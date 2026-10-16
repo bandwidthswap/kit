@@ -156,7 +156,7 @@ EOS
 step_kit() {
   say "bwkit on the three nodes"
   for h in $HOSTS; do
-    tar -C "$kit" -cf - bwkit.py install.sh systemd | $SSH "$h" 'mkdir -p ~/kit && tar -C ~/kit -xf -'
+    COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py install.sh systemd | $SSH "$h" 'mkdir -p ~/kit && tar -C ~/kit -xf -'
   done
   run bw-house 'cd ~/kit && sudo ./install.sh payer'
   run bw-forest 'cd ~/kit && sudo ./install.sh hop'
