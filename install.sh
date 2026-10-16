@@ -13,7 +13,7 @@ role="${1:-}"
 case "$role" in payer|hop|mint) ;; *) echo "usage: $0 payer|hop|mint" >&2; exit 2;; esac
 here="$(cd "$(dirname "$0")" && pwd)"
 
-apt-get install -y --no-install-recommends python3 python3-cryptography >/dev/null
+apt-get -o DPkg::Lock::Timeout=600 install -y --no-install-recommends python3 python3-cryptography >/dev/null
 id bwkit >/dev/null 2>&1 || useradd --system --home-dir /var/lib/bwkit --shell /usr/sbin/nologin bwkit
 install -d -o bwkit -g bwkit -m 0750 /var/lib/bwkit
 install -d -m 0755 /etc/bwkit
