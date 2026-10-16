@@ -1,0 +1,11 @@
+[Unit]
+Description=bwkit: make this hour's receipt and send it to the hop and the Mint
+After=network-online.target wg-quick@wg0.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=bwkit
+Group=bwkit
+ExecStart=/usr/local/bin/bwkit receipt
+Environment=PYTHONUNBUFFERED=1

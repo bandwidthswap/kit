@@ -1,0 +1,10 @@
+[Unit]
+Description=bwkit: hourly receipt
+
+[Timer]
+OnCalendar=hourly
+AccuracySec=1s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
