@@ -37,7 +37,7 @@ wait_up() {
 step_upgrade() {
   say "upgrade and reboot (the three in parallel; 5 to 15 minutes)"
   for h in $HOSTS; do
-    ( $SSH "$h" 'sudo apt-get update -q && sudo DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y -q && sudo apt-get autoremove -y -q && sudo reboot' > "/tmp/bwkit-upgrade-$h.log" 2>&1; echo "$h: exit $?" ) &
+    ( $SSH "$h" 'sudo apt-get -o DPkg::Lock::Timeout=600 update -q && sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 full-upgrade -y -q && sudo apt-get -o DPkg::Lock::Timeout=600 autoremove -y -q && sudo reboot' > "/tmp/bwkit-upgrade-$h.log" 2>&1; echo "$h: exit $?" ) &
   done
   wait
   sleep 20
@@ -47,7 +47,7 @@ step_upgrade() {
 
 step_time() {
   say "time: chrony"
-  for h in $HOSTS; do run "$h" 'sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -q chrony >/dev/null && echo "$(hostname): chrony installed"'; done
+  for h in $HOSTS; do run "$h" 'sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 install -y -q chrony >/dev/null && echo "$(hostname): chrony installed"'; done
   sudo_sh bw-house <<EOS
 set -e
 cat > /etc/chrony/conf.d/bwkit.conf <<EOC
@@ -83,7 +83,7 @@ step_tunnel() {
   for h in bw-house bw-forest; do
     sudo_sh "$h" <<'EOS'
 set -e
-DEBIAN_FRONTEND=noninteractive apt-get install -y -q wireguard-tools >/dev/null
+DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 install -y -q wireguard-tools >/dev/null
 install -d -m 0700 /etc/wireguard
 if [ ! -s /etc/wireguard/wg0.key ]; then (umask 077; wg genkey > /etc/wireguard/wg0.key); fi
 wg pubkey < /etc/wireguard/wg0.key > /etc/wireguard/wg0.pub
