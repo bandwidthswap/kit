@@ -62,6 +62,8 @@ AGREE_MIN_BYTES = 65536                 # or by less than this, whichever is lar
 DEFAULT_PORT = 8710
 DEFAULT_PRICE_USD_PER_GB = 0.10         # the lab's posted price; dollars, no token
 HTTP_TIMEOUT_S = 10
+HOP_FLUSH_DELAY_S = 5                   # the hop sends its own copy of an ack this long after answering the payer
+FLUSH_EVERY_S = 300                     # and retries whatever is left in its outbox this often
 MAX_BODY = 1 << 20
 
 
@@ -376,12 +378,19 @@ class Node:
         mint = self.config.get("mint")
         if not mint:
             raise SystemExit("config has no mint URL")
+        with self.lock:
+            return self._flush(mint)
+
+    def _flush(self, mint):
         names = sorted(os.listdir(self.path("outbox")))
         sent = 0
         for name in names:
             p = self.path("outbox", name)
-            with open(p) as f:
-                env = json.load(f)
+            try:
+                with open(p) as f:
+                    env = json.load(f)
+            except FileNotFoundError:
+                continue
             try:
                 status, body = http_post(mint.rstrip("/") + "/receipt", env)
             except (urlerror.URLError, socket.timeout, OSError) as e:
@@ -398,6 +407,20 @@ class Node:
                 log("mint refused %s: %s %s" % (name, status, body))
                 os.replace(p, self.path("sent", name + ".refused"))
         return sent, len(os.listdir(self.path("outbox")))
+
+    def flush_quietly(self):
+        """A background flush: never raises, logs what it did."""
+        try:
+            if os.listdir(self.path("outbox")):
+                sent, left = self.flush()
+                log("outbox: sent %d, %d left" % (sent, left))
+        except (OSError, SystemExit) as e:
+            log("outbox flush failed: %s" % e)
+
+    def flush_later(self, delay):
+        t = threading.Timer(delay, self.flush_quietly)
+        t.daemon = True
+        t.start()
 
     # payer
 
@@ -482,6 +505,8 @@ class Node:
             self.append("acks.jsonl", ack)
             self.outbox_put(ack)
         log("ack for %s %d..%d: payer says %d, we say %d" % (env.get("from"), r["t_first"], r["t_last"], r["bytes"], nbytes))
+        if self.config.get("mint"):
+            self.flush_later(HOP_FLUSH_DELAY_S)   # our own copy, in case the payer drops an ack it dislikes
         return ack
 
     # mint
@@ -673,6 +698,12 @@ class Node:
 
         srv = ThreadingHTTPServer((host, port), Handler)
         srv.daemon_threads = True
+        if self.role == "hop" and self.config.get("mint"):
+            def retry():
+                while True:
+                    time.sleep(FLUSH_EVERY_S)
+                    self.flush_quietly()
+            threading.Thread(target=retry, daemon=True).start()
         log("%s %s serving on %s:%d as %s" % (self.role, self.name, host, srv.server_address[1], self.nym))
         if block:
             try:

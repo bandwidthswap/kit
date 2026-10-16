@@ -7,6 +7,7 @@
 #   phase0/provision.sh tunnel     WireGuard wg0, bw-house 10.77.0.1 <-> bw-forest 10.77.0.2
 #   phase0/provision.sh logs       journald in RAM on all three
 #   phase0/provision.sh kit        install bwkit, exchange NYMs, baseline, enable the services
+#   phase0/provision.sh update     copy a newer bwkit.py and units to the nodes and restart the services
 #   phase0/provision.sh check      the four verifications, nothing changed
 #   phase0/provision.sh all        the steps above in order
 #
@@ -176,6 +177,16 @@ step_kit() {
   check_kit
 }
 
+step_update() {
+  say "bwkit.py and the units to the three nodes, services restarted"
+  for h in $HOSTS; do
+    COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py install.sh systemd | $SSH "$h" 'mkdir -p ~/kit && tar -C ~/kit -xf - && sudo install -m 0755 ~/kit/bwkit.py /usr/local/bin/bwkit && sudo install -m 0644 ~/kit/systemd/bwkit.service ~/kit/systemd/bwkit-receipt.service ~/kit/systemd/bwkit-receipt.timer /etc/systemd/system/ && sudo systemctl daemon-reload && echo "$(hostname): updated"'
+  done
+  run bw-forest 'sudo systemctl restart bwkit && sleep 1 && systemctl is-active bwkit'
+  run bw-mint 'sudo systemctl restart bwkit && sleep 1 && systemctl is-active bwkit'
+  check_kit
+}
+
 check_kit() {
   say "bwkit status"
   run bw-forest 'curl -s http://127.0.0.1:8710/status; echo'
@@ -189,7 +200,8 @@ case "${1:-}" in
   tunnel) step_tunnel ;;
   logs) step_logs ;;
   kit) step_kit ;;
+  update) step_update ;;
   check) check_time; check_tunnel; check_kit ;;
   all) step_upgrade; step_time; step_tunnel; step_logs; step_kit ;;
-  *) sed -n '2,16p' "$0"; exit 2 ;;
+  *) sed -n '2,17p' "$0"; exit 2 ;;
 esac
