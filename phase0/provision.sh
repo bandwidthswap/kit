@@ -9,7 +9,8 @@
 #   phase0/provision.sh kit        install bwkit, exchange NYMs, baseline, enable the services
 #   phase0/provision.sh update     copy a newer bwkit.py and units to the nodes and restart the services
 #   phase0/provision.sh status     bw-mint: the status reporter (bwkit report, every two minutes) with its
-#                                  token from $BWKIT_STATUS_TOKEN, written to the root-only /etc/bwkit/status.env
+#                                  token from $BWKIT_STATUS_TOKEN, written to the root-only /etc/bwkit/status.env;
+#                                  with no token given, the file already there is kept and only the code is updated
 #   phase0/provision.sh check      the four verifications, nothing changed
 #   phase0/provision.sh all        upgrade, time, tunnel, logs and kit, in order
 #
@@ -200,21 +201,26 @@ check_kit() {
 step_status() {
   say "status reporter on bw-mint"
   if [ -z "${BWKIT_STATUS_TOKEN:-}" ]; then
-    echo "set BWKIT_STATUS_TOKEN to the token the Worker was given (the site repo's worker/README.md has the steps)" >&2
-    exit 2
+    if run bw-mint 'sudo test -s /etc/bwkit/status.env'; then
+      echo "no BWKIT_STATUS_TOKEN given; keeping the /etc/bwkit/status.env already on bw-mint"
+    else
+      echo "set BWKIT_STATUS_TOKEN to the token the Worker was given (the site repo's worker/README.md has the steps)" >&2
+      exit 2
+    fi
   fi
   url="${BWKIT_STATUS_URL:-https://status.bandwidthswap.com/status}"
   COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py install.sh systemd | $SSH bw-mint 'mkdir -p ~/kit && tar -C ~/kit -xf - && sudo install -m 0755 ~/kit/bwkit.py /usr/local/bin/bwkit && sudo install -m 0644 ~/kit/systemd/*.service ~/kit/systemd/*.timer /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl restart bwkit && sleep 1 && echo "bw-mint: bwkit $(grep -m1 "^VERSION" /usr/local/bin/bwkit | cut -d\" -f2), server $(systemctl is-active bwkit)"'
-  sudo_sh bw-mint <<EOS
+  if [ -n "${BWKIT_STATUS_TOKEN:-}" ]; then
+    sudo_sh bw-mint <<EOS
 set -e
 umask 077
 printf 'BWKIT_STATUS_URL=%s\nBWKIT_STATUS_TOKEN=%s\n' '$url' '$BWKIT_STATUS_TOKEN' > /etc/bwkit/status.env
 chown root:root /etc/bwkit/status.env
 chmod 0600 /etc/bwkit/status.env
-systemctl enable -q --now bwkit-status.timer
-systemctl start bwkit-status.service
-echo "bw-mint: /etc/bwkit/status.env written (root only), bwkit-status.timer enabled, first report sent"
+echo "bw-mint: /etc/bwkit/status.env written (root only)"
 EOS
+  fi
+  run bw-mint 'sudo systemctl enable -q --now bwkit-status.timer && sudo systemctl start bwkit-status.service && echo "bw-mint: bwkit-status.timer enabled, a report sent"'
   check_status
 }
 

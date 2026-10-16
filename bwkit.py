@@ -59,7 +59,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 FIELDS = ("payer", "hop", "hop_index", "merkle_root", "bytes", "t_first", "t_last", "prev_sig")
 DOMAIN = b"bandwidthswap/receipt/v1\n"   # prefixed to every signed message
 CLOCK_TOLERANCE_S = 5                   # OPEN-QUESTIONS B9 default: 5 seconds, decline
@@ -72,6 +72,8 @@ HOP_FLUSH_DELAY_S = 5                   # the hop sends its own copy of an ack t
 FLUSH_EVERY_S = 300                     # and retries whatever is left in its outbox this often
 MAX_BODY = 1 << 20
 STATUS_TIMEOUT_S = 10                   # posting the status report
+HISTORY_HOURS = 12                      # the status report carries each node's windows of the last twelve hours
+HISTORY_MAX = 36                        # at most this many per node (the forced tests made several in one hour)
 PRIVATE_PATTERNS = (                    # what a status report may never carry
     re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b"),               # an IPv4 address
     re.compile(r"\b[0-9a-f]{2}(?::[0-9a-f]{2}){5}\b", re.I),  # a MAC address
@@ -681,15 +683,20 @@ class Node:
         nodes' names. Per node: when its last receipt (for the hop, its last
         ack) reached the Mint, the bytes it signed for its latest window, how
         many it has signed, how many of its windows settled and how many of
-        those were disputed. The Mint's own line counts what it recorded.
-        `service` is whether the Mint's server answered (service_up), None
-        when not checked.
+        those were disputed, its running total of bytes (signed, counted, or
+        settled for the Mint), and `history`: its windows of the last twelve
+        hours (HISTORY_HOURS, at most HISTORY_MAX), each with the window's
+        bounds, the bytes, the settled bytes and the disputed flag (None while
+        unsettled). The Mint's own line counts what it recorded. `since` is
+        when the first entry reached the ledger. `service` is whether the
+        Mint's server answered (service_up), None when not checked.
         """
         now = int(now if now is not None else time.time())
         self.load_index(skip_partial=True)
         ix = self.index
         peers = self.peers()
         order = {"payer": 0, "hop": 1, "mint": 2, "peer": 3}
+        cut = (now // 3600 - (HISTORY_HOURS - 1)) * 3600      # the start of the oldest of the last twelve hours
         nodes = {}
 
         def node(name, role):
@@ -697,10 +704,15 @@ class Node:
             if n is None:
                 n = nodes[name] = {"name": name, "role": role, "last_receipt": None, "window_bytes": None,
                                    "window_t_first": None, "window_t_last": None,
-                                   "receipts": 0, "windows": 0, "disputed": 0}
+                                   "receipts": 0, "windows": 0, "disputed": 0, "total_bytes": 0, "history": []}
             elif order[role] < order[n["role"]]:
                 n["role"] = role
             return n
+
+        def window_of(r, nbytes, st):
+            return {"t_first": r["t_first"], "t_last": r["t_last"], "bytes": nbytes,
+                    "settled_bytes": st["settled_bytes"] if st else None,
+                    "disputed": (st["status"] == "disputed") if st else None}
 
         for name in peers.values():
             node(name, "peer")                      # a peer with nothing on the ledger yet is still listed
@@ -709,10 +721,14 @@ class Node:
             n = node(e["from"], "payer" if e["kind"] == "receipt" else "hop")
             r = e["receipt"]
             n["receipts"] += 1
+            n["total_bytes"] += r["bytes"]
             if n["last_receipt"] is None or e["received_at"] > n["last_receipt"]:
                 n["last_receipt"] = e["received_at"]
             if n["window_t_last"] is None or r["t_last"] > n["window_t_last"]:
                 n["window_bytes"], n["window_t_first"], n["window_t_last"] = r["bytes"], r["t_first"], r["t_last"]
+            if r["t_last"] >= cut:
+                st = ix["settled"].get(e["sig"] if e["kind"] == "receipt" else r["prev_sig"])
+                n["history"].append(window_of(r, r["bytes"], st))
         for st in ix["settled"].values():
             for nym, role in ((st["payer"], "payer"), (st["hop"], "hop")):
                 if nym in peers:
@@ -725,12 +741,18 @@ class Node:
         me["last_receipt"] = max((e["received_at"] for e in entries), default=None)
         me["windows"] = len(ix["settled"])
         me["disputed"] = sum(1 for st in ix["settled"].values() if st["status"] == "disputed")
+        me["total_bytes"] = sum(st["settled_bytes"] for st in ix["settled"].values())
+        me["history"] = [window_of(st, st["settled_bytes"], st) for st in ix["settled"].values() if st["t_last"] >= cut]
         latest = max(ix["settled"].values(), key=lambda st: (st["t_last"], st["t"]), default=None)
         if latest:
             me["window_bytes"], me["window_t_first"], me["window_t_last"] = latest["settled_bytes"], latest["t_first"], latest["t_last"]
+        for n in nodes.values():
+            n["history"].sort(key=lambda w: (w["t_last"], w["t_first"]))
+            del n["history"][:-HISTORY_MAX]
         no_ack, no_receipt = self.pending()
         return {
             "v": 1, "generated_at": now, "bwkit": VERSION, "phase": 0, "window_s": 3600,
+            "since": min((e["received_at"] for e in entries), default=None),
             "service": service,
             "ledger": {"receipts": sum(1 for e in entries if e["kind"] == "receipt"),
                        "acks": sum(1 for e in entries if e["kind"] == "ack"),

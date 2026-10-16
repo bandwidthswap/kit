@@ -296,6 +296,17 @@ class StatusReport(unittest.TestCase):
         self.assertEqual(rep["ledger"], {"receipts": 2, "acks": 2, "settlements": 2, "disputed": 1,
                                          "receipts_without_ack": 0, "acks_without_receipt": 0})
         self.assertIs(rep["service"], True)
+        self.assertIsNotNone(rep["since"])
+        # the running totals: what each signed, counted or settled
+        self.assertEqual((by["bw-house"]["total_bytes"], by["bw-forest"]["total_bytes"], by["bw-mint"]["total_bytes"]),
+                         (3_000_000, 2_000_000, 2_000_000))
+        # the history: both windows, oldest first, with the settlement on each
+        h = by["bw-house"]["history"]
+        self.assertEqual([(w["t_first"], w["t_last"], w["bytes"], w["settled_bytes"], w["disputed"]) for w in h],
+                         [(self.lab.t - 7200, self.lab.t - 3600, 1_000_000, 1_000_000, False),
+                          (self.lab.t - 3600, self.lab.t, 2_000_000, 1_000_000, True)])
+        self.assertEqual([w["bytes"] for w in by["bw-forest"]["history"]], [1_000_000, 1_000_000])
+        self.assertEqual([(w["bytes"], w["disputed"]) for w in by["bw-mint"]["history"]], [(1_000_000, False), (1_000_000, True)])
         text = json.dumps(rep)
         self.assertNotIn("ed25519:", text)                   # names and roles only
         self.assertNotIn("127.0.0.1", text)
@@ -308,7 +319,33 @@ class StatusReport(unittest.TestCase):
         self.assertEqual(by["bw-house"]["role"], "peer")       # no receipt yet, so no role known
         self.assertIsNone(by["bw-house"]["last_receipt"])
         self.assertIsNone(by["bw-mint"]["window_bytes"])
+        self.assertEqual((by["bw-mint"]["history"], by["bw-mint"]["total_bytes"]), ([], 0))
         self.assertEqual(rep["ledger"]["settlements"], 0)
+        self.assertIsNone(rep["since"])
+
+    def test_history_is_the_last_twelve_hours_and_an_unsettled_window_says_so(self):
+        for i in range(14):
+            self.lab.hour((i + 1) * 1000, (i + 1) * 1000)
+        rep = self.lab.mint.status_report(now=self.lab.t + 5)
+        by = {n["name"]: n for n in rep["nodes"]}
+        h = by["bw-house"]["history"]
+        self.assertEqual(len(h), bwkit.HISTORY_HOURS)
+        cut = (self.lab.t // 3600 - (bwkit.HISTORY_HOURS - 1)) * 3600
+        self.assertGreaterEqual(h[0]["t_last"], cut)
+        self.assertLess(h[0]["t_last"] - 3600, cut)              # the one before it fell off
+        self.assertEqual(h[-1]["t_last"], self.lab.t)
+        self.assertEqual(by["bw-house"]["total_bytes"], 14 * 1000)
+        self.assertEqual(len(by["bw-mint"]["history"]), bwkit.HISTORY_HOURS)
+        # a receipt the hop never acked: on the ledger, in the history, unsettled
+        self.lab.hop_srv.shutdown()
+        self.lab.hop_srv.server_close()
+        self.lab.hour(15 * 1000, 15 * 1000)
+        rep = self.lab.mint.status_report(now=self.lab.t + 5)
+        by = {n["name"]: n for n in rep["nodes"]}
+        last = by["bw-house"]["history"][-1]
+        self.assertEqual((last["bytes"], last["settled_bytes"], last["disputed"]), (1000, None, None))
+        self.assertEqual(rep["ledger"]["receipts_without_ack"], 1)
+        self.lab.hop_srv = self.lab.hop.serve("127.0.0.1", 0, block=False)   # so close() has something to shut down
 
     def test_report_skips_a_half_written_last_line(self):
         self.lab.hour(1_000, 1_000)
