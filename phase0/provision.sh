@@ -67,7 +67,13 @@ EOS
     src="server bw-house.local iburst prefer"
   fi
   for h in bw-forest bw-mint; do
-    printf '%s\n' "$src" | $SSH "$h" sudo sh -c 'set -e; read line; sed -i "s/^pool /#pool /" /etc/chrony/chrony.conf; printf "# Bandwidth Swap lab: bw-house is the only source\n%s\n" "$line" > /etc/chrony/sources.d/bwkit.sources; systemctl restart chrony'
+    sudo_sh "$h" <<EOS
+set -e
+sed -i "s/^pool /#pool /" /etc/chrony/chrony.conf
+printf '# Bandwidth Swap lab: bw-house is the only source\n%s\n' "$src" > /etc/chrony/sources.d/bwkit.sources
+systemctl restart chrony
+echo "$h: source is '$src'"
+EOS
   done
   sleep 8
   check_time
@@ -97,9 +103,8 @@ EOS
     h="$1"; addr="$2"; peer_pub="$3"; peer_addr="$4"; peer_host="$5"
     peer_ip="$(run "$h" "getent hosts $peer_host | cut -d' ' -f1" || true)"
     [ -z "$peer_ip" ] && peer_ip="$(dscacheutil -q host -a name "$peer_host" | awk '/ip_address/ {print $2; exit}')"
-    printf '%s\n' "$addr" "$peer_pub" "$peer_addr" "$peer_ip" | $SSH "$h" sudo sh -c '
+    sudo_sh "$h" <<EOS
 set -e
-read addr; read peer_pub; read peer_addr; read peer_ip
 umask 077
 cat > /etc/wireguard/wg0.conf <<EOC
 # Bandwidth Swap lab tunnel. The private key stays in /etc/wireguard/wg0.key.
@@ -116,7 +121,8 @@ PersistentKeepalive = 25
 EOC
 systemctl enable -q wg-quick@wg0
 systemctl restart wg-quick@wg0
-echo "$(hostname): wg0 $addr, peer $peer_ip"'
+echo "$h: wg0 $addr, peer $peer_ip"
+EOS
   done
   sleep 3
   check_tunnel
