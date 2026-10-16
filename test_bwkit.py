@@ -329,6 +329,7 @@ class StatusReport(unittest.TestCase):
 
             def do_POST(self):
                 seen["auth"] = self.headers.get("Authorization")
+                seen["agent"] = self.headers.get("User-Agent")
                 seen["path"] = self.path
                 seen["body"] = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 data = b'{"stored": true, "received_at": 1}'
@@ -348,6 +349,7 @@ class StatusReport(unittest.TestCase):
             self.assertEqual(status, 200)
             self.assertEqual(body, {"stored": True, "received_at": 1})
             self.assertEqual(seen["auth"], "Bearer tok-123")
+            self.assertEqual(seen["agent"], "bwkit/" + bwkit.VERSION)   # Python's default is refused at the edge
             self.assertEqual(seen["path"], "/status")
             self.assertEqual(seen["body"]["generated_at"], self.lab.t)
             self.assertEqual(len(seen["body"]["nodes"]), 3)

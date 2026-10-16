@@ -220,9 +220,12 @@ def resolve(receipt_env, ack_env, price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB, now
 
 # ---------------------------------------------------------------- http
 
+USER_AGENT = "bwkit/" + VERSION   # Cloudflare's edge in front of the status page refuses Python's default (error 1010)
+
+
 def http_post(url, body, timeout=HTTP_TIMEOUT_S, headers=None):
     data = json.dumps(body).encode()
-    h = {"Content-Type": "application/json"}
+    h = {"Content-Type": "application/json", "User-Agent": USER_AGENT}
     h.update(headers or {})
     req = urlrequest.Request(url, data=data, headers=h, method="POST")
     try:
@@ -236,7 +239,8 @@ def http_post(url, body, timeout=HTTP_TIMEOUT_S, headers=None):
 
 
 def http_get(url, timeout=HTTP_TIMEOUT_S):
-    with urlrequest.urlopen(url, timeout=timeout) as resp:
+    req = urlrequest.Request(url, headers={"User-Agent": USER_AGENT})
+    with urlrequest.urlopen(req, timeout=timeout) as resp:
         return resp.status, resp.read().decode()
 
 
