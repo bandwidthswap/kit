@@ -264,5 +264,107 @@ class Windows(unittest.TestCase):
         self.assertEqual(fresh.pending(), ([], []))
 
 
+class StatusReport(unittest.TestCase):
+    """The Mint's summary for the status page: names and roles, nothing about the network."""
+
+    def setUp(self):
+        self.lab = Lab()
+
+    def tearDown(self):
+        self.lab.close()
+
+    def test_report_summarises_the_ledger_by_name(self):
+        self.lab.hour(1_000_000, 1_000_000)                  # agreeing window
+        self.lab.hour(3_000_000, 2_000_000)                  # the hop under-counts: disputed, settled at 1 MB
+        rep = self.lab.mint.status_report(now=self.lab.t + 60, service=True)
+        self.assertEqual(rep["generated_at"], self.lab.t + 60)
+        self.assertEqual([n["name"] for n in rep["nodes"]], ["bw-house", "bw-forest", "bw-mint"])
+        by = {n["name"]: n for n in rep["nodes"]}
+        self.assertEqual(by["bw-house"]["role"], "payer")
+        self.assertEqual(by["bw-forest"]["role"], "hop")
+        self.assertEqual(by["bw-mint"]["role"], "mint")
+        self.assertEqual(by["bw-house"]["receipts"], 2)
+        self.assertEqual(by["bw-house"]["window_bytes"], 2_000_000)
+        self.assertEqual((by["bw-house"]["window_t_first"], by["bw-house"]["window_t_last"]), (self.lab.t - 3600, self.lab.t))
+        self.assertEqual(by["bw-forest"]["receipts"], 2)
+        self.assertEqual(by["bw-forest"]["window_bytes"], 1_000_000)
+        self.assertEqual(by["bw-mint"]["receipts"], 4)
+        self.assertEqual(by["bw-mint"]["window_bytes"], 1_000_000)   # the settled count
+        for name in ("bw-house", "bw-forest", "bw-mint"):
+            self.assertEqual((by[name]["windows"], by[name]["disputed"]), (2, 1), name)
+            self.assertIsNotNone(by[name]["last_receipt"])
+        self.assertEqual(rep["ledger"], {"receipts": 2, "acks": 2, "settlements": 2, "disputed": 1,
+                                         "receipts_without_ack": 0, "acks_without_receipt": 0})
+        self.assertIs(rep["service"], True)
+        text = json.dumps(rep)
+        self.assertNotIn("ed25519:", text)                   # names and roles only
+        self.assertNotIn("127.0.0.1", text)
+        bwkit.assert_public(text)
+
+    def test_report_before_any_receipt_lists_the_peers(self):
+        rep = self.lab.mint.status_report(now=self.lab.t)
+        by = {n["name"]: n for n in rep["nodes"]}
+        self.assertEqual(set(by), {"bw-house", "bw-forest", "bw-mint"})
+        self.assertEqual(by["bw-house"]["role"], "peer")       # no receipt yet, so no role known
+        self.assertIsNone(by["bw-house"]["last_receipt"])
+        self.assertIsNone(by["bw-mint"]["window_bytes"])
+        self.assertEqual(rep["ledger"]["settlements"], 0)
+
+    def test_report_skips_a_half_written_last_line(self):
+        self.lab.hour(1_000, 1_000)
+        with open(self.lab.mint.path("ledger.jsonl"), "a") as f:
+            f.write('{"kind": "receipt", "from": "bw-ho')
+        rep = self.lab.mint.status_report(now=self.lab.t)
+        self.assertEqual(rep["ledger"]["settlements"], 1)
+        with self.assertRaises(ValueError):
+            bwkit.Node(self.lab.mint.dir, self.lab.mint.config).load_index()
+
+    def test_report_posts_with_the_bearer_token(self):
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        seen = {}
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                seen["auth"] = self.headers.get("Authorization")
+                seen["path"] = self.path
+                seen["body"] = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+                data = b'{"stored": true, "received_at": 1}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        import threading
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            self.lab.hour(1_000, 1_000)
+            url = "http://127.0.0.1:%d/status" % srv.server_address[1]
+            status, body = self.lab.mint.report(url, "tok-123", now=self.lab.t)
+            self.assertEqual(status, 200)
+            self.assertEqual(body, {"stored": True, "received_at": 1})
+            self.assertEqual(seen["auth"], "Bearer tok-123")
+            self.assertEqual(seen["path"], "/status")
+            self.assertEqual(seen["body"]["generated_at"], self.lab.t)
+            self.assertEqual(len(seen["body"]["nodes"]), 3)
+            self.assertIn(seen["body"]["service"], (True, False))   # the test Mint serves on a port, so it was checked
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        with self.assertRaises(SystemExit):
+            self.lab.payer.report("http://127.0.0.1:1/status", "tok")   # only the Mint reports
+
+    def test_assert_public_refuses_addresses(self):
+        with self.assertRaises(ValueError):
+            bwkit.assert_public('{"note": "bw-mint is at 192.168.0.61"}')
+        with self.assertRaises(ValueError):
+            bwkit.assert_public('{"note": "b8:27:eb:6b:1b:09"}')
+        bwkit.assert_public('{"bwkit": "0.1.2", "amount_usd": 0.002195, "t": 1792186147, "name": "bw-house"}')
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

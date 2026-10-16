@@ -18,7 +18,7 @@ id bwkit >/dev/null 2>&1 || useradd --system --home-dir /var/lib/bwkit --shell /
 install -d -o bwkit -g bwkit -m 0750 /var/lib/bwkit
 install -d -m 0755 /etc/bwkit
 install -m 0755 "$here/bwkit.py" /usr/local/bin/bwkit
-install -m 0644 "$here/systemd/bwkit.service" "$here/systemd/bwkit-receipt.service" "$here/systemd/bwkit-receipt.timer" /etc/systemd/system/
+install -m 0644 "$here"/systemd/*.service "$here"/systemd/*.timer /etc/systemd/system/
 systemctl daemon-reload
 
 if [ ! -f /etc/bwkit/config.json ]; then

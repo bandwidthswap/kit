@@ -8,11 +8,14 @@
 #   phase0/provision.sh logs       journald in RAM on all three
 #   phase0/provision.sh kit        install bwkit, exchange NYMs, baseline, enable the services
 #   phase0/provision.sh update     copy a newer bwkit.py and units to the nodes and restart the services
+#   phase0/provision.sh status     bw-mint: the status reporter (bwkit report, every two minutes) with its
+#                                  token from $BWKIT_STATUS_TOKEN, written to the root-only /etc/bwkit/status.env
 #   phase0/provision.sh check      the four verifications, nothing changed
-#   phase0/provision.sh all        the steps above in order
+#   phase0/provision.sh all        upgrade, time, tunnel, logs and kit, in order
 #
 # Nothing here prints or copies a private key: WireGuard keys are made on the
-# nodes and only the public halves cross the LAN.
+# nodes and only the public halves cross the LAN. The status token travels once,
+# inside the script on stdin of `status`, and is never echoed.
 set -eu
 kit="$(cd "$(dirname "$0")/.." && pwd)"
 HOSTS="bw-house bw-forest bw-mint"
@@ -180,7 +183,7 @@ step_kit() {
 step_update() {
   say "bwkit.py and the units to the three nodes, services restarted"
   for h in $HOSTS; do
-    COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py install.sh systemd | $SSH "$h" 'mkdir -p ~/kit && tar -C ~/kit -xf - && sudo install -m 0755 ~/kit/bwkit.py /usr/local/bin/bwkit && sudo install -m 0644 ~/kit/systemd/bwkit.service ~/kit/systemd/bwkit-receipt.service ~/kit/systemd/bwkit-receipt.timer /etc/systemd/system/ && sudo systemctl daemon-reload && echo "$(hostname): updated"'
+    COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py install.sh systemd | $SSH "$h" 'mkdir -p ~/kit && tar -C ~/kit -xf - && sudo install -m 0755 ~/kit/bwkit.py /usr/local/bin/bwkit && sudo install -m 0644 ~/kit/systemd/*.service ~/kit/systemd/*.timer /etc/systemd/system/ && sudo systemctl daemon-reload && echo "$(hostname): updated"'
   done
   run bw-forest 'sudo systemctl restart bwkit && sleep 1 && systemctl is-active bwkit'
   run bw-mint 'sudo systemctl restart bwkit && sleep 1 && systemctl is-active bwkit'
@@ -194,6 +197,32 @@ check_kit() {
   run bw-house 'sudo -u bwkit bwkit status'
 }
 
+step_status() {
+  say "status reporter on bw-mint"
+  if [ -z "${BWKIT_STATUS_TOKEN:-}" ]; then
+    echo "set BWKIT_STATUS_TOKEN to the token the Worker was given (the site repo's worker/README.md has the steps)" >&2
+    exit 2
+  fi
+  url="${BWKIT_STATUS_URL:-https://status.bandwidthswap.com/status}"
+  COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py install.sh systemd | $SSH bw-mint 'mkdir -p ~/kit && tar -C ~/kit -xf - && sudo install -m 0755 ~/kit/bwkit.py /usr/local/bin/bwkit && sudo install -m 0644 ~/kit/systemd/*.service ~/kit/systemd/*.timer /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl restart bwkit && sleep 1 && echo "bw-mint: bwkit $(grep -m1 "^VERSION" /usr/local/bin/bwkit | cut -d\" -f2), server $(systemctl is-active bwkit)"'
+  sudo_sh bw-mint <<EOS
+set -e
+umask 077
+printf 'BWKIT_STATUS_URL=%s\nBWKIT_STATUS_TOKEN=%s\n' '$url' '$BWKIT_STATUS_TOKEN' > /etc/bwkit/status.env
+chown root:root /etc/bwkit/status.env
+chmod 0600 /etc/bwkit/status.env
+systemctl enable -q --now bwkit-status.timer
+systemctl start bwkit-status.service
+echo "bw-mint: /etc/bwkit/status.env written (root only), bwkit-status.timer enabled, first report sent"
+EOS
+  check_status
+}
+
+check_status() {
+  say "status reporter"
+  run bw-mint 'systemctl list-timers bwkit-status.timer --no-pager | head -2; journalctl -u bwkit-status -n 2 --no-pager -o cat'
+}
+
 case "${1:-}" in
   upgrade) step_upgrade ;;
   time) step_time ;;
@@ -201,7 +230,8 @@ case "${1:-}" in
   logs) step_logs ;;
   kit) step_kit ;;
   update) step_update ;;
-  check) check_time; check_tunnel; check_kit ;;
+  status) step_status ;;
+  check) check_time; check_tunnel; check_kit; check_status ;;
   all) step_upgrade; step_time; step_tunnel; step_logs; step_kit ;;
-  *) sed -n '2,17p' "$0"; exit 2 ;;
+  *) sed -n '2,18p' "$0"; exit 2 ;;
 esac

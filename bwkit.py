@@ -17,6 +17,11 @@ Three roles, chosen by "role" in the config file:
                      window once both are there, at the smaller of the two
                      signed counts.
 
+The Mint also reports: `bwkit report` (the bwkit-status timer, every two
+minutes) summarises the ledger per node, names and roles only, and posts it
+to the status page's Worker, so bandwidthswap.com can say which nodes are up
+while nothing reaches the LAN.
+
 The receipt is the paper's Figure 2:
 
   (payer NYM, hop NYM, hop index, merkle root, bytes, t_first, t_last, prev receipt sig)
@@ -41,6 +46,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import socket
 import sys
 import threading
@@ -53,7 +59,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 FIELDS = ("payer", "hop", "hop_index", "merkle_root", "bytes", "t_first", "t_last", "prev_sig")
 DOMAIN = b"bandwidthswap/receipt/v1\n"   # prefixed to every signed message
 CLOCK_TOLERANCE_S = 5                   # OPEN-QUESTIONS B9 default: 5 seconds, decline
@@ -65,6 +71,11 @@ HTTP_TIMEOUT_S = 10
 HOP_FLUSH_DELAY_S = 5                   # the hop sends its own copy of an ack this long after answering the payer
 FLUSH_EVERY_S = 300                     # and retries whatever is left in its outbox this often
 MAX_BODY = 1 << 20
+STATUS_TIMEOUT_S = 10                   # posting the status report
+PRIVATE_PATTERNS = (                    # what a status report may never carry
+    re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b"),               # an IPv4 address
+    re.compile(r"\b[0-9a-f]{2}(?::[0-9a-f]{2}){5}\b", re.I),  # a MAC address
+)
 
 
 # ---------------------------------------------------------------- encoding
@@ -166,6 +177,14 @@ def meter_root(payer_nym, meter):
     return hashlib.sha256(s.encode()).hexdigest()
 
 
+def assert_public(text):
+    """Raise ValueError when text carries an address. A status report is names and roles only."""
+    for pat in PRIVATE_PATTERNS:
+        m = pat.search(text)
+        if m:
+            raise ValueError("a status report may not carry an address (%s)" % m.group(0))
+
+
 def resolve(receipt_env, ack_env, price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB, now=None):
     """Settle one window from a payer's receipt and a hop's ack. Pure: needs nothing else.
 
@@ -201,9 +220,11 @@ def resolve(receipt_env, ack_env, price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB, now
 
 # ---------------------------------------------------------------- http
 
-def http_post(url, body, timeout=HTTP_TIMEOUT_S):
+def http_post(url, body, timeout=HTTP_TIMEOUT_S, headers=None):
     data = json.dumps(body).encode()
-    req = urlrequest.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    h = {"Content-Type": "application/json"}
+    h.update(headers or {})
+    req = urlrequest.Request(url, data=data, headers=h, method="POST")
     try:
         with urlrequest.urlopen(req, timeout=timeout) as resp:
             return resp.status, json.loads(resp.read().decode() or "null")
@@ -511,16 +532,28 @@ class Node:
 
     # mint
 
-    def load_index(self):
-        """Rebuild the Mint's view from the ledger."""
+    def load_index(self, skip_partial=False):
+        """Rebuild the Mint's view from the ledger.
+
+        skip_partial: a reader beside the running Mint (the status reporter)
+        may catch the last line half written; skip it rather than fail.
+        """
         ix = {"by_sig": {}, "receipt_by_window": {}, "acks_by_prev": {}, "settled": {}}
         p = self.path("ledger.jsonl")
         if os.path.exists(p):
             with open(p) as f:
-                for line in f:
-                    line = line.strip()
-                    if line:
-                        self._index_line(ix, json.loads(line))
+                lines = f.read().split("\n")
+            for i, line in enumerate(lines):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    if skip_partial and i == len(lines) - 1:
+                        break
+                    raise
+                self._index_line(ix, entry)
         self.index = ix
         return ix
 
@@ -623,6 +656,104 @@ class Node:
             o["settled_bytes"] += e["settled_bytes"]
             o["amount_usd"] = round(o["amount_usd"] + e["amount_usd"], 6)
         return out
+
+    # the status page
+
+    def service_up(self):
+        """Does this node's own server answer on the loopback? None when it has none."""
+        if self.role not in ("hop", "mint"):
+            return None
+        port = int(self.config.get("port", DEFAULT_PORT))
+        try:
+            status, _ = http_get("http://127.0.0.1:%d/status" % port, timeout=3)
+            return status == 200
+        except (urlerror.URLError, socket.timeout, OSError, ValueError):
+            return False
+
+    def status_report(self, now=None, service=None):
+        """Mint: the lab's public summary for the status page, from the ledger alone.
+
+        Names and roles only: never a NYM, an address or a hostname beyond the
+        nodes' names. Per node: when its last receipt (for the hop, its last
+        ack) reached the Mint, the bytes it signed for its latest window, how
+        many it has signed, how many of its windows settled and how many of
+        those were disputed. The Mint's own line counts what it recorded.
+        `service` is whether the Mint's server answered (service_up), None
+        when not checked.
+        """
+        now = int(now if now is not None else time.time())
+        self.load_index(skip_partial=True)
+        ix = self.index
+        peers = self.peers()
+        order = {"payer": 0, "hop": 1, "mint": 2, "peer": 3}
+        nodes = {}
+
+        def node(name, role):
+            n = nodes.get(name)
+            if n is None:
+                n = nodes[name] = {"name": name, "role": role, "last_receipt": None, "window_bytes": None,
+                                   "window_t_first": None, "window_t_last": None,
+                                   "receipts": 0, "windows": 0, "disputed": 0}
+            elif order[role] < order[n["role"]]:
+                n["role"] = role
+            return n
+
+        for name in peers.values():
+            node(name, "peer")                      # a peer with nothing on the ledger yet is still listed
+        entries = list(ix["by_sig"].values())
+        for e in entries:
+            n = node(e["from"], "payer" if e["kind"] == "receipt" else "hop")
+            r = e["receipt"]
+            n["receipts"] += 1
+            if n["last_receipt"] is None or e["received_at"] > n["last_receipt"]:
+                n["last_receipt"] = e["received_at"]
+            if n["window_t_last"] is None or r["t_last"] > n["window_t_last"]:
+                n["window_bytes"], n["window_t_first"], n["window_t_last"] = r["bytes"], r["t_first"], r["t_last"]
+        for st in ix["settled"].values():
+            for nym, role in ((st["payer"], "payer"), (st["hop"], "hop")):
+                if nym in peers:
+                    n = node(peers[nym], role)
+                    n["windows"] += 1
+                    n["disputed"] += 1 if st["status"] == "disputed" else 0
+        me = node(self.name, "mint")
+        me["role"] = "mint"
+        me["receipts"] = len(entries)
+        me["last_receipt"] = max((e["received_at"] for e in entries), default=None)
+        me["windows"] = len(ix["settled"])
+        me["disputed"] = sum(1 for st in ix["settled"].values() if st["status"] == "disputed")
+        latest = max(ix["settled"].values(), key=lambda st: (st["t_last"], st["t"]), default=None)
+        if latest:
+            me["window_bytes"], me["window_t_first"], me["window_t_last"] = latest["settled_bytes"], latest["t_first"], latest["t_last"]
+        no_ack, no_receipt = self.pending()
+        return {
+            "v": 1, "generated_at": now, "bwkit": VERSION, "phase": 0, "window_s": 3600,
+            "service": service,
+            "ledger": {"receipts": sum(1 for e in entries if e["kind"] == "receipt"),
+                       "acks": sum(1 for e in entries if e["kind"] == "ack"),
+                       "settlements": len(ix["settled"]), "disputed": me["disputed"],
+                       "receipts_without_ack": len(no_ack), "acks_without_receipt": len(no_receipt)},
+            "nodes": sorted(nodes.values(), key=lambda n: (order[n["role"]], n["name"])),
+        }
+
+    def report(self, url=None, token=None, now=None):
+        """Mint: post status_report() to the status page's Worker. Returns (HTTP status, body).
+
+        The URL and the token come from the arguments, else from the
+        environment (BWKIT_STATUS_URL, BWKIT_STATUS_TOKEN: the systemd unit
+        reads them from the root-only /etc/bwkit/status.env), the URL also from
+        `status_url` in the config. The token is never in the config.
+        """
+        if self.role != "mint":
+            raise SystemExit("only the Mint reports")
+        url = url or os.environ.get("BWKIT_STATUS_URL") or self.config.get("status_url")
+        token = token or os.environ.get("BWKIT_STATUS_TOKEN")
+        if not url:
+            raise SystemExit("no status URL: set BWKIT_STATUS_URL in /etc/bwkit/status.env (or status_url in the config)")
+        if not token:
+            raise SystemExit("no token: set BWKIT_STATUS_TOKEN in /etc/bwkit/status.env")
+        rep = self.status_report(now, service=self.service_up())
+        assert_public(json.dumps(rep, sort_keys=True))
+        return http_post(url, rep, timeout=STATUS_TIMEOUT_S, headers={"Authorization": "Bearer " + token})
 
     # the server
 
@@ -757,6 +888,9 @@ def main(argv=None):
     st.add_argument("receipt")
     st.add_argument("ack")
     st.add_argument("--price", type=float, default=DEFAULT_PRICE_USD_PER_GB)
+    rp = sub.add_parser("report", help="mint: post the ledger's public summary to the status page "
+                                       "(BWKIT_STATUS_URL and BWKIT_STATUS_TOKEN, from /etc/bwkit/status.env)")
+    rp.add_argument("--print", dest="print_only", action="store_true", help="print the report instead of posting it")
     args = ap.parse_args(argv)
 
     if args.cmd == "verify":
@@ -838,6 +972,21 @@ def main(argv=None):
             print("%s  %s pays %s: %d windows (%d disputed), %s, $%.4f" % (
                 args.month, peers.get(payer, payer), peers.get(hop, hop), o["windows"], o["disputed"],
                 fmt_bytes(o["settled_bytes"]), o["amount_usd"]))
+    elif args.cmd == "report":
+        if node.role != "mint":
+            raise SystemExit("only the Mint reports")
+        if args.print_only:
+            print(json.dumps(node.status_report(service=node.service_up()), indent=1, sort_keys=True))
+            return 0
+        try:
+            status, body = node.report()
+        except (urlerror.URLError, socket.timeout, OSError) as e:
+            log("status page unreachable: %s" % e)
+            return 1
+        if not 200 <= status < 300:
+            log("status page refused the report: %s %s" % (status, body))
+            return 1
+        log("status posted: %s" % json.dumps(body, sort_keys=True))
     return 0
 
 

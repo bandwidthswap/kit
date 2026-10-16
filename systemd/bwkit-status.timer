@@ -1,0 +1,11 @@
+[Unit]
+Description=bwkit: status report every two minutes
+
+[Timer]
+# Two minutes, not one: the Worker's KV allows 1,000 writes a day on the free plan.
+OnCalendar=*:0/2
+AccuracySec=5s
+Persistent=false
+
+[Install]
+WantedBy=timers.target
