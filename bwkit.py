@@ -53,7 +53,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 FIELDS = ("payer", "hop", "hop_index", "merkle_root", "bytes", "t_first", "t_last", "prev_sig")
 DOMAIN = b"bandwidthswap/receipt/v1\n"   # prefixed to every signed message
 CLOCK_TOLERANCE_S = 5                   # OPEN-QUESTIONS B9 default: 5 seconds, decline
@@ -692,8 +692,10 @@ class Node:
                     msg = str(e)
                     if msg.startswith("unknown"):
                         code = 403
+                    log("declined %s from %s: %s" % (self.path, self.client_address[0], msg))
                     return self.reply(code, {"error": msg.split(":")[0] if msg.startswith("clock") else msg, "detail": msg})
                 except ValueError as e:
+                    log("refused %s from %s: %s" % (self.path, self.client_address[0], e))
                     return self.reply(400, {"error": str(e)})
 
         srv = ThreadingHTTPServer((host, port), Handler)

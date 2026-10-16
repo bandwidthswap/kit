@@ -1,18 +1,30 @@
 #!/bin/sh
-# The first dispute test, from the Mac. Needs the tunnel and bwkit running
+# The dispute tests, from the Mac. Needs the tunnel and bwkit running
 # (phase0/provision.sh all). Two windows, both forced now rather than at the
 # top of the hour:
 #
 #   1. 20 MB through the tunnel, then a receipt: both meters agree -> settled.
-#   2. 20 MB more, then wg0 is restarted on bw-forest so its counters start
-#      over, then a receipt: the hop signs fewer bytes than the payer ->
-#      disputed, settled at the hop's count, by the Mint and again offline
-#      from the two signed files alone.
+#   2. 20 MB more, then wg0 is restarted on one node so its counters start
+#      over, then a receipt: the side that restarted signs fewer bytes than
+#      the other -> disputed, settled at the smaller count, by the Mint and
+#      again offline from the two signed files alone.
 #
-# Nothing is faked in the daemon: the hop's meter really did see fewer bytes.
+#   phase0/dispute-test.sh hop     the hop under-claims: wg0 restarts on bw-forest (the first test, Oct 16)
+#   phase0/dispute-test.sh payer   the hop over-claims: wg0 restarts on bw-house (the second test, Oct 16)
+#
+# Nothing is faked in the daemon and no count is set by hand: the meter that
+# restarted really did see fewer bytes. The hop has no hook for signing a
+# count of its own choosing, deliberately, so "the hop over-claims" is made
+# by giving the payer the smaller honest count. The rule is the same either
+# way: min(payer, hop).
 set -eu
 SSH="ssh -o ConnectTimeout=8 -o BatchMode=yes"
 MB="${MB:-20}"
+case "${1:-hop}" in
+  hop)   reset=bw-forest; side="the hop under-claims";  wins="hop" ;;
+  payer) reset=bw-house;  side="the hop over-claims";   wins="payer" ;;
+  *) echo "usage: $0 [hop|payer]" >&2; exit 2 ;;
+esac
 
 say() { printf '\n== %s\n' "$*"; }
 
@@ -45,12 +57,12 @@ say "window 1: $MB MB through the tunnel, then a receipt"
 push "$MB"
 receipt
 
-say "window 2: $MB MB more, then wg0 restarts on bw-forest (its counters start over), then a receipt"
+say "window 2 ($side): $MB MB more, then wg0 restarts on $reset (its counters start over), then a receipt"
 push "$MB"
-$SSH bw-forest 'sudo systemctl restart wg-quick@wg0 && sleep 3 && sudo wg show wg0 transfer'
+$SSH "$reset" 'sudo systemctl restart wg-quick@wg0 && sleep 3 && sudo wg show wg0 transfer'
 receipt
 
-say "the Mint's view"
+say "the Mint's view (expected: DISPUTED, settled at the $wins's count)"
 $SSH bw-mint 'sudo -u bwkit bwkit ledger | tail -6'
 say "the dispute, resolved again from the two signed files alone"
 $SSH bw-mint 'sudo -u bwkit bwkit ledger --json | python3 -c "
