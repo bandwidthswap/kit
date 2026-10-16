@@ -9,6 +9,7 @@ The code for the Phase 0 lab: three Raspberry Pi 3 B nodes on a home LAN that ke
 | `install.sh` | Installs `bwkit` on one node: `sudo ./install.sh payer\|hop\|mint` |
 | `systemd/` | The hop's and Mint's service, the payer's hourly timer. |
 | `phase0/provision.sh` | The whole lab from the Mac over SSH: upgrade, chrony, WireGuard, logs to RAM, bwkit. |
+| `phase0/dispute-test.sh` | The first dispute test from the Mac: an agreeing window, then one where the hop's counters restart mid-window. |
 
 ## What a receipt is
 
