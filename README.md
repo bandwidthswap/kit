@@ -93,3 +93,7 @@ What is deliberately not here: prepayment of a window (backlog B2 b), a payment 
 ## Keys
 
 `install.sh` makes each node's ed25519 key in `/var/lib/bwkit/key.priv` (mode 600, owner `bwkit`). WireGuard keys are made on the nodes by `provision.sh` and stay in `/etc/wireguard`. Nothing in this repo is secret and nothing secret should be added to it.
+
+## License
+
+MIT, see `LICENSE`.
