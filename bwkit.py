@@ -134,6 +134,7 @@ MAX_BODY = 1 << 20
 STATUS_TIMEOUT_S = 10                   # posting the status report
 HISTORY_HOURS = 12                      # the status report carries each node's windows of the last twelve hours
 HISTORY_MAX = 36                        # at most this many per node (the forced tests made several in one hour)
+REPORT_MAX = 64 * 1024                  # the status Worker refuses a larger body
 PRIVATE_PATTERNS = (                    # what a status report may never carry
     re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b"),               # an IPv4 address
     re.compile(r"\b[0-9a-f]{2}(?::[0-9a-f]{2}){5}\b", re.I),  # a MAC address
@@ -1798,7 +1799,9 @@ class Node:
         that hour's settlements, how many, the Mint's signature over them and
         the Mint's NYM (None until the first); `proof` is the proof document
         for that hour, so a browser can check the commitment against the
-        Mint's key with nothing else. NYMs are public keys and may appear;
+        Mint's key with nothing else; `mint` is the Mint's NYM; `steward` is
+        the Steward's book (Steward.feed: names and places only, None until
+        the Steward has a key). NYMs are public keys and may appear;
         addresses may not (assert_public).
         """
         now = int(now if now is not None else time.time())
@@ -1867,12 +1870,20 @@ class Node:
                 proof = make_proof(last, [s for s in ix["settled"].values() if commit_hour(s) == last["window"]])
             except ValueError:
                 proof = None                         # a settlement landed after this commitment; the next report has both
+        steward = None
+        if ix["steward_nym"]:
+            try:
+                steward = Steward(self).feed(now)
+            except (SystemExit, ValueError, OSError) as e:
+                log("steward: no book for the report: %s" % e)
         return {
             "v": 1, "generated_at": now, "bwkit": VERSION, "proto": PROTO, "phase": 0, "window_s": 3600,
             "since": min((e["received_at"] for e in entries), default=None),
             "service": service,
+            "mint": self.nym if self.priv else None,
             "commitment": {k: last[k] for k in ("t", "window", "root", "count", "signature", "mint")} if last else None,
             "proof": proof,
+            "steward": steward,
             "ledger": {"receipts": sum(1 for e in entries if e["kind"] == "receipt"),
                        "acks": sum(1 for e in entries if e["kind"] == "ack"),
                        "settlements": len(ix["settled"]), "disputed": me["disputed"],
@@ -1897,7 +1908,10 @@ class Node:
         if not token:
             raise SystemExit("no token: set BWKIT_STATUS_TOKEN in /etc/bwkit/status.env")
         rep = self.status_report(now, service=self.service_up())
-        assert_public(json.dumps(rep, sort_keys=True))
+        text = json.dumps(rep, sort_keys=True)
+        assert_public(text)
+        if len(text) > REPORT_MAX:
+            raise ValueError("the report is %d bytes; the status Worker takes at most %d" % (len(text), REPORT_MAX))
         return http_post(url, rep, timeout=STATUS_TIMEOUT_S, headers={"Authorization": "Bearer " + token})
 
     # the server

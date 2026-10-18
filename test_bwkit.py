@@ -572,7 +572,8 @@ class Commitments(unittest.TestCase):
         self.lab.step(600, 2_500_000, 2_500_000)             # a second window in the latest hour
         rep = self.lab.mint.status_report(now=self.lab.t + 60, service=True)
         self.assertEqual(set(rep), {"v", "generated_at", "bwkit", "proto", "phase", "window_s", "since", "service", "ledger", "nodes",
-                                    "commitment", "proof"})
+                                    "mint", "commitment", "proof", "steward"})
+        self.assertEqual((rep["mint"], rep["steward"]), (self.lab.mint.nym, None))
         c = self.lab.mint.ledger_lines()[-1]
         self.assertEqual(rep["commitment"], {"t": c["t"], "window": self.lab.t - 600, "root": c["root"], "count": 1,
                                              "signature": c["signature"], "mint": self.lab.mint.nym})
@@ -1586,6 +1587,38 @@ class StewardRole(unittest.TestCase):
         self.assertAlmostEqual(fl[1]["escrow"], round(income - 0.04 * income + 0.00008, 6), places=6)   # all the Steward has, less the match reserve
         self.assertEqual(len(self.recs("second_bridge")), 1)      # no link carried fees in the last program window
         self.assertEqual(run5["posted"], [fl[1]["id"]])
+
+    def test_the_report_carries_the_mint_and_the_stewards_book_and_refuses_an_address(self):
+        lab, st = self.lab, self.st
+        lab.hour(100_000_000, 100_000_000)
+        st.run(lab.t + 300)
+        rec, pid = lab.payer.purchase_post("bw-forest", 50_000_000, 0.02, 168, 1.0, lab.t + self.WEEK, now=lab.t)
+        lab.hour(200_000_000, 200_000_000)
+        rep = lab.mint.status_report(now=lab.t + 60, service=True)
+        self.assertEqual(rep["mint"], lab.mint.nym)
+        self.assertEqual(set(rep["steward"]), set(st.feed(lab.t + 60)))
+        self.assertEqual(rep["steward"]["nym"], st.nym)
+        self.assertEqual([p["program"] for p in rep["steward"]["purchases"]], ["second_bridge", "payer"])
+        self.assertEqual(rep["steward"]["payouts"][0]["payer"], "bw-house")
+        self.assertEqual(rep["steward"]["purchases"][1]["route"], {"from": "bw-house", "to": "bw-forest", "not_via": []})
+        text = json.dumps(rep, sort_keys=True)
+        bwkit.assert_public(text)
+        self.assertLess(len(text), bwkit.REPORT_MAX)
+        for nym in (lab.payer.nym, lab.hop.nym):                   # the book names nodes and places, never their keys
+            self.assertNotIn(nym, json.dumps(rep["steward"]))
+        # a map that carries an address (an operator's slip) never reaches the Worker: report() refuses it before sending
+        with open(self.map_path) as f:
+            m = json.load(f)
+        m["places"]["the-cabin"]["name"] = "the cabin at 192.168.0.61"
+        with open(self.map_path, "w") as f:
+            json.dump(m, f)
+        with self.assertRaises(ValueError) as cm:
+            lab.mint.report("http://127.0.0.1:1/status", "tok", now=lab.t + 60)
+        self.assertIn("192.168.0.61", str(cm.exception))
+        # without a Steward key the report says so and still goes
+        other = bwkit.Node(os.path.join(lab.root, "mint2"), {"role": "mint", "name": "m2"})
+        other.keygen()
+        self.assertIsNone(other.status_report(now=lab.t)["steward"])
 
     def test_the_steward_needs_the_mints_config_and_a_key(self):
         with self.assertRaises(SystemExit):
