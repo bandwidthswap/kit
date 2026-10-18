@@ -1,0 +1,43 @@
+# Punch list
+
+Work that is open in the kit and the lab, grouped by when it can be done. Each item says where it stands and how to pick it up. Work set aside in the site repo is in its own `PUNCH-LIST.md`.
+
+*Started Oct 18, 2026.*
+
+## Due on a date
+
+- **Oct 25: set the neighbor link's margin from a week of data.** The announcement says 10%, chosen from the first night's gaps (backlog B11 in the site repo). Run `phase0/link-report.sh`, take the week's gap distribution, and re-announce with `bwkit announce` on bw-neighbor. The same week tells whether the dashboard's learned baselines fire usefully; they stay silent until a node has a week of windows.
+- **Oct 25, 04:06: the house's purchase runs out.** Purchase `60162767`: 168 windows, at least 50 MB a window, two cents a gigabyte premium, a dollar of escrow. Check that it closes on its own, the unspent escrow returns to bw-house, and `bwkit steward book`, `bwkit invoice` and the dashboard agree on what was paid.
+- **Nov 1: the first invoice with the neighbor.** `sudo -u bwkit bwkit invoice 2026-10` on bw-mint, settled the way neighbors do; there is no payment rail. `phase0/NEIGHBOR.md` names November as the first full month.
+
+## Lab tests still to run
+
+These are the month's tests from `phase0/NEIGHBOR.md`, none run yet.
+
+- **The outage.** Take the neighbor's internet down for an hour. Receipts and acks should wait in the outbox and settle when it returns, with no window lost. This is the claim in the paper's Section 1, and the dashboard's outbox section has never drawn a real one.
+- **A forced dispute across the link.** Run `phase0/dispute-test.sh` with the hop at the neighbor's, and resolve it from the two signed receipts alone.
+
+## Kit fixes
+
+- **A lost window stays in `health` forever.** bw-mint and bw-house both flag the window of Oct 16, 16:28 (the forced clock test) as lost, and will on every check from now on. A lost window should leave `health` after a day; it stays in the ledger and in the page's open-windows table.
+- **One test is flaky.** `test_bwkit.py` failed once in four runs on Oct 18, before `bwkit.py` changed, and the name of the failing test was not captured. Run it in a loop until it fails, then fix the cause.
+- **bw-forest is not on the tailnet.** It runs 0.4.0 on the bench and answers on the house LAN, but a fleet page reading over the tailnet cannot reach it. Join it with `NODES=bw-forest phase0/neighbor.sh tailnet`, which needs a fresh pre-authentication key in `~/.config/bwkit/neighbor.env`. Or decide that it waits for Phase 1, when it becomes the radio hop.
+
+## Dashboard, after the serving work
+
+These are the follow-ups in `dashboard/PLAN.md` Sections 7 and 8. Start them once bwkit serves the three views on all four nodes.
+
+- **"Verify the last day"**: one button that checks every committed hour of the last 24, not one hour at a time.
+- **The Steward's history in the as-of control.** The control moves every record but not the Steward's balances, which exist only as of now. `steward.jsonl` already holds every run, so the page can redraw from it.
+- **A hop's own invoice.** "Owed to me" is the page's arithmetic over the Mint's settlements. A hop should get the invoice itself for its own windows, through the Mint proxy.
+- **A per-node "mine" switch in the fleet list**, so watching a counterparty's node does not count toward your own position.
+
+## Protocol, not yet built
+
+- **Prepayment of a window** (backlog B2, option b). The receipt and the monthly invoice are the settlement today (B8, option d).
+- **What profile 1 left out:** announcements over a gossip layer, places that buy service through an anchor, proving allowances that pay, and a second Mint. `spec/PROTOCOL.md` marks each as not in profile 1.
+
+## Waiting on the site repo
+
+- **The kit's half of the multi-tenant status Worker.** `bwkit report` signs its report with the Mint's key and drops the bearer token (phase 2 of `worker/PLAN.md` in the site repo). It waits on phase 1, which waits on a Cloudflare login; see the site's `PUNCH-LIST.md`.
+- **The payer pays for some of the path's loss.** On Oct 18 the house's own meter counted 1.102 bytes on `tailscale0` for each byte of payload, because TCP's retransmissions travel inside the tunnel and arrive. Whitepaper v0.6 Section 3.6 says every retransmission is the hop's cost. A week of `phase0/link-report.sh` data should size the effect. The correction to the paper then goes on a proof sheet for approval.
