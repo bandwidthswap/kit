@@ -134,6 +134,16 @@ The payer has no service to restart; its timer runs the new code at the next hou
 
 The hook is `/usr/local/bin/bwkit-on-decline`, run with the payer's NYM the first time the hop's patience declines that payer: it logs the fact and withdraws the exit node (`tailscale set --advertise-exit-node=false`, the one command a sudoers line lets the `bwkit` user run), since declining a receipt by itself costs the hop the window and the payer nothing. With `LINK_PATIENCE` 0 the hop never declines and the hook never runs; it is there so that the rule has teeth when the terms say so. To serve a declined payer again: `sudo -u bwkit bwkit patience --reset <NYM>` on the hop, and offer the exit node again by hand.
 
+## The house's purchase, and the Steward
+
+The house buys more than the hourly download: it posts a purchase on the neighbor's link (paper, Section 5.1; README, "The Steward and purchases"), keeping the link in use at a minimum of 50 MB a window for a week at a premium of two cents a gigabyte above the posted price, a dollar escrowed, which on the pilot is a line on the invoice. From `bw-house`:
+
+```
+sudo -u bwkit bwkit purchase post --to bw-neighbor --min-bytes 50000000 --premium 0.02 --windows 168 --escrow 1.00 --deadline +7d
+```
+
+The Mint registers it and every window from the one running settles with the premium on the bytes moved, in proportion below the minimum with the rest returned. The Steward on `bw-mint` (`phase0/provision.sh steward` installs the map, its key and its hourly timer) matches it at `m` of the Steward's whole income, posts a first-link offer for the cabin, and posts a second-bridge bounty on the house to next-door link that nobody can collect until there is a third place. `sudo -u bwkit bwkit steward book` on `bw-mint` is the book; the status page carries the same.
+
 ## What to watch for a month
 
 - The clock: `phase0/link-report.sh` gives the day-by-day figure between the sites; `chronyc tracking` on both ends is the live view, and the hop's journal says if it ever declines a receipt (since bwkit 0.1.1). Section 10 lists drift between sites as unmeasured; this is the measurement.

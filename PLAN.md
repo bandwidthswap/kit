@@ -60,6 +60,8 @@ One file still. Changes, each with tests in `test_bwkit.py`:
 
 ## 2. The Steward's tools
 
+*Built October 18, 2026, kit commits 8543c5c (2.3, `steward_rules.py` shared with the simulator), 5d80ac2 (2.1 and 2.2, purchases and settlement against them), d998fb0 (2.4, the Steward role, its timer, the map), 9bcb170 (2.5, the report's `mint`, `proof` and `steward`), 7dee697 and 77bd0ce (the spec's extension as built, a purchase vector, a purchase governs the window running when it is posted). 2.6 ran on the lab the same morning: the Steward's first run at 04:06 CDT on real fees, the house's purchase posted at 04:06, the first settlement against it at the 05:00 window. What changed on the way: the per-payer cap counts fees in as the gross amounts a payer paid for carriage (the paper's "fees that NYM has paid in", and the simulator's reading), not the sum of `fee_usd` as 2.3 below says; a place counts as linked once a settled window has either end at it; the Steward's income is the sum of `fee_usd`, so the 42 windows settled before 0.3.0 contribute nothing to it, and the lab's Steward started with one window's fee, not the mockup's 0.21¢.*
+
 ### 2.1 The purchase commitment, as a record
 
 The paper calls both the Merkle commitment and the bounty a commitment. In the code the bounty is a **purchase**, to keep the ledger readable. The spec's extension section defines it:

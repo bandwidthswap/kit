@@ -7,10 +7,12 @@ The code for the Phase 0 lab: three Raspberry Pi 3 B nodes on a home LAN that ke
 | `bwkit.py` | The receipt daemon and the Mint, one file: the reference implementation of the pilot profile (`spec/`), with link announcements, the Steward's fee, the Mint's hourly commitment and the ledger rebuild. Python 3.9+ and `python3-cryptography`. |
 | `spec/PROTOCOL.md`, `spec/CONFORMANCE.md`, `spec/vectors/` | The Bandwidth Swap Protocol, pilot profile 1 (`bsp/1`), written from what the kit does; what a second implementation must reproduce; the test vectors it reproduces, from published test-only keys. "The specification" below. |
 | `tools/vectors.py`, `tools/conform.py` | Write the vectors from the kit; check a directory in their layout. |
+| `steward_rules.py` | The Network Steward's sizes and cap as pure functions, imported by `bwkit.py` and by `sim/steward.py`, so the simulator and the Mint run one rule. Installed beside `bwkit`. |
+| `phase0/map.json` | The lab's map for the Steward: domain `earth` (USD, `bw-mint`), places `house`, `next-door` and `the-cabin`, and which node is at which place. Installed as `/etc/bwkit/map.json` on `bw-mint`. |
 | `test_bwkit.py` | Runs a payer, a hop and a Mint in one process. `python3 test_bwkit.py` (on the Mac: `python3 -m venv venv && venv/bin/pip install cryptography`, then `venv/bin/python`; `venv/` is ignored) |
 | `install.sh` | Installs `bwkit` on one node: `sudo ./install.sh payer\|hop\|mint` |
-| `systemd/` | The hop's and Mint's service, the payer's hourly timer, the Mint's status timer (every two minutes). |
-| `phase0/provision.sh` | The whole lab from the Mac over SSH: upgrade, chrony, WireGuard, logs to RAM, bwkit; `status` installs the status reporter on `bw-mint`. |
+| `systemd/` | The hop's and Mint's service, the payer's hourly timer, the Mint's status timer (every two minutes), the Steward's hourly timer (five past, after the commitment). |
+| `phase0/provision.sh` | The whole lab from the Mac over SSH: upgrade, chrony, WireGuard, logs to RAM, bwkit; `status` installs the status reporter on `bw-mint`, `steward` the Steward (the map, its key, its timer). |
 | `phase0/neighbor.sh`, `phase0/NEIGHBOR.md` | A fourth node at a neighbor's house, the first operated by someone else: provisioned on the house LAN, meeting the house on a Tailscale tailnet because neither house can open a port, then carried next door. `NEIGHBOR.md` is the whole procedure. |
 | `phase0/link-log.sh`, `phase0/link-report.sh` | The neighbor's link measured: a ten-minute log on both ends (each clock against NTP, the metered and uplink byte counters), the purchase line carrying its rate and overhead, and the report from the Mac that reads them with the Mint's ledger: the clock between the sites per day, overhead and rate per purchase, the payer/hop gap per window. `NEIGHBOR.md`, "Measuring the link". |
 | `phase0/dispute-test.sh [hop\|payer]` | The dispute tests from the Mac: an agreeing window, then one where one side's counters restart mid-window. `hop` (the default) is the hop under-claiming, `payer` the hop over-claiming; the Mint settles both at the smaller count. |
@@ -45,6 +47,24 @@ Neither party is bound beyond what it signed: the payer never pays for more than
 **The link's terms.** A hop announces the parameters of its link (paper, Appendix A.1) by signing them and registering them with the Mint: `bwkit announce` on the hop reads the `link` object in its config (price, margin, `min_bytes`, patience, clock tolerance, medium, range class) and posts the signed record to `POST /link`; the Mint keeps it in `links.jsonl` and lists it at `GET /links`. The announcement governs every window that starts at or after its `since`; a window with none in force settles under the pilot's defaults and says so (`link: null`). The Mint refuses a backdated announcement, so the terms of a settled window never change. **Patience** is the hop's side of it: it counts, per payer, the windows whose payer count fell short of its own beyond the margin, and after `patience_windows` of them (0, never, on the lab) it declines that payer's next receipt and runs the `on_decline` command from its config with the payer's NYM, which on the neighbor's node withdraws the exit node, since declining a receipt by itself costs the hop the window and the payer nothing.
 
 Dollars, not tokens: the Mint prices settled bytes at the announcement's price (or `price_usd_per_gb` from its config when there is none; the lab's posted price, 10 cents a gigabyte), takes the Network Steward's fraction `steward_fee` (5%, paper 3.3) of every settlement as `fee_usd`, and `bwkit invoice 2026-10` sums a month with the relay's share and the Steward's line apart. There is no payment rail; the invoice is the pilot's settlement (backlog E, B8 default d). Settlements written before 0.3.0 carry no fee and none is taken from them.
+
+## The Steward and purchases
+
+The paper's Network Steward (Section 7) is a rule, not a party: it receives the fraction `f` of every fee and can spend only by posting purchase commitments, which pay out against settled receipts and refund on shortfall. In the kit a bounty is a **purchase** (the Merkle commitment keeps the word commitment). Both halves run on the lab since October 18, 2026.
+
+**A purchase** (spec, Section 15) is a signed record: a route (from a node or a place to a node or a place), a minimum rate in bytes per window, a premium per gigabyte above the posted price, a number of windows, a deadline and an escrow, which on the pilot is a line on the invoice. A payer posts one with `bwkit purchase post --to bw-neighbor --min-bytes 50000000 --premium 0.02 --windows 168 --escrow 1.00 --deadline +7d` and the Mint registers it (`POST /purchase`, `purchases.jsonl`, `GET /purchases`, `bwkit purchase list`). From then on every window the purchase governs (the window running when it was posted and the ones after, until its windows or its deadline are spent) settles with the rule of Section 5.1 after the smaller count: the premium on the bytes moved, in proportion below the minimum with the rest of that window's premium returned to the poster, drawn from the poster's escrow first and then from the Steward's match under the per-payer cap. The settlement carries `purchase`, `premium_usd`, `refund_usd`, `from_poster_usd`, `from_steward_usd` and `steward_held_usd`; the fee takes `f` of the premium as of any fee; the invoice shows the premium column and the refund line; the rebuild takes `purchases.jsonl` as its fourth input.
+
+**The Steward** runs on `bw-mint` as `bwkit-steward.timer`, five minutes past every hour, with its own key (`bwkit steward keygen`, kept in `steward.priv` beside the Mint's) and the map in `/etc/bwkit/map.json`. Every balance it shows is read from the ledger and the purchases; `steward.jsonl` logs its runs. Each run applies the three programs of PLAN.md 2.4 through `steward_rules.py`: a **match** on a payer's open purchase, at `m` of the escrow within `m` of the Steward's whole income (on the lab a hundredth of a cent, which is the rule working); a **second-bridge** bounty for every link that carried fees between two different places in the program window, sized at the Steward's take of those fees with the link's effective price as the premium, routed from one place to the other through a third (nobody on the lab can collect it, since the lab has no third place; a link inside one place, like the bench wire, is skipped); and a standing **first-link** offer for every mapped place no settled window has an end at, topped up toward `first_link_usd` on every run from what is left after the match reserve. Escrow a closed posting did not spend returns to the Steward and is posted again. The Steward posts through the Mint's own `/purchase`, which accepts its NYM for its programs.
+
+```
+sudo -u bwkit bwkit steward status     # on bw-mint: the balances in a line
+sudo -u bwkit bwkit steward book       # the book: balances, open offers, the links of the program window, the map
+sudo -u bwkit bwkit steward run        # what the timer does
+sudo -u bwkit bwkit steward feed       # the `steward` object the status report carries
+sudo -u bwkit bwkit steward map        # the map, and which node is where
+```
+
+The status report carries the same book as `steward` (names and places only), the Mint's NYM as `mint`, and the committed hour's proof as `proof`, so the site's Steward's book page and its verifier draw from the feed. The Steward's parameters are the Mint's config: `steward: {m, margin, program_window_s, first_link_usd, first_link_premium, min_payer_age_s, bounty_deadline_s}`, defaults `0.04`, `0.01`, a week, `1.00`, `0.05`, a day and a week.
 
 ## The specification
 
@@ -90,8 +110,9 @@ ssh bw-mint 'sudo systemctl stop bwkit'
 ssh bw-house  'sudo cat /var/lib/bwkit/receipts.jsonl' > receipts.jsonl
 ssh bw-forest 'sudo cat /var/lib/bwkit/acks.jsonl'     > acks.jsonl     # bw-neighbor-ts once the hop is the neighbor's
 ssh bw-mint   'sudo cat /var/lib/bwkit/links.jsonl'    > links.jsonl    # the announcements (the hop's copy serves as well)
+ssh bw-mint   'sudo cat /var/lib/bwkit/purchases.jsonl' > purchases.jsonl
 ssh bw-mint   'sudo cat /var/lib/bwkit/ledger.jsonl'   > ledger.jsonl
-python3 bwkit.py rebuild receipts.jsonl acks.jsonl links.jsonl --compare ledger.jsonl
+python3 bwkit.py rebuild receipts.jsonl acks.jsonl links.jsonl purchases.jsonl --compare ledger.jsonl
 ssh bw-mint 'sudo systemctl start bwkit'
 ```
 
@@ -101,7 +122,7 @@ The second is the test the paper names: the Mint's word was never the proof. The
 
 [bandwidthswap.com](https://bandwidthswap.com/#lab) shows which nodes are up. The nodes have no inbound ports and that stays so, so the Mint pushes: `bwkit report` summarises the ledger per node and POSTs it, with a bearer token, to a small Cloudflare Worker at `status.bandwidthswap.com` (in the site repo under `worker/`), and the page reads it from there. The `bwkit-status.timer` runs it every two minutes on `bw-mint` (two, not one: the Worker's KV allows 1,000 writes a day on the free plan).
 
-The report is **names and roles only**: for each node its name (`bw-house`, `bw-forest`, `bw-mint`), its role (`payer`, `hop`, `mint`; `peer` for a peer with nothing on the ledger yet), when its last receipt (the hop's last ack) reached the Mint, the bytes it signed for its latest window and that window's bounds, how many receipts it has signed, how many of its windows settled and how many of those were disputed, its running total of bytes (`total_bytes`: signed by the payer, counted by the hop, settled by the Mint) and its `history`, the windows of the last twelve hours (`HISTORY_HOURS`, at most `HISTORY_MAX` = 36), each with the window's bounds, its bytes, the settled bytes and the disputed flag (both `null` while the window waits for its other half); plus `since` (when the first entry reached the ledger), a `ledger` summary (receipts, acks, settlements, disputed, receipts without ack, acks without receipt), the Mint's latest `commitment` (its hour, root, count, signature and the Mint's NYM, `null` before the first) with that hour's `proof` (the settlements, their leaves and paths, as `bwkit prove` prints them), whether the Mint's own server answers (`service`) and `generated_at`. The page draws the map from the first part and the ledger strip from the history, one column per hour. NYMs are public keys and appear in the commitment and the proof; no address, no hostname beyond those names. `assert_public` in `bwkit.py` refuses a report carrying an IPv4 or MAC address before it is sent, the Worker refuses one on arrival, and the test checks the shape, the absence of addresses and the Worker's size limit. `bwkit report --print` on `bw-mint` prints what would be sent.
+The report is **names and roles only**: for each node its name (`bw-house`, `bw-forest`, `bw-mint`), its role (`payer`, `hop`, `mint`; `peer` for a peer with nothing on the ledger yet), when its last receipt (the hop's last ack) reached the Mint, the bytes it signed for its latest window and that window's bounds, how many receipts it has signed, how many of its windows settled and how many of those were disputed, its running total of bytes (`total_bytes`: signed by the payer, counted by the hop, settled by the Mint) and its `history`, the windows of the last twelve hours (`HISTORY_HOURS`, at most `HISTORY_MAX` = 36), each with the window's bounds, its bytes, the settled bytes and the disputed flag (both `null` while the window waits for its other half); plus `since` (when the first entry reached the ledger), a `ledger` summary (receipts, acks, settlements, disputed, receipts without ack, acks without receipt), the Mint's NYM as `mint`, its latest `commitment` (its hour, root, count, signature and the Mint's NYM, `null` before the first) with that hour's `proof` (the settlements, their leaves and paths, as `bwkit prove` prints them), the Steward's book as `steward` (`null` until the Steward has a key), whether the Mint's own server answers (`service`) and `generated_at`. The page draws the map from the first part and the ledger strip from the history, one column per hour. NYMs are public keys and appear in the commitment and the proof; no address, no hostname beyond those names. `assert_public` in `bwkit.py` refuses a report carrying an IPv4 or MAC address before it is sent, the Worker refuses one on arrival, and the test checks the shape, the absence of addresses and the Worker's size limit. `bwkit report --print` on `bw-mint` prints what would be sent.
 
 The URL and the token live in `/etc/bwkit/status.env` on `bw-mint`, root-only, read by systemd for the oneshot (`BWKIT_STATUS_URL`, `BWKIT_STATUS_TOKEN`); the token is never in the config file or in either repo. `phase0/provision.sh status` writes that file from `$BWKIT_STATUS_TOKEN` on the Mac, puts the current `bwkit.py` and units on `bw-mint`, enables the timer and sends a report; run with no token it keeps the file already there and only updates the code. The site repo's `worker/README.md` has the whole sequence, Worker side first.
 
@@ -139,12 +160,16 @@ curl -s http://bw-mint.local:8710/status        # counts, pending halves, commit
 curl -s http://bw-mint.local:8710/ledger        # the ledger, one JSON object per line
 curl -s http://bw-mint.local:8710/commitments   # the current commitment of every hour
 curl -s http://bw-mint.local:8710/links         # the link announcements the Mint holds
+curl -s http://bw-mint.local:8710/purchases     # the purchases it holds
 curl -s "http://bw-mint.local:8710/proof?window=1792306800"   # the proof document for that hour
 sudo -u bwkit bwkit ledger [--disputes]      # on bw-mint, readable
 sudo -u bwkit bwkit links                    # on bw-mint: the announcements, readable
 sudo -u bwkit bwkit invoice 2026-10          # on bw-mint, with the Steward's line
 sudo -u bwkit bwkit prove 2026-10-17T21      # on bw-mint: the inclusion proofs for that hour
 sudo -u bwkit bwkit announce                 # on a hop: sign the config's `link` and register it with the Mint
+sudo -u bwkit bwkit purchase post ...        # on the payer: post a purchase on a route (see "The Steward and purchases")
+sudo -u bwkit bwkit purchase list            # on the Mint or the payer: the purchases held
+sudo -u bwkit bwkit steward book             # on bw-mint: the Steward's book
 sudo -u bwkit bwkit patience [--reset NYM]   # on a hop: the payers counted short, and whether one is declined
 sudo -u bwkit bwkit status                   # on any node
 journalctl -u bwkit -u bwkit-receipt -f      # the daemon's log
@@ -165,6 +190,9 @@ Config (`/etc/bwkit/config.json`):
 | `mint_nym` | hop | The Mint's NYM for the announcement's `domain`; read from the Mint's `/status` when absent |
 | `price_usd_per_gb` | mint | The posted price for a window with no announcement in force |
 | `steward_fee` | mint | The Network Steward's fraction `f` of every settlement, 0.05 |
+| `steward` | mint | The Steward's parameters: `m`, `margin`, `program_window_s`, `first_link_usd`, `first_link_premium`, `min_payer_age_s`, `bounty_deadline_s` |
+| `steward_mint` | mint | Where the Steward posts its purchases; the Mint's own loopback by default |
+| `map` | mint | The map's path; `/etc/bwkit/map.json` (or `BWKIT_MAP`) by default |
 | `status_url` | mint | Where `bwkit report` posts; usually set as `BWKIT_STATUS_URL` in `/etc/bwkit/status.env` instead. The token is only ever in that file. |
 
 What is deliberately not here: prepayment of a window (backlog B2 b), a payment rail, more than one hop, onion routing, a token, a chain. The outbox means a node that cannot reach the Mint keeps its receipts and sends them next hour; a hop that was down for a window acks the next one with both windows' bytes, and the Mint settles that window at the payer's count, so the hop loses the window it missed. The HTTP is plain, on a private LAN; the signatures are what protect the receipts.

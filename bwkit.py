@@ -2105,7 +2105,7 @@ class Steward:
         nym = self.nym if self.priv else ix["steward_nym"]
         f, m = node.config.get("steward_fee", DEFAULT_STEWARD_FEE), self.params["m"]
         settled = sorted(ix["settled"].values(), key=lambda st: (st["t"], settlement_order(st)))
-        income = round(sum(st.get("fee_usd", 0.0) for st in settled), 6)
+        income = round(float(sum(st.get("fee_usd", 0.0) for st in settled)), 6)
         place_of = book.place_of
         recs = [book.purchases[pid] for pid in book.order]
         rows = []
@@ -2128,12 +2128,12 @@ class Steward:
                          "mine": rec["poster"] == nym, "refund": u.get("refund", 0.0),
                          "match": book.match_for(rec["id"]) if rec["program"] == "payer" else None})
         mine = [r for r in rows if r["mine"]]
-        posted = round(sum(r["rec"]["escrow"] for r in mine), 6)
-        paid = round(sum(r["paid"] for r in mine), 6)
-        returned = round(sum(r["pool"] for r in mine if r["status"] != "open"), 6)
-        in_offers = round(sum(r["pool"] for r in mine if r["status"] == "open"), 6)
-        held = round(sum(st.get("steward_held_usd", 0.0) for st in settled), 6)
-        matched = round(sum(r["rec"]["escrow"] for r in mine if r["rec"]["program"] == "match"), 6)
+        posted = round(float(sum(r["rec"]["escrow"] for r in mine)), 6)
+        paid = round(float(sum(r["paid"] for r in mine)), 6)
+        returned = round(float(sum(r["pool"] for r in mine if r["status"] != "open")), 6)
+        in_offers = round(float(sum(r["pool"] for r in mine if r["status"] == "open")), 6)
+        held = round(float(sum(st.get("steward_held_usd", 0.0) for st in settled)), 6)
+        matched = round(float(sum(r["rec"]["escrow"] for r in mine if r["rec"]["program"] == "match")), 6)
         escrow = round(income - posted + returned, 6)
         reserve = round(max(0.0, m * income - matched), 6)
         # the links of the program window: (payer's place, hop's place) with the fees they carried
