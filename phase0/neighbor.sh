@@ -227,7 +227,7 @@ EOS
 
 step_update() {
   say "bwkit.py and the units to $N, the hop restarted (the Mint should already run the newer kit)"
-  COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py steward_rules.py install.sh systemd dashboard | $SSH "$(host_of $N)" 'mkdir -p ~/kit && tar -C ~/kit -xf - && sudo install -m 0755 ~/kit/bwkit.py /usr/local/bin/bwkit && sudo install -m 0644 ~/kit/steward_rules.py /usr/local/bin/steward_rules.py && sudo install -d -m 0755 /usr/local/share/bwkit && sudo install -m 0644 ~/kit/dashboard/dashboard.html /usr/local/share/bwkit/dashboard.html && sudo install -m 0644 ~/kit/systemd/*.service ~/kit/systemd/*.timer /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl restart bwkit && sleep 1 && echo "$(hostname): bwkit $(grep -m1 "^VERSION" /usr/local/bin/bwkit | cut -d\" -f2), server $(systemctl is-active bwkit)"'
+  COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py steward_rules.py install.sh systemd dashboard | $SSH "$(host_of $N)" 'mkdir -p ~/kit && tar -C ~/kit -xf - && sudo install -m 0755 ~/kit/bwkit.py /usr/local/bin/bwkit && sudo install -m 0644 ~/kit/steward_rules.py /usr/local/bin/steward_rules.py && sudo install -d -m 0755 /usr/local/share/bwkit/dashboard && sudo install -m 0644 ~/kit/dashboard/*.html ~/kit/dashboard/*.css ~/kit/dashboard/*.js /usr/local/share/bwkit/dashboard/ && sudo rm -f /usr/local/share/bwkit/dashboard.html && sudo install -m 0644 ~/kit/systemd/*.service ~/kit/systemd/*.timer /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl restart bwkit && sleep 1 && echo "$(hostname): bwkit $(grep -m1 "^VERSION" /usr/local/bin/bwkit | cut -d\" -f2), server $(systemctl is-active bwkit)"'
   run $N 'curl -s http://127.0.0.1:8710/status | head -c 400; echo'
 }
 

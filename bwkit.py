@@ -129,8 +129,13 @@ DEFAULT_STEWARD = {                     # the Steward's parameters (paper, Secti
     "min_payer_age_s": 86400, "bounty_deadline_s": 7 * 86400,
 }
 DEFAULT_MAP_PATH = "/etc/bwkit/map.json"   # BWKIT_MAP: the membership's map of domains, places and which node is where
-DASHBOARD_PATHS = ("/usr/local/share/bwkit/dashboard.html",   # the node's own page (dashboard/dashboard.html), served at /
-                   os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard", "dashboard.html"))
+DASHBOARD_DIRS = ("/usr/local/share/bwkit/dashboard",         # the node's own page (the kit's dashboard/), served at / and /dash/
+                  os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard"))
+DASHBOARD_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8", ".js": "application/javascript; charset=utf-8",
+                   ".mjs": "application/javascript; charset=utf-8", ".json": "application/json", ".svg": "image/svg+xml"}
+DASHBOARD_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")      # a file of the directory itself, never a path
+SNAPSHOT_PROOFS = {"mint": 24, "hop": 2, "payer": 2}  # how many committed hours' proofs a snapshot embeds: the Mint's own are cheap, a node's come over the wire
+BSP_MODULE = """<script type="module">import * as bsp from './dash/bsp.js'; window.bsp = bsp;</script>"""   # index.html's verifier line
 DECLINE_WORDS = ("clock", "patience", "since", "domain", "profile", "replay", "route")   # 409 reasons, the word before the colon
 TOKEN_RE = re.compile(r"^[a-z0-9-]{1,32}$")   # a medium or range class
 HTTP_TIMEOUT_S = 10
@@ -2373,30 +2378,121 @@ class Node:
         items.sort(key=lambda i: order.get(i["level"], 3))
         return {"items": items, "checked_at": now}
 
-    def dashboard_path(self):
-        for p in ((self.config.get("dashboard"),) if self.config.get("dashboard") else ()) + DASHBOARD_PATHS:
-            if p and os.path.exists(p):
-                return p
+    def dashboard_dir(self):
+        """The directory the page is served from: `dashboard` in the config, else the installed copy, else the kit's own."""
+        for d in ((self.config.get("dashboard"),) if self.config.get("dashboard") else ()) + DASHBOARD_DIRS:
+            if d and os.path.isfile(os.path.join(d, "index.html")):
+                return d
         return None
 
-    def dashboard(self, snapshot=False):
-        """The node's page (dashboard/dashboard.html), as served at /; with snapshot, the node's data embedded so the file stands alone."""
-        p = self.dashboard_path()
-        if p is None:
+    def dashboard_file(self, name):
+        """(bytes, content type) of one file of the page's directory, or None: a plain name of a known type, nothing else."""
+        d = self.dashboard_dir()
+        ext = os.path.splitext(name)[1]
+        if d is None or not DASHBOARD_NAME.match(name) or ext not in DASHBOARD_TYPES or not os.path.isfile(os.path.join(d, name)):
             return None
-        with open(p, encoding="utf-8") as f:
-            html = f.read()
+        with open(os.path.join(d, name), "rb") as f:
+            return f.read(), DASHBOARD_TYPES[ext]
+
+    def snapshot_remote(self):
+        """A hop's or a payer's share of a snapshot that comes from its Mint, fetched before the node's lock is taken:
+        {mint: {ledger, commitments, name}, map, proofs}. Nothing of it is re-serialised: the ledger is the Mint's text,
+        the proofs are the Mint's text, for the hours that hold this node's windows (the newest SNAPSHOT_PROOFS)."""
+        info = self.mint_info()
+        out = {"mint": {"ledger": "", "commitments": [], "name": info["name"]}, "map": None, "proofs": {}}
+        try:
+            status, data, _ = self.proxy_get("/ledger")
+            if status == 200:
+                out["mint"]["ledger"] = data.decode("utf-8")
+            status, data, _ = self.proxy_get("/commitments")
+            if status == 200:
+                out["mint"]["commitments"] = json.loads(data.decode("utf-8"))
+            if not self.map_path_exists():
+                status, data, _ = self.proxy_get("/map")
+                if status == 200:
+                    out["map"] = json.loads(data.decode("utf-8"))
+        except (urlerror.URLError, socket.timeout, OSError, ValueError):
+            return out
+        me = self.nym if self.priv else None
+        mine = set()
+        for line in out["mint"]["ledger"].split("\n"):
+            if '"settlement"' in line:
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if e.get("kind") == "settlement" and me in (e.get("payer"), e.get("hop")):
+                    mine.add(commit_hour(e))
+        hours = sorted((c["window"] for c in out["mint"]["commitments"] if c["window"] in mine), reverse=True)[:SNAPSHOT_PROOFS[self.role]]
+        for w in hours:
+            try:
+                status, data, _ = self.proxy_get("/proof?window=%d" % w)
+            except (urlerror.URLError, socket.timeout, OSError):
+                break
+            if status == 200:
+                out["proofs"][str(w)] = data.decode("utf-8")
+        return out
+
+    def snapshot_data(self, remote=None):
+        """The node's data as the page's `<script id="snapshot">` holds it (dashboard/fixtures/<role>.json has each role's shape).
+
+        Every .jsonl file goes in as its text; a proof as the text GET /proof
+        serves, since its leaves hash the Mint's own number spelling; a hop's
+        or payer's Mint comes from `remote` (snapshot_remote).
+        """
+        st = self.status_dict()
+        snap = {"taken_at": st["time"], "status": st}
+        if self.role == "mint":
+            snap["ledger"] = self.file_bytes("ledger.jsonl").decode("utf-8")
+            snap["commitments"] = self.commitments()
+            snap["purchases"] = self.file_bytes("purchases.jsonl").decode("utf-8")
+            snap["steward"] = self.steward_view()
+            snap["map"] = self.load_map() if self.map_path_exists() else None
+            proofs = {}
+            for c in snap["commitments"][-SNAPSHOT_PROOFS["mint"]:]:
+                try:
+                    proofs[str(c["window"])] = json.dumps(self.proof(c["window"], reload=False), sort_keys=True)
+                except (SystemExit, ValueError):
+                    pass                                     # an hour settled since its commitment: the next one has both
+            snap["proofs"] = proofs
+            return snap
+        remote = remote or {"mint": {"ledger": "", "commitments": [], "name": self.mint_info()["name"]}, "map": None, "proofs": {}}
+        if self.role == "payer":
+            snap["receipts"] = self.file_bytes("receipts.jsonl").decode("utf-8")
+            snap["acks"] = self.file_bytes("acks.jsonl").decode("utf-8")
+            snap["purchases"] = self.file_bytes("purchases.jsonl").decode("utf-8")
+        else:
+            snap["acks"] = self.file_bytes("acks.jsonl").decode("utf-8")
+            snap["receipts"] = self.file_bytes("receipts.jsonl").decode("utf-8")
+            snap["links"] = self.file_bytes("links.jsonl").decode("utf-8")
+        snap["outbox"] = self.outbox_list()
+        snap["mint"] = remote["mint"]
+        snap["map"] = self.load_map() if self.map_path_exists() else remote["map"]
+        snap["proofs"] = remote["proofs"]
+        return snap
+
+    def dashboard_html(self, snapshot=False, remote=None):
+        """index.html as served at /, /fleet and /snapshot; with snapshot, one self-contained file: the stylesheet and the
+        scripts inlined (bsp.js as an inline module) and the node's data in the `<script id="snapshot">` element."""
+        d = self.dashboard_dir()
+        if d is None:
+            return None
+
+        def read(name):
+            with open(os.path.join(d, name), encoding="utf-8") as f:
+                return f.read().replace("</script", "<\\/script")
+
+        html = read("index.html").replace("<\\/script", "</script")
         if not snapshot:
             return html
-        st = self.status_dict()
-        snap = {"taken_at": st["time"], "status": st,
-                "ledger": open(self.path("ledger.jsonl")).read() if self.role == "mint" and os.path.exists(self.path("ledger.jsonl")) else "",
-                "commitments": self.commitments() if self.role == "mint" else [],
-                "purchases": open(self.path("purchases.jsonl")).read() if os.path.exists(self.path("purchases.jsonl")) else "",
-                "steward": self.steward_view() if self.role == "mint" else None,
-                "map": self.load_map() if self.map_path_exists() else None}
+        html = re.sub(r'<link rel="stylesheet" href="dash/([A-Za-z0-9_.-]+)">', lambda m: "<style>\n%s</style>" % read(m.group(1)), html)
+        html = re.sub(r'<script src="dash/([A-Za-z0-9_.-]+)"></script>', lambda m: "<script>\n%s</script>" % read(m.group(1)), html)
+        if BSP_MODULE in html:
+            text = read("bsp.js")
+            names = re.findall(r"^export (?:async )?(?:function|const|let|var|class) (\w+)", text, re.M)   # an inline module may export; nothing imports it
+            html = html.replace(BSP_MODULE, '<script type="module">\n%s\nwindow.bsp = {%s};</script>' % (text, ", ".join(names)), 1)
         marker = '<script id="snapshot" type="application/json"></script>'
-        filled = '<script id="snapshot" type="application/json">%s</script>' % json.dumps(snap).replace("</", "<\\/")
+        filled = '<script id="snapshot" type="application/json">%s</script>' % json.dumps(self.snapshot_data(remote)).replace("</", "<\\/")
         return html.replace(marker, filled, 1) if marker in html else html
 
     def map_path_exists(self):
@@ -2512,13 +2608,20 @@ class Node:
 
             def do_GET(self):
                 url = urlparse.urlsplit(self.path)
-                if url.path in ("/", "/index.html", "/snapshot"):
+                if url.path in ("/", "/index.html", "/fleet", "/snapshot"):
+                    snapshot = url.path == "/snapshot"
+                    remote = node.snapshot_remote() if snapshot and node.role != "mint" else None   # the Mint's part, outside the lock
                     with node.lock:
-                        html = node.dashboard(snapshot=url.path == "/snapshot")
+                        html = node.dashboard_html(snapshot=snapshot, remote=remote)
                     if html is None:
-                        return self.reply(404, {"error": "no dashboard: dashboard.html is not installed (config `dashboard`, or /usr/local/share/bwkit)"})
+                        return self.reply(404, {"error": "no dashboard: the page's directory is not installed (config `dashboard`, or /usr/local/share/bwkit/dashboard)"})
                     return self.raw(html.encode("utf-8"), "text/html; charset=utf-8",
-                                    "%s-snapshot-%s.html" % (node.name, time.strftime("%Y%m%dT%H%M")) if url.path == "/snapshot" else None)
+                                    "%s-snapshot-%s.html" % (node.name, time.strftime("%Y%m%dT%H%M")) if snapshot else None)
+                if url.path.startswith("/dash/"):
+                    got = node.dashboard_file(url.path[6:])
+                    if got is None:
+                        return self.reply(404, {"error": "no such file of the page"})
+                    return self.raw(got[0], got[1])
                 if url.path == "/status":
                     if node.role != "mint":
                         node.mint_info()                     # the Mint's name, read outside the lock when it is time

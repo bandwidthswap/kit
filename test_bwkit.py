@@ -1906,10 +1906,12 @@ class Served(unittest.TestCase):
         self.payer_srv.server_close()
         self.lab.close()
 
+    PAGE = ("/", "/fleet", "/snapshot", "/dash/data.js", "/dash/bsp.js", "/dash/style.css", "/dash/nothing.js", "/nothing")
     PATHS = {"mint": ("/status", "/ledger", "/ledger?since=1", "/commitments", "/purchases", "/links", "/map", "/steward", "/proof?window=1800000000",
-                      "/proof?window=x", "/nothing", "/", "/snapshot"),
-             "hop": ("/status", "/purchases", "/map", "/ledger", "/nothing", "/", "/snapshot"),
-             "payer": ("/status", "/purchases", "/map", "/nothing", "/", "/snapshot")}
+                      "/proof?window=x") + PAGE,
+             "hop": ("/status", "/purchases", "/map", "/ledger", "/acks", "/receipts", "/links", "/outbox", "/mint/ledger", "/mint/commitments",
+                     "/mint/links", "/mint/proof?window=1800000000", "/mint/map") + PAGE,
+             "payer": ("/status", "/purchases", "/map", "/acks", "/receipts", "/outbox", "/mint/ledger?since=1", "/mint/commitments") + PAGE}
 
     def test_every_get_is_cors_open_and_address_free(self):
         lab = self.lab
@@ -2105,22 +2107,58 @@ class Dashboard(unittest.TestCase):
         st.keygen()
         lab.mint.load_index()
         st.run(lab.t + 300)
+        lab.hop.flush()                                                                             # its own copy of the ack, otherwise sent 5 s later
+        here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard")
+        shapes = {"mint": ["taken_at", "status", "ledger", "commitments", "purchases", "steward", "map", "proofs"],
+                  "hop": ["taken_at", "status", "acks", "receipts", "links", "outbox", "mint", "map", "proofs"],
+                  "payer": ["taken_at", "status", "receipts", "acks", "purchases", "outbox", "mint", "map", "proofs"]}
+        w = bwkit.commit_hour(list(lab.mint.index["settled"].values())[0])
+        proof_text = bwkit.http_get(lab.mint_url + "/proof?window=%d" % w)[1]
+        mint_ledger = bwkit.http_get(lab.mint_url + "/ledger")[1]
         for url, role in ((lab.mint_url, "mint"), (lab.hop_url, "hop"), (self.payer_url, "payer")):
-            status, html = bwkit.http_get(url + "/")
-            self.assertEqual(status, 200)
-            self.assertIn('<script id="snapshot" type="application/json"></script>', html)   # the live page: empty, it fetches
-            self.assertIn("function derive()", html)
+            for path in ("/", "/index.html", "/fleet"):
+                status, headers, html = get_raw(url + path)
+                self.assertEqual((status, headers["Content-Type"]), (200, "text/html; charset=utf-8"), (role, path))
+                self.assertIn('<script id="snapshot" type="application/json"></script>', html)   # the live page: empty, it fetches
+                self.assertIn('<script src="dash/data.js"></script>', html)                      # the directory's modules, as index.html names them
+                self.assertEqual(html, open(os.path.join(here, "index.html")).read())
+            for name in ("style.css", "data.js", "rules.js", "charts.js", "view-mint.js", "view-node.js", "view-fleet.js", "app.js", "bsp.js"):
+                status, headers, body = get_raw(url + "/dash/" + name)
+                self.assertEqual(status, 200, (role, name))
+                self.assertEqual(body, open(os.path.join(here, name)).read(), (role, name))
+                self.assertTrue(headers["Content-Type"].startswith("text/css" if name.endswith(".css") else "application/javascript"), (role, name))
+            for bad in ("/dash/", "/dash/nothing.js", "/dash/PLAN.md", "/dash/fixtures/mint.json", "/dash/..%2Fbwkit.py", "/dash/index.html/"):
+                self.assertEqual(get_raw(url + bad)[0], 404, (role, bad))
             sd = json.loads(bwkit.http_get(url + "/status")[1])
             self.assertEqual(sd["role"], role)
-            for k in ("clock_offset_s", "stratum", "disk_free_bytes", "last_report_at"):
+            for k in ("clock_offset_s", "stratum", "disk_free_bytes", "last_report_at", "health"):
                 self.assertIn(k, sd, (role, k))
             self.assertTrue(sd["disk_free_bytes"] is None or sd["disk_free_bytes"] > 0)
             self.assertIsNone(sd["last_report_at"])
-            status, html = bwkit.http_get(url + "/snapshot")
+            status, headers, html = get_raw(url + "/snapshot")
             self.assertEqual(status, 200)
+            self.assertIn('filename="%s-snapshot-' % sd["name"], headers["Content-Disposition"])
+            # one self-contained file: no file of the directory is referred to, every module is inside, the verifier as an inline module
+            self.assertNotIn('href="dash/', html)
+            self.assertNotIn('src="dash/', html)
+            self.assertNotIn("from './dash/", html)
+            for name in ("style.css", "data.js", "rules.js", "charts.js", "view-mint.js", "view-node.js", "view-fleet.js", "app.js"):
+                self.assertIn(open(os.path.join(here, name)).read()[:400], html, (role, name))
+            self.assertIn("export async function verifyProof", html)
+            self.assertIn("window.bsp = {", html)
+            self.assertIn("verifyProof, ", html)
+            self.assertIn('<style>\n/* The node\'s own dashboard', html)
             snap = self.snapshot_of(html)
-            self.assertEqual(set(snap), {"taken_at", "status", "ledger", "commitments", "purchases", "steward", "map"})
+            self.assertEqual(list(snap), shapes[role], role)                                 # the shape dashboard/fixtures/<role>.json has
             self.assertEqual((snap["status"]["role"], snap["taken_at"]), (role, snap["status"]["time"]))
+            self.assertEqual(set(snap["proofs"]), {str(w)}, role)
+            self.assertEqual(snap["proofs"][str(w)], proof_text, role)                          # the Mint's own text, byte for byte
+            self.assertEqual(snap["map"]["places"]["the-cabin"]["name"], "the cabin", role)    # the Mint's map, proxied to the nodes
+            if role != "mint":
+                self.assertEqual(snap["mint"], {"ledger": mint_ledger, "commitments": lab.mint.commitments(), "name": "bw-mint"}, role)
+                self.assertEqual(snap["outbox"], [], role)
+                self.assertEqual(snap["acks"], open(getattr(lab, role).path("acks.jsonl")).read(), role)
+                self.assertEqual(snap["receipts"], open(getattr(lab, role).path("receipts.jsonl")).read(), role)
         # the Mint's snapshot carries its ledger, commitments, purchases, the Steward's book and the map, all self-contained
         snap = self.snapshot_of(bwkit.http_get(lab.mint_url + "/snapshot")[1])
         self.assertIn('"kind": "settlement"', snap["ledger"])
@@ -2170,13 +2208,20 @@ class Dashboard(unittest.TestCase):
             srv.server_close()
         self.assertEqual(json.loads(bwkit.http_get(lab.mint_url + "/status")[1])["last_report_at"], lab.t + 9)
         # without the page installed, / says so
-        with mock.patch.object(bwkit, "DASHBOARD_PATHS", ()):
-            with self.assertRaises(bwkit.urlerror.HTTPError) as cm:
-                bwkit.http_get(lab.hop_url + "/")
-            self.assertEqual(cm.exception.code, 404)
-        lab.hop.config["dashboard"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard", "dashboard.html")
-        with mock.patch.object(bwkit, "DASHBOARD_PATHS", ()):
-            self.assertEqual(bwkit.http_get(lab.hop_url + "/")[0], 200)                                # the config's path
+        with mock.patch.object(bwkit, "DASHBOARD_DIRS", ()):
+            for path in ("/", "/fleet", "/snapshot", "/dash/data.js"):
+                with self.assertRaises(bwkit.urlerror.HTTPError) as cm:
+                    bwkit.http_get(lab.hop_url + path)
+                self.assertEqual(cm.exception.code, 404, path)
+        lab.hop.config["dashboard"] = here
+        with mock.patch.object(bwkit, "DASHBOARD_DIRS", ()):
+            self.assertEqual(bwkit.http_get(lab.hop_url + "/")[0], 200)                                # the config's directory
+        # a hop whose Mint is away still gives a snapshot: its own records, and the Mint's part empty
+        lab.hop.config["mint"] = "http://127.0.0.1:1"
+        lab.hop._mint_info = None
+        snap = self.snapshot_of(bwkit.http_get(lab.hop_url + "/snapshot")[1])
+        self.assertEqual((snap["mint"], snap["proofs"], snap["map"]), ({"ledger": "", "commitments": [], "name": None}, {}, None))
+        self.assertIn('"kind": "ack"', snap["acks"])
 
 
 class Rules(unittest.TestCase):
