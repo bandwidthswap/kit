@@ -111,7 +111,7 @@ step_kit() {
   run $N 'cd ~/kit && sudo ./install.sh hop'
   mint_ts="$(ts_ip bw-mint 2>/dev/null || true)"
   [ -n "$mint_ts" ] || { echo "the Mint's tailnet address is not known yet (bw-mint not reachable and MINT_TS not set); the hop's config gets it in the peers step"; mint_ts="MINT_TS_PENDING"; }
-  run $N "sudo -u bwkit python3 - <<'PY'
+  run $N "sudo python3 - <<'PY'
 import json; p='/etc/bwkit/config.json'; c=json.load(open(p)); c['mint']='http://$mint_ts:8710'; c['iface']='tailscale0'; json.dump(c,open(p,'w'),indent=2); print('hop config:',c)
 PY"
   run $N 'sudo systemctl enable -q --now bwkit && sleep 1 && systemctl is-active bwkit'
@@ -120,7 +120,7 @@ PY"
 step_peers() {
   say "NYMs exchanged among bw-house, $N and bw-mint; the hop's Mint address"
   mint_ts="$(ts_ip bw-mint)"
-  run $N "sudo -u bwkit python3 - <<'PY'
+  run $N "sudo python3 - <<'PY'
 import json; p='/etc/bwkit/config.json'; c=json.load(open(p)); c['mint']='http://$mint_ts:8710'; json.dump(c,open(p,'w'),indent=2); print('hop config:',c)
 PY"
   neigh_nym="$(run $N 'sudo -u bwkit bwkit nym')"
@@ -133,7 +133,7 @@ PY"
 step_house() {
   say "the house buys from the neighbor: payer on tailscale0, hop $N, an hourly purchase through the exit node"
   neigh_ts="$(ts_ip $N)"
-  run bw-house "sudo cp -n /etc/bwkit/config.json /etc/bwkit/config.json.bench; sudo -u bwkit python3 - <<'PY'
+  run bw-house "sudo cp -n /etc/bwkit/config.json /etc/bwkit/config.json.bench; sudo python3 - <<'PY'
 import json; p='/etc/bwkit/config.json'; c=json.load(open(p)); c['hop_name']='$N'; c['hop_url']='http://$neigh_ts:8710'; c['iface']='tailscale0'; json.dump(c,open(p,'w'),indent=2); print('payer config:',c)
 PY"
   sudo_sh bw-house <<EOS
