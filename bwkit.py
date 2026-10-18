@@ -83,6 +83,11 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
+try:
+    import steward_rules as rules   # the Steward's sizes and cap, one file shared with sim/; installed beside bwkit
+except ImportError:                 # an older install without it: everything but purchases and the Steward still runs
+    rules = None
+
 VERSION = "0.3.0"
 IMPL = "bwkit/" + VERSION               # `impl` in every envelope: informational, never the profile
 PROTO = 1                               # the profile every record this kit writes carries (spec, Section 14)
@@ -110,6 +115,16 @@ LINK_FIELDS = ("kind", "proto", "relay", "payer") + LINK_PARAMS + ("domain", "si
 PROFILE_1_CONSTANTS = {"unit": "USD/GB", "carry": 0, "window": "hour", "sig_scheme": "ed25519",
                        "light_time_s": 0, "contact_plan": None}   # what profile 1 fixes; the paper has the rest
 SETTLEMENT_PROFILE_KEYS = ("proto", "steward_fee", "fee_usd", "margin", "min_bytes", "link")   # what 0.2.0 settlements lack
+PURCHASE_DOMAIN = b"bandwidthswap/purchase/v1\n"   # prefixed to every signed purchase (spec, Section 15)
+PURCHASE_FIELDS = ("kind", "proto", "id", "poster", "program", "route", "min_bytes", "premium_per_gb", "windows", "deadline",
+                   "proving", "escrow", "unit", "posted_at", "matches", "sig")
+PROGRAMS = ("payer", "match", "second_bridge", "first_link")   # who posted a purchase and under which rule (paper, Section 7)
+PURCHASE_KEYS = ("purchase", "match", "premium_usd", "refund_usd", "from_poster_usd", "from_steward_usd", "steward_held_usd")
+DEFAULT_STEWARD = {                     # the Steward's parameters (paper, Section 7; the mockup's values), under "steward" in the Mint's config
+    "m": 0.04, "margin": 0.01, "program_window_s": 7 * 86400, "first_link_usd": 1.0, "first_link_premium": 0.05,
+    "min_payer_age_s": 86400, "bounty_deadline_s": 7 * 86400,
+}
+DEFAULT_MAP_PATH = "/etc/bwkit/map.json"   # BWKIT_MAP: the membership's map of domains, places and which node is where
 DECLINE_WORDS = ("clock", "patience", "since", "domain", "profile", "replay")   # 409 reasons, the word before the colon
 TOKEN_RE = re.compile(r"^[a-z0-9-]{1,32}$")   # a medium or range class
 HTTP_TIMEOUT_S = 10
@@ -344,13 +359,182 @@ def link_in_force(links, payer, hop, t_first):
     return best[1] if best else None
 
 
-def resolve(receipt_env, ack_env, price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB, now=None, link=None, fee=DEFAULT_STEWARD_FEE):
+# ---------------------------------------------------------------- purchases (spec, Section 15)
+
+def is_place(x):
+    return isinstance(x, str) and not x.startswith("ed25519:") and bool(TOKEN_RE.match(x))
+
+
+def purchase_body(rec):
+    return {k: v for k, v in rec.items() if k not in ("id", "sig")}
+
+
+def purchase_id(body):
+    """A purchase's id: the SHA-256 of the canonical JSON of the record without id and sig."""
+    return hashlib.sha256(canon_json(body).encode()).hexdigest()
+
+
+def sign_purchase(priv, body):
+    return b64u(priv.sign(PURCHASE_DOMAIN + canon_json(body).encode()))
+
+
+def verify_purchase(rec):
+    """True when rec carries its poster's signature."""
+    try:
+        pub_of_nym(rec["poster"]).verify(b64u_dec(rec["sig"]), PURCHASE_DOMAIN + canon_json(purchase_body(rec)).encode())
+        return True
+    except (InvalidSignature, ValueError, KeyError, TypeError):
+        return False
+
+
+def check_purchase(rec):
+    """Raise ValueError unless rec has exactly a purchase's fields with sane types and its own id. Signature not checked."""
+    if not isinstance(rec, dict) or set(rec) != set(PURCHASE_FIELDS):
+        raise ValueError("a purchase has exactly the fields %s" % ", ".join(PURCHASE_FIELDS))
+    if rec["kind"] != "purchase":
+        raise ValueError("kind must be purchase")
+    check_proto(rec)
+    pub_of_nym(rec["poster"])
+    if rec["program"] not in PROGRAMS:
+        raise ValueError("program must be one of %s" % ", ".join(PROGRAMS))
+    route = rec["route"]
+    if not isinstance(route, dict) or set(route) != {"from", "to", "not_via"}:
+        raise ValueError("route has exactly from, to and not_via")
+    for k in ("from", "to"):
+        v = route[k]
+        if v is None and k == "from":
+            continue
+        if not isinstance(v, str) or not (v.startswith("ed25519:") or is_place(v)):
+            raise ValueError("route.%s is a NYM or a place id%s" % (k, ", or null" if k == "from" else ""))
+        if v.startswith("ed25519:"):
+            pub_of_nym(v)
+    if not isinstance(route["not_via"], list) or not all(is_place(x) for x in route["not_via"]):
+        raise ValueError("route.not_via is a list of place ids")
+    for k in ("min_bytes", "deadline", "posted_at"):
+        if not is_int(rec[k]) or rec[k] < 0:
+            raise ValueError("%s must be a non-negative integer" % k)
+    if not is_int(rec["windows"]) or rec["windows"] < 1:
+        raise ValueError("windows must be a positive integer")
+    for k in ("premium_per_gb", "escrow"):
+        v = rec[k]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v or v < 0 or v == float("inf"):
+            raise ValueError("%s must be a non-negative number" % k)
+    pv = rec["proving"]
+    if pv is not None:
+        if not isinstance(pv, dict) or set(pv) != {"windows_per_period", "period_s"} or \
+                not all(is_int(pv[k]) and pv[k] >= 0 for k in pv):
+            raise ValueError("proving is null or {windows_per_period, period_s}")
+    if rec["unit"] != "USD":
+        raise ValueError("unit must be USD in profile 1")
+    m = rec["matches"]
+    if m is not None and not (isinstance(m, str) and len(m) == 64 and all(c in "0123456789abcdef" for c in m)):
+        raise ValueError("matches is null or a purchase id")
+    if (rec["program"] == "match") != (m is not None):
+        raise ValueError("a match names the purchase it matches, and only a match does")
+    if rec["id"] != purchase_id(purchase_body(rec)):
+        raise ValueError("id is not the hash of the record")
+    if not isinstance(rec["sig"], str) or len(b64u_dec(rec["sig"])) != 64:
+        raise ValueError("sig is not an ed25519 signature")
+
+
+class PurchaseBook:
+    """The purchases a Mint holds and what the settlements have drawn from them, kept in settlement order.
+
+    Pure bookkeeping shared by the Mint and the rebuild: which purchase a
+    window settles against, the pools it draws from, the per-payer cap.
+    `place_of` maps a NYM to its place in the map (or None); f and margin
+    are the domain's.
+    """
+
+    def __init__(self, place_of=None, f=DEFAULT_STEWARD_FEE, margin=DEFAULT_STEWARD["margin"]):
+        self.place_of = place_of or (lambda nym: None)
+        self.f, self.margin = f, margin
+        self.purchases, self.order = {}, []
+        self.use = {}                         # purchase id -> {"windows", "own", "steward", "refund", "held"}
+        self.fees_in, self.paid_on = {}, {}   # payer NYM -> gross amounts paid for carriage; what the Steward paid out on it
+
+    def add(self, rec):
+        if rec["id"] not in self.purchases:
+            self.purchases[rec["id"]] = rec
+            self.order.append(rec["id"])
+
+    def note(self, s):
+        """A settlement happened: count the payer's fees in and what it drew from a purchase."""
+        self.fees_in[s["payer"]] = round(self.fees_in.get(s["payer"], 0.0) + s["amount_usd"], 6)
+        pid = s.get("purchase")
+        if not pid:
+            return
+        u = self.use.setdefault(pid, {"windows": 0, "own": 0.0, "steward": 0.0, "refund": 0.0, "held": 0.0})
+        u["windows"] += 1
+        u["own"] = round(u["own"] + s["from_poster_usd"], 6)
+        u["refund"] = round(u["refund"] + s["refund_usd"], 6)
+        target = s.get("match") or pid
+        if s["from_steward_usd"] or s["steward_held_usd"]:
+            mu = self.use.setdefault(target, {"windows": 0, "own": 0.0, "steward": 0.0, "refund": 0.0, "held": 0.0})
+            mu["steward"] = round(mu["steward"] + s["from_steward_usd"], 6)
+            mu["held"] = round(mu["held"] + s["steward_held_usd"], 6)
+        self.paid_on[s["payer"]] = round(self.paid_on.get(s["payer"], 0.0) + s["from_steward_usd"], 6)
+
+    def pool(self, rec):
+        """What is left of a purchase's escrow: the poster's own pool, or the Steward's for its own postings and matches."""
+        u = self.use.get(rec["id"], {})
+        return round(rec["escrow"] - u.get("own", 0.0) - u.get("steward", 0.0), 6)
+
+    def match_for(self, pid):
+        for mid in self.order:
+            m = self.purchases[mid]
+            if m["program"] == "match" and m["matches"] == pid:
+                return m
+        return None
+
+    def applies(self, rec, r, t_last):
+        """Does this purchase govern a window (payer, hop, t_first, t_last)? Programs other than match only."""
+        if rec["program"] == "match" or rec["posted_at"] > r["t_first"] or t_last > rec["deadline"]:
+            return False
+        if self.use.get(rec["id"], {}).get("windows", 0) >= rec["windows"]:
+            return False
+        route = rec["route"]
+        hop_place, payer_place = self.place_of(r["hop"]), self.place_of(r["payer"])
+        if rec["program"] == "payer":
+            return rec["poster"] == r["payer"] and route["from"] in (None, r["payer"]) and \
+                (route["to"] == r["hop"] or (is_place(route["to"]) and hop_place == route["to"]))
+        if rec["program"] == "first_link":
+            return route["from"] is None and hop_place is not None and hop_place == route["to"]
+        if rec["program"] == "second_bridge":
+            return payer_place is not None and payer_place == route["from"] and \
+                hop_place is not None and hop_place not in route["not_via"] and hop_place != route["from"]
+        return False
+
+    def context(self, r, t_last):
+        """The purchase a window settles against and the pools it draws from, for resolve(); None when none applies.
+
+        The payer's own purchases come first, then the Steward's, each by
+        posting time; a purchase whose pools are empty is passed over.
+        """
+        cands = [self.purchases[pid] for pid in self.order if self.applies(self.purchases[pid], r, t_last)]
+        cands.sort(key=lambda rec: (0 if rec["poster"] == r["payer"] else 1, rec["posted_at"], rec["id"]))
+        for rec in cands:
+            match = self.match_for(rec["id"]) if rec["program"] == "payer" else None
+            if rec["program"] == "payer":
+                own, steward = self.pool(rec), (self.pool(match) if match else 0.0)
+            else:
+                own, steward = 0.0, self.pool(rec)
+            if own <= 0 and steward <= 0:
+                continue
+            allowed = rules.allowance(self.f, self.margin, self.fees_in.get(r["payer"], 0.0), self.paid_on.get(r["payer"], 0.0)) if rules else 0.0
+            return {"rec": rec, "match": match, "pool_own": max(0.0, own), "pool_steward": max(0.0, steward), "allowance": allowed}
+        return None
+
+
+def resolve(receipt_env, ack_env, price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB, now=None, link=None, fee=DEFAULT_STEWARD_FEE, purchase=None):
     """Settle one window from a payer's receipt and a hop's ack (spec, Section 8). Pure: needs nothing else.
 
     link is the announcement in force at the window's start, or None for the
-    pilot defaults with price_usd_per_gb; fee is the Steward's fraction f.
-    Raises ValueError when the two don't describe the same window or a
-    signature fails. Returns the settlement record.
+    pilot defaults with price_usd_per_gb; fee is the Steward's fraction f;
+    purchase, when a purchase applies, is PurchaseBook.context(): the record
+    and the pools the premium is drawn from (spec, Section 15). Raises
+    ValueError when the two don't describe the same window or a signature
+    fails. Returns the settlement record.
     """
     if check_envelope(receipt_env) is None or check_envelope(ack_env) is None:
         raise ValueError("unreachable")
@@ -368,7 +552,19 @@ def resolve(receipt_env, ack_env, price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB, now
     settled = min(x, y)
     agree = abs(x - y) <= max(p["min_bytes"], p["margin"] * max(x, y))
     amount = round(settled / 1e9 * price, 6)
-    return {
+    extra, premium = {}, 0.0
+    if purchase:
+        if rules is None:
+            raise ValueError("steward_rules.py is not installed beside bwkit; a purchase cannot be settled")
+        rec = purchase["rec"]
+        due, refund = rules.premium_split(settled, rec["min_bytes"], rec["premium_per_gb"])
+        own, steward, held = rules.draw(due, purchase["pool_own"], purchase["pool_steward"], purchase["allowance"])
+        own, steward, held = round(own, 6), round(steward, 6), round(held, 6)
+        premium = round(own + steward, 6)
+        extra = {"purchase": rec["id"], "match": purchase["match"]["id"] if purchase.get("match") else None,
+                 "premium_usd": premium, "refund_usd": round(refund, 6),
+                 "from_poster_usd": own, "from_steward_usd": steward, "steward_held_usd": held}
+    out = {
         "kind": "settlement", "proto": PROTO,
         "t": int(now if now is not None else time.time()),
         "payer": r["payer"], "hop": r["hop"], "hop_index": r["hop_index"],
@@ -379,10 +575,12 @@ def resolve(receipt_env, ack_env, price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB, now
         "receipt_sig": receipt_env["sig"], "ack_sig": ack_env["sig"],
         "price_usd_per_gb": price,
         "amount_usd": amount,
-        "steward_fee": fee, "fee_usd": round(amount * fee, 6),
+        "steward_fee": fee, "fee_usd": round((amount + premium) * fee, 6),   # f is taken from the premium as from any fee
         "margin": p["margin"], "min_bytes": p["min_bytes"],
         "link": link_hash(link) if link else None,
     }
+    out.update(extra)
+    return out
 
 
 def legacy_shape(s):
@@ -579,8 +777,15 @@ def read_jsonl(path):
     return entries, bad
 
 
+def place_lookup(map_obj, peers):
+    """A function NYM -> place id from the map's `nodes` (name -> place) through the peer list (NYM -> name)."""
+    nodes = (map_obj or {}).get("nodes") or {}
+    return lambda nym: nodes.get(peers.get(nym)) if peers else None
+
+
 def rebuild(receipts, acks, links=(), price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB, fee=DEFAULT_STEWARD_FEE, now=None,
-            names=("receipts.jsonl", "acks.jsonl", "links.jsonl")):
+            names=("receipts.jsonl", "acks.jsonl", "links.jsonl", "purchases.jsonl"), purchases=(), place_of=None,
+            steward_margin=DEFAULT_STEWARD["margin"]):
     """A Mint's ledger from the payer's receipts, the hop's acks and the announcements alone (spec, Section 11).
 
     receipts, acks and links are lists of (line number, record), as
@@ -592,11 +797,25 @@ def rebuild(receipts, acks, links=(), price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB,
     Each hour's settlements get a commitment, unsigned, since only the Mint
     holds its key.
 
+    purchases are the purchase records (spec, Section 15); a window that one
+    governs settles against it, in the order the windows are rebuilt, with
+    place_of (NYM -> place) for the Steward's place-routed purchases.
+
     Returns (entries, report): the ledger lines in the order a Mint would
     have written them, and the counts, with `bad` naming what was left out.
     """
     now = int(now if now is not None else time.time())
     bad, seen, good = [], set(), {"receipt": [], "ack": [], "link": []}
+    book = PurchaseBook(place_of, fee, steward_margin)
+    for i, rec in purchases:
+        try:
+            check_purchase(rec)
+            if not verify_purchase(rec):
+                raise ValueError("bad signature")
+        except ValueError as e:
+            bad.append("%s line %d: %s" % (names[3] if len(names) > 3 else "purchases.jsonl", i, e))
+            continue
+        book.add(rec)
     for i, rec in links:
         try:
             check_link(rec)
@@ -638,8 +857,8 @@ def rebuild(receipts, acks, links=(), price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB,
                 acks_by_prev[env["receipt"]["prev_sig"]] = env
             seen.add(env["sig"])
             good[kind].append(env)
-    rep = {"receipts": len(good["receipt"]), "acks": len(good["ack"]), "links": len(good["link"]), "settlements": 0,
-           "disputed": 0, "hours": 0, "receipts_without_ack": 0, "acks_without_receipt": 0, "bad": bad}
+    rep = {"receipts": len(good["receipt"]), "acks": len(good["ack"]), "links": len(good["link"]), "purchases": len(book.order),
+           "settlements": 0, "disputed": 0, "hours": 0, "receipts_without_ack": 0, "acks_without_receipt": 0, "bad": bad}
 
     def entry(env):
         return {"kind": env["kind"], "received_at": now, "from": env.get("from") or env["kind"],
@@ -655,10 +874,12 @@ def rebuild(receipts, acks, links=(), price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB,
         entries.append(entry(ack))
         r = env["receipt"]
         try:
-            s = resolve(env, ack, price_usd_per_gb, now, link_in_force(good["link"], r["payer"], r["hop"], r["t_first"]), fee)
+            s = resolve(env, ack, price_usd_per_gb, now, link_in_force(good["link"], r["payer"], r["hop"], r["t_first"]), fee,
+                        book.context(r, r["t_last"]))
         except ValueError as e:
             bad.append("%s %s does not settle receipt %s: %s" % (names[1], ack["sig"][:12], env["sig"][:12], e))
             continue
+        book.note(s)
         entries.append(s)
         rep["settlements"] += 1
         rep["disputed"] += 1 if s["status"] == "disputed" else 0
@@ -1081,6 +1302,42 @@ class Node:
         log("sent %d to the Mint, %d left in outbox" % (sent, left))
         return {"receipt": env, "ack": ack, "sent": sent, "left": left}
 
+    def purchase_post(self, to, min_bytes, premium_per_gb, windows, escrow, deadline, now=None, post=True, poster_priv=None,
+                      program="payer", route_from="self", not_via=(), matches=None):
+        """Sign a purchase (spec, Section 15) and register it with the Mint. Returns (record, id).
+
+        to is a peer name, a NYM or a place id; route_from "self" is this
+        node's NYM, None is anywhere, else a place id. The Steward passes its
+        own key and program.
+        """
+        now = int(now if now is not None else time.time())
+        priv = poster_priv or self.priv
+        poster = nym_of_pub(priv.public_key())
+        if isinstance(to, str) and not to.startswith("ed25519:") and not is_place(to):
+            to = self.nym_by_name(to)
+        elif isinstance(to, str) and is_place(to) and to in {n for n in self.peers().values()}:
+            to = self.nym_by_name(to)
+        body = {"kind": "purchase", "proto": PROTO, "poster": poster, "program": program,
+                "route": {"from": poster if route_from == "self" else route_from, "to": to, "not_via": list(not_via)},
+                "min_bytes": int(min_bytes), "premium_per_gb": float(premium_per_gb), "windows": int(windows), "deadline": int(deadline),
+                "proving": None, "escrow": float(escrow), "unit": "USD", "posted_at": now, "matches": matches}
+        rec = dict(body, id=purchase_id(body), sig=sign_purchase(priv, body))
+        check_purchase(rec)
+        if post:
+            mint = (self.config.get("mint") or "").rstrip("/")
+            if not mint:
+                raise SystemExit("config has no mint URL")
+            try:
+                status, ans = http_post(mint + "/purchase", rec)
+            except (urlerror.URLError, socket.timeout, OSError) as e:
+                raise SystemExit("mint unreachable: %s" % e)
+            if not 200 <= status < 300:
+                raise SystemExit("the Mint refused the purchase: %s %s" % (status, json.dumps(ans)))
+            self.append("purchases.jsonl", rec)
+            log("posted purchase %s to the Mint: %s -> %s, >= %d bytes a window, premium %s/GB, %d windows, escrow %s" % (
+                rec["id"][:16], rec["route"]["from"], rec["route"]["to"], rec["min_bytes"], rec["premium_per_gb"], rec["windows"], rec["escrow"]))
+        return rec, rec["id"]
+
     # hop
 
     def my_link(self):
@@ -1212,14 +1469,48 @@ class Node:
     def load_links(self, skip_partial=False):
         return self.read_lines("links.jsonl", skip_partial)
 
+    def load_purchases(self, skip_partial=False):
+        return self.read_lines("purchases.jsonl", skip_partial)
+
+    def load_map(self):
+        """The membership's map: domains, places and which node is at which place (BWKIT_MAP, or `map` in the config)."""
+        path = os.environ.get("BWKIT_MAP") or self.config.get("map") or DEFAULT_MAP_PATH
+        if not os.path.exists(path):
+            return {"domains": {}, "places": {}, "nodes": {}}
+        with open(path) as f:
+            m = json.load(f)
+        for k in ("domains", "places", "nodes"):
+            m.setdefault(k, {})
+        return m
+
+    def steward_params(self):
+        p = dict(DEFAULT_STEWARD)
+        p.update(self.config.get("steward") or {})
+        return p
+
+    def steward_nym(self):
+        """The Steward's NYM: from its key beside the Mint's (steward.priv), else `steward_nym` in the config, else None."""
+        kp = self.path("steward.priv")
+        if os.path.exists(kp):
+            with open(kp, "rb") as f:
+                return nym_of_pub(Ed25519PrivateKey.from_private_bytes(f.read()).public_key())
+        return self.config.get("steward_nym")
+
     def load_index(self, skip_partial=False):
-        """Rebuild the Mint's view from the ledger and the announcements.
+        """Rebuild the Mint's view from the ledger, the announcements and the purchases.
 
         skip_partial: a reader beside the running Mint (the status reporter)
         may catch the last line half written; skip it rather than fail.
         """
+        peers = self.peers()
+        self.map = self.load_map()
+        sp = self.steward_params()
         ix = {"by_sig": {}, "receipt_by_window": {}, "acks_by_prev": {}, "settled": {},
-              "commitments": {}, "last_commitment": None, "lines": 0, "links": self.load_links(skip_partial)}
+              "commitments": {}, "last_commitment": None, "lines": 0, "links": self.load_links(skip_partial),
+              "book": PurchaseBook(place_lookup(self.map, peers), self.config.get("steward_fee", DEFAULT_STEWARD_FEE), sp["margin"]),
+              "steward_nym": self.steward_nym()}
+        for rec in self.load_purchases(skip_partial):
+            ix["book"].add(rec)
         for entry in self.read_lines("ledger.jsonl", skip_partial):
             self._index_line(ix, entry)
         self.index = ix
@@ -1237,6 +1528,7 @@ class Node:
             ix["acks_by_prev"][entry["receipt"]["prev_sig"]] = entry
         elif k == "settlement":
             ix["settled"][entry["receipt_sig"]] = entry
+            ix["book"].note(entry)
         elif k == "commitment":
             ix["commitments"][entry["window"]] = entry     # the newest for an hour is the Mint's current word
             ix["last_commitment"] = entry
@@ -1326,6 +1618,50 @@ class Node:
             rec["price"], rec["unit"], rec["margin"], rec["min_bytes"], rec["patience_windows"], rec["since"]))
         return h
 
+    def register_purchase(self, rec, now=None):
+        """The Mint's /purchase (spec, Section 15). Checks the record, appends it to purchases.jsonl, returns its id."""
+        now = int(now if now is not None else time.time())
+        if self.index is None:
+            self.load_index()
+        check_purchase(rec)
+        if not verify_purchase(rec):
+            raise ValueError("bad signature")
+        peers = self.peers()
+        steward = self.index["steward_nym"]
+        if rec["program"] == "payer":
+            if rec["poster"] not in peers:
+                raise Decline("unknown poster %s" % rec["poster"])
+            if rec["route"]["from"] not in (None, rec["poster"]):
+                raise Decline("route: a payer's purchase starts at the payer (or anywhere, null)")
+            to = rec["route"]["to"]
+            if to.startswith("ed25519:"):
+                if to not in peers:
+                    raise Decline("unknown route.to %s" % to)
+            elif to not in self.map["places"]:
+                raise Decline("route: %s is not a place on the map" % to)
+        else:
+            if not steward or rec["poster"] != steward:
+                raise Decline("unknown poster %s: only the Steward posts a %s" % (rec["poster"], rec["program"]))
+            if rec["program"] == "match" and rec["matches"] not in self.index["book"].purchases:
+                raise Decline("route: a match names a purchase this Mint holds")
+        book = self.index["book"]
+        with self.lock:
+            if rec["id"] in book.purchases:
+                raise Decline("duplicate")
+            if rec["posted_at"] < now - CLOCK_TOLERANCE_S:
+                raise Decline("since: posted_at %d is in the past (the Mint's clock is %d); a purchase cannot be backdated" % (rec["posted_at"], now))
+            if rec["program"] != "match":
+                for e in self.index["by_sig"].values():
+                    r = e["receipt"]
+                    if r["t_first"] >= rec["posted_at"] and book.applies(rec, r, r["t_last"]):
+                        raise Decline("since: a window from %d that this purchase would govern is already held" % r["t_first"])
+            self.append("purchases.jsonl", rec)
+            book.add(rec)
+        log("purchase %s registered: %s by %s, %s -> %s, >= %d bytes a window, premium %s/GB, %d windows, escrow %s, until %d" % (
+            rec["id"][:16], rec["program"], peers.get(rec["poster"], "the Steward" if rec["poster"] == steward else rec["poster"]),
+            rec["route"]["from"], rec["route"]["to"], rec["min_bytes"], rec["premium_per_gb"], rec["windows"], rec["escrow"], rec["deadline"]))
+        return rec["id"]
+
     def try_settle(self, env, now):
         ix = self.index
         if env["kind"] == "receipt":
@@ -1340,14 +1676,16 @@ class Node:
         link = link_in_force(ix["links"], r["payer"], r["hop"], r["t_first"])
         try:
             s = resolve(rec, ack, self.config.get("price_usd_per_gb", DEFAULT_PRICE_USD_PER_GB), now, link,
-                        self.config.get("steward_fee", DEFAULT_STEWARD_FEE))
+                        self.config.get("steward_fee", DEFAULT_STEWARD_FEE), ix["book"].context(r, r["t_last"]))
         except ValueError as e:
             log("receipt %s and ack %s do not settle: %s" % (rec["sig"][:12], ack["sig"][:12], e))
             return None
         self.ledger_append(s)
-        log("%s %s..%d: payer %d, hop %d, settled %d bytes ($%.6f, fee $%.6f, margin %s%s)" % (
+        log("%s %s..%d: payer %d, hop %d, settled %d bytes ($%.6f, fee $%.6f, margin %s%s%s)" % (
             s["status"], s["t_first"], s["t_last"], s["payer_bytes"], s["hop_bytes"], s["settled_bytes"], s["amount_usd"],
-            s["fee_usd"], s["margin"], " from link %s" % s["link"][:16] if s["link"] else ", the default"))
+            s["fee_usd"], s["margin"], " from link %s" % s["link"][:16] if s["link"] else ", the default",
+            "; purchase %s: premium $%.6f (poster $%.6f, Steward $%.6f), $%.6f returned" % (
+                s["purchase"][:16], s["premium_usd"], s["from_poster_usd"], s["from_steward_usd"], s["refund_usd"]) if s.get("purchase") else ""))
         return s
 
     def commit(self, window, now):
@@ -1410,14 +1748,20 @@ class Node:
             if time.strftime("%Y-%m", time.localtime(e["t_last"])) != month:
                 continue
             k = (e["payer"], e["hop"])
-            o = out.setdefault(k, {"windows": 0, "disputed": 0, "settled_bytes": 0, "amount_usd": 0.0, "fee_usd": 0.0, "relay_usd": 0.0})
+            o = out.setdefault(k, {"windows": 0, "disputed": 0, "settled_bytes": 0, "amount_usd": 0.0, "fee_usd": 0.0, "relay_usd": 0.0,
+                                   "premium_usd": 0.0, "refund_usd": 0.0, "from_steward_usd": 0.0, "purchases": 0})
             o["windows"] += 1
             o["disputed"] += 1 if e["status"] == "disputed" else 0
             o["settled_bytes"] += e["settled_bytes"]
             fee = e.get("fee_usd", 0.0)
             o["amount_usd"] = round(o["amount_usd"] + e["amount_usd"], 6)
             o["fee_usd"] = round(o["fee_usd"] + fee, 6)
-            o["relay_usd"] = round(o["amount_usd"] - o["fee_usd"], 6)
+            if e.get("purchase"):
+                o["purchases"] += 1
+                o["premium_usd"] = round(o["premium_usd"] + e["premium_usd"], 6)
+                o["refund_usd"] = round(o["refund_usd"] + e["refund_usd"], 6)
+                o["from_steward_usd"] = round(o["from_steward_usd"] + e["from_steward_usd"], 6)
+            o["relay_usd"] = round(o["amount_usd"] + o["premium_usd"] - o["fee_usd"], 6)
         return out
 
     # the status page
@@ -1590,6 +1934,8 @@ class Node:
                         st["disputed"] = sum(1 for s in node.index["settled"].values() if s["status"] == "disputed")
                         st["pending"] = {"receipts_without_ack": len(no_ack), "acks_without_receipt": len(no_receipt)}
                         st["links"] = node.index["links"]
+                        st["purchases"] = len(node.index["book"].order)
+                        st["steward"] = node.index["steward_nym"]
                     else:
                         st["sample"] = node.state().get("sample")
                         st["outbox"] = len(os.listdir(node.path("outbox")))
@@ -1609,6 +1955,9 @@ class Node:
                     return self.reply(200, node.commitments())
                 if url.path == "/links" and node.role == "mint":
                     return self.reply(200, node.index["links"])
+                if url.path == "/purchases" and node.role == "mint":
+                    book = node.index["book"]
+                    return self.reply(200, [book.purchases[pid] for pid in book.order])
                 if url.path == "/proof" and node.role == "mint":
                     q = urlparse.parse_qs(url.query).get("window", [""])[0]
                     if not q.isdigit():
@@ -1635,6 +1984,8 @@ class Node:
                         return self.reply(200, node.receive(body))
                     if self.path == "/link" and node.role == "mint":
                         return self.reply(200, {"stored": node.register_link(body)})
+                    if self.path == "/purchase" and node.role == "mint":
+                        return self.reply(200, {"stored": node.register_purchase(body)})
                     return self.reply(404, {"error": "no such path"})
                 except Decline as e:
                     code = 409
@@ -1702,6 +2053,17 @@ def main(argv=None):
     sv.add_argument("--port", type=int, default=None)
     sub.add_parser("status", help="what this node knows")
     sub.add_parser("links", help="mint: the link announcements it holds")
+    pu = sub.add_parser("purchase", help="purchases (spec, Section 15): a payer posts one, the Mint lists them")
+    pus = pu.add_subparsers(dest="pucmd", required=True)
+    pp = pus.add_parser("post", help="payer: sign a purchase on a route and register it with the Mint")
+    pp.add_argument("--to", required=True, help="the hop, by peer name or NYM, or a place id")
+    pp.add_argument("--min-bytes", type=int, required=True, help="the minimum rate, in bytes per window")
+    pp.add_argument("--premium", type=float, required=True, help="the premium above the posted price, USD per GB")
+    pp.add_argument("--windows", type=int, required=True, help="how many windows it pays for")
+    pp.add_argument("--escrow", type=float, required=True, help="the prepaid value in USD (a line on the invoice)")
+    pp.add_argument("--deadline", required=True, help="Unix seconds, or +Nd / +Nh from now")
+    pp.add_argument("--print", dest="print_only", action="store_true", help="print the signed record instead of posting it")
+    pus.add_parser("list", help="the purchases this node holds (the Mint's registry, or a payer's own postings)")
     lg = sub.add_parser("ledger", help="mint: print the ledger")
     lg.add_argument("--disputes", action="store_true", help="only disputed settlements")
     lg.add_argument("--json", action="store_true")
@@ -1728,6 +2090,9 @@ def main(argv=None):
     rb.add_argument("receipts", help="the payer's receipts.jsonl")
     rb.add_argument("acks", help="the hop's acks.jsonl")
     rb.add_argument("links", nargs="?", help="links.jsonl, the announcements (the Mint's or the hop's copy); none means the pilot defaults")
+    rb.add_argument("purchases", nargs="?", help="purchases.jsonl, the purchases (the Mint's copy); none means no premiums")
+    rb.add_argument("--map", help="the map (map.json), needed for the Steward's place-routed purchases")
+    rb.add_argument("--peers", help="peers.json, to put nodes at their places on the map")
     rb.add_argument("--ledger", help="write the rebuilt ledger here instead of printing it")
     rb.add_argument("--compare", metavar="MINT_LEDGER", help="diff the rebuilt settlements and commitments against this ledger.jsonl")
     rb.add_argument("--price", type=float, default=DEFAULT_PRICE_USD_PER_GB, help="the default price when no announcement is in force")
@@ -1746,6 +2111,14 @@ def main(argv=None):
                         raise ValueError("bad signature")
                     print("%s: link by %s, %s %s, margin %s, since %d, hash %s, ok" % (
                         fn, env["relay"], env["price"], env["unit"], env["margin"], env["since"], link_hash(env)[:16]))
+                    continue
+                if isinstance(env, dict) and env.get("kind") == "purchase":
+                    check_purchase(env)
+                    if not verify_purchase(env):
+                        raise ValueError("bad signature")
+                    print("%s: purchase %s by %s (%s), %s -> %s, >= %d bytes a window, premium %s/GB, %d windows, escrow %s, ok" % (
+                        fn, env["id"][:16], env["poster"], env["program"], env["route"]["from"], env["route"]["to"], env["min_bytes"],
+                        env["premium_per_gb"], env["windows"], env["escrow"]))
                     continue
                 signer = check_envelope(env)
                 r = env["receipt"]
@@ -1780,14 +2153,25 @@ def main(argv=None):
         receipts, bad_r = read_jsonl(args.receipts)
         acks, bad_a = read_jsonl(args.acks)
         links, bad_l = read_jsonl(args.links) if args.links else ([], [])
-        names = (os.path.basename(args.receipts), os.path.basename(args.acks), os.path.basename(args.links or "links.jsonl"))
-        entries, rep = rebuild(receipts, acks, links, args.price, args.fee, names=names)
-        rep["bad"] = bad_r + bad_a + bad_l + rep["bad"]
+        purchases, bad_p = read_jsonl(args.purchases) if args.purchases else ([], [])
+        names = (os.path.basename(args.receipts), os.path.basename(args.acks), os.path.basename(args.links or "links.jsonl"),
+                 os.path.basename(args.purchases or "purchases.jsonl"))
+        place_of = None
+        if args.map:
+            with open(args.map) as f:
+                map_obj = json.load(f)
+            peers = {}
+            if args.peers:
+                with open(args.peers) as f:
+                    peers = json.load(f)
+            place_of = place_lookup(map_obj, peers)
+        entries, rep = rebuild(receipts, acks, links, args.price, args.fee, names=names, purchases=purchases, place_of=place_of)
+        rep["bad"] = bad_r + bad_a + bad_l + bad_p + rep["bad"]
         for line in rep["bad"]:
             print("left out: " + line, file=sys.stderr)
-        summary = ("rebuilt %d receipts and %d acks under %d announcements into %d settlements (%d disputed) in %d hours; "
+        summary = ("rebuilt %d receipts and %d acks under %d announcements and %d purchases into %d settlements (%d disputed) in %d hours; "
                    "%d receipts without ack, %d acks without receipt, %d lines left out" % (
-                       rep["receipts"], rep["acks"], rep["links"], rep["settlements"], rep["disputed"], rep["hours"],
+                       rep["receipts"], rep["acks"], rep["links"], rep["purchases"], rep["settlements"], rep["disputed"], rep["hours"],
                        rep["receipts_without_ack"], rep["acks_without_receipt"], len(rep["bad"])))
         if args.ledger:
             with open(args.ledger, "w") as f:
@@ -1878,6 +2262,46 @@ def main(argv=None):
                 declined = [n for n, ps in node.patience_state().items() if ps.get("declined")]
                 if declined:
                     print("declined payers: %s" % ", ".join(declined))
+    elif args.cmd == "purchase":
+        if args.pucmd == "post":
+            if node.role != "payer":
+                raise SystemExit("only a payer posts a purchase from the command line (the Steward posts its own)")
+            d = args.deadline
+            if d.startswith("+"):
+                unit = {"d": 86400, "h": 3600, "w": 7 * 86400}.get(d[-1])
+                if not unit or not d[1:-1].isdigit():
+                    raise SystemExit("--deadline is Unix seconds or +Nd, +Nh, +Nw")
+                deadline = int(time.time()) + int(d[1:-1]) * unit
+            elif d.isdigit():
+                deadline = int(d)
+            else:
+                raise SystemExit("--deadline is Unix seconds or +Nd, +Nh, +Nw")
+            rec, pid = node.purchase_post(args.to, args.min_bytes, args.premium, args.windows, args.escrow, deadline, post=not args.print_only)
+            if args.print_only:
+                print(json.dumps(rec, indent=1, sort_keys=True))
+            else:
+                print("posted %s: %s -> %s, >= %d bytes a window, premium %s USD/GB, %d windows, escrow %s USD, until %s" % (
+                    pid, rec["route"]["from"], rec["route"]["to"], rec["min_bytes"], rec["premium_per_gb"], rec["windows"], rec["escrow"],
+                    time.strftime("%Y-%m-%d %H:%M", time.localtime(rec["deadline"]))))
+        else:
+            peers = node.peers()
+            if node.role == "mint":
+                node.load_index()
+                book = node.index["book"]
+                recs = [book.purchases[pid] for pid in book.order]
+            else:
+                book, recs = None, node.load_purchases()
+            steward = node.steward_nym() if node.role == "mint" else None
+            for rec in recs:
+                u = book.use.get(rec["id"], {}) if book else {}
+                who = "the Steward" if rec["poster"] == steward else peers.get(rec["poster"], rec["poster"][:20])
+                print("%s  %-13s %s  %s -> %s%s  >=%s  %s/GB  %d window%s%s  escrow %s%s  until %s" % (
+                    rec["id"][:16], rec["program"], who, rec["route"]["from"] if rec["route"]["from"] and not rec["route"]["from"].startswith("ed25519:") else who,
+                    peers.get(rec["route"]["to"], rec["route"]["to"]), (" !via " + ",".join(rec["route"]["not_via"])) if rec["route"]["not_via"] else "",
+                    fmt_bytes(rec["min_bytes"]), rec["premium_per_gb"], rec["windows"], "" if rec["windows"] == 1 else "s",
+                    (", %d used" % u["windows"]) if u.get("windows") else "", rec["escrow"],
+                    (", %s paid" % round(u.get("own", 0.0) + u.get("steward", 0.0), 6)) if u else "",
+                    time.strftime("%Y-%m-%d %H:%M", time.localtime(rec["deadline"]))))
     elif args.cmd == "links":
         if node.role != "mint":
             raise SystemExit("only the Mint holds announcements")
@@ -1917,9 +2341,14 @@ def main(argv=None):
         fees = 0.0
         for (payer, hop), o in sorted(tot.items()):
             fees = round(fees + o["fee_usd"], 6)
-            print("%s  %s pays %s: %d windows (%d disputed), %s, $%.4f: the relay's $%.4f, the Steward's $%.4f" % (
+            print("%s  %s pays %s: %d windows (%d disputed), %s, $%.4f%s: the relay's $%.4f, the Steward's $%.4f" % (
                 args.month, peers.get(payer, payer), peers.get(hop, hop), o["windows"], o["disputed"],
-                fmt_bytes(o["settled_bytes"]), o["amount_usd"], o["relay_usd"], o["fee_usd"]))
+                fmt_bytes(o["settled_bytes"]), o["amount_usd"],
+                " + $%.4f premium on %d purchased window%s ($%.4f of it the Steward's)" % (
+                    o["premium_usd"], o["purchases"], "" if o["purchases"] == 1 else "s", o["from_steward_usd"]) if o["purchases"] else "",
+                o["relay_usd"], o["fee_usd"]))
+            if o["refund_usd"]:
+                print("%s    returned to %s on short windows: $%.4f" % (args.month, peers.get(payer, payer), o["refund_usd"]))
         if tot:
             print("%s  the Network Steward's share: $%.4f (f = %s of every settlement since 0.3.0; none before)" % (
                 args.month, fees, node.config.get("steward_fee", DEFAULT_STEWARD_FEE)))

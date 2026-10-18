@@ -692,7 +692,7 @@ class Rebuild(unittest.TestCase):
 
     def test_rebuild_agrees_with_the_mint(self):
         entries, rep = self.rebuild()
-        self.assertEqual(rep, {"receipts": 5, "acks": 4, "links": 0, "settlements": 4, "disputed": 2, "hours": 3,
+        self.assertEqual(rep, {"receipts": 5, "acks": 4, "links": 0, "purchases": 0, "settlements": 4, "disputed": 2, "hours": 3,
                                "receipts_without_ack": 1, "acks_without_receipt": 0, "bad": []})
         self.assertEqual([e["kind"] for e in entries],
                          ["receipt", "ack", "settlement", "commitment"] * 2 + ["receipt"] + ["receipt", "ack", "settlement"] * 2 + ["commitment"])
@@ -716,7 +716,7 @@ class Rebuild(unittest.TestCase):
         # the command line: the comparison, and a ledger a fresh Mint can load
         rc, out = self.run_cli("--compare", self.ledger)
         self.assertEqual(rc, 0)
-        self.assertTrue(out[0].startswith("rebuilt 5 receipts and 4 acks under 0 announcements into 4 settlements (2 disputed) in 3 hours"), out)
+        self.assertTrue(out[0].startswith("rebuilt 5 receipts and 4 acks under 0 announcements and 0 purchases into 4 settlements (2 disputed) in 3 hours"), out)
         self.assertTrue(out[1].startswith("AGREE"), out)
         path = os.path.join(self.lab.root, "rebuilt.jsonl")
         rc, out = self.run_cli("--ledger", path)
@@ -1148,7 +1148,7 @@ class RebuildWithLinks(unittest.TestCase):
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
             rc = bwkit.main(["rebuild", self.files["receipts.jsonl"], self.files["acks.jsonl"], self.files["links.jsonl"], "--compare", self.ledger])
         self.assertEqual(rc, 0, out.getvalue())
-        self.assertTrue(out.getvalue().startswith("rebuilt 3 receipts and 3 acks under 1 announcements into 3 settlements (2 disputed) in 3 hours"), out.getvalue())
+        self.assertTrue(out.getvalue().startswith("rebuilt 3 receipts and 3 acks under 1 announcements and 0 purchases into 3 settlements (2 disputed) in 3 hours"), out.getvalue())
         # the Mint's copy of the registry serves as well as the hop's
         shutil.copy(self.lab.mint.path("links.jsonl"), self.files["links.jsonl"])
         self.assertTrue(bwkit.compare(self.rebuild()[0], self.lab.mint.ledger_lines())[0])
@@ -1288,6 +1288,168 @@ class Vectors(unittest.TestCase):
         self.assertIn('"amount_usd":0.0,', bwkit.canon_json({k: v for k, v in tiny.items() if k != "t"}))
         small = [s for s in ss if s["settled_bytes"] == 500_000][0]
         self.assertIn('"amount_usd":5e-05,"fee_usd":3e-06,', bwkit.canon_json(small).replace('"hop"', "").replace("", ""))
+
+
+class Purchases(unittest.TestCase):
+    """Purchases (spec, Section 15): posted by a payer, settled against with the premium split, the Steward's match under the cap."""
+
+    WEEK = 7 * 86400
+
+    def setUp(self):
+        self.lab = Lab()
+
+    def tearDown(self):
+        self.lab.close()
+
+    def settlements(self):
+        return [e for e in self.lab.mint.ledger_lines() if e["kind"] == "settlement"]
+
+    def steward_key(self):
+        """The Steward's key beside the Mint's, as `bwkit steward keygen` makes it."""
+        from cryptography.hazmat.primitives import serialization
+        priv = bwkit.Ed25519PrivateKey.generate()
+        with open(self.lab.mint.path("steward.priv"), "wb") as f:
+            f.write(priv.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption()))
+        self.lab.mint.load_index()
+        self.assertEqual(self.lab.mint.index["steward_nym"], bwkit.nym_of_pub(priv.public_key()))
+        return priv
+
+    def test_payer_posts_and_windows_settle_against_it(self):
+        import time
+        lab = self.lab
+        lab.hour(100_000_000, 100_000_000)                        # before the purchase: no premium
+        rec, pid = lab.payer.purchase_post("bw-forest", 50_000_000, 0.02, 3, 1.0, lab.t + self.WEEK, now=lab.t + 1)
+        self.assertEqual((rec["kind"], rec["proto"], rec["program"], rec["poster"], rec["unit"], rec["matches"], rec["proving"]),
+                         ("purchase", 1, "payer", lab.payer.nym, "USD", None, None))
+        self.assertEqual(rec["route"], {"from": lab.payer.nym, "to": lab.hop.nym, "not_via": []})
+        self.assertEqual((rec["min_bytes"], rec["premium_per_gb"], rec["windows"], rec["escrow"], rec["posted_at"]), (50_000_000, 0.02, 3, 1.0, lab.t + 1))
+        self.assertEqual(rec["id"], bwkit.purchase_id(bwkit.purchase_body(rec)))
+        self.assertTrue(bwkit.verify_purchase(rec))
+        bwkit.check_purchase(rec)
+        self.assertEqual((lab.payer.load_purchases(), lab.mint.load_purchases()), ([rec], [rec]))
+        self.assertEqual(json.loads(bwkit.http_get(lab.mint_url + "/purchases")[1]), [rec])
+        self.assertEqual(json.loads(bwkit.http_get(lab.mint_url + "/status")[1])["purchases"], 1)
+        lab.hour(200_000_000, 200_000_000)                        # started before posted_at: no premium
+        self.assertNotIn("purchase", self.settlements()[-1])
+        lab.hour(300_000_000, 300_000_000)                        # 100 MB, above the 50 MB minimum: the full premium, from the poster
+        s = self.settlements()[-1]
+        self.assertEqual([s[k] for k in bwkit.PURCHASE_KEYS], [pid, None, 0.002, 0.0, 0.002, 0.0, 0.0])
+        self.assertEqual((s["amount_usd"], s["fee_usd"]), (0.01, 0.0006))      # f is taken from the premium as from any fee
+        lab.hour(320_000_000, 320_000_000)                        # 20 MB, 40% of the minimum: the premium in proportion, the rest returns
+        s = self.settlements()[-1]
+        self.assertEqual([s[k] for k in bwkit.PURCHASE_KEYS], [pid, None, 0.0004, 0.0006, 0.0004, 0.0, 0.0])
+        self.assertEqual(s["fee_usd"], 0.00012)
+        lab.hour(420_000_000, 420_000_000)                        # the third of three windows
+        self.assertEqual(self.settlements()[-1]["purchase"], pid)
+        lab.hour(520_000_000, 520_000_000)                        # the windows are spent
+        self.assertNotIn("purchase", self.settlements()[-1])
+        book = lab.mint.index["book"]
+        self.assertEqual(book.use[pid], {"windows": 3, "own": 0.0044, "steward": 0.0, "refund": 0.0006, "held": 0.0})
+        self.assertEqual(book.pool(rec), 0.9956)
+        self.assertEqual(book.fees_in[lab.payer.nym], 0.052)                   # five windows of 100 MB and one of 20
+        month = time.strftime("%Y-%m", time.localtime(lab.t))
+        rc, text = cli(["invoice", month], mint_env(lab))
+        self.assertIn("6 windows (0 disputed), 520.00 MB, $0.0520 + $0.0044 premium on 3 purchased windows ($0.0000 of it the Steward's): "
+                      "the relay's $0.0536, the Steward's $0.0028", text)
+        self.assertIn("returned to bw-house on short windows: $0.0006", text)
+        rc, text = cli(["purchase", "list"], mint_env(lab))
+        self.assertIn(pid[:16], text)
+        self.assertIn("3 windows, 3 used", text)
+        # the rebuild with purchases.jsonl matches the Mint; without it the purchased windows differ
+        files = {}
+        for name, src in (("receipts.jsonl", lab.payer.path("receipts.jsonl")), ("acks.jsonl", lab.hop.path("acks.jsonl")),
+                          ("purchases.jsonl", lab.mint.path("purchases.jsonl"))):
+            files[name] = os.path.join(lab.root, name)
+            shutil.copy(src, files[name])
+        files["links.jsonl"] = os.path.join(lab.root, "links.jsonl")
+        open(files["links.jsonl"], "w").close()
+        read = lambda n: bwkit.read_jsonl(files[n])[0]   # noqa: E731
+        entries, rep = bwkit.rebuild(read("receipts.jsonl"), read("acks.jsonl"), (), purchases=read("purchases.jsonl"), now=lab.t + 9)
+        self.assertEqual((rep["purchases"], rep["settlements"], rep["bad"]), (1, 6, []))
+        agree, verdict, lines = bwkit.compare(entries, lab.mint.ledger_lines())
+        self.assertTrue(agree, (verdict, lines))
+        entries2, _ = bwkit.rebuild(read("receipts.jsonl"), read("acks.jsonl"), (), now=lab.t + 9)
+        agree, verdict, lines = bwkit.compare(entries2, lab.mint.ledger_lines())
+        self.assertFalse(agree)
+        self.assertEqual(sum(1 for line in lines if "purchase None here, '%s' on the Mint" % pid in line), 3)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            rc = bwkit.main(["rebuild", files["receipts.jsonl"], files["acks.jsonl"], files["links.jsonl"], files["purchases.jsonl"],
+                             "--compare", lab.mint.path("ledger.jsonl")])
+        self.assertEqual(rc, 0, out.getvalue())
+        self.assertIn("under 0 announcements and 1 purchases into 6 settlements", out.getvalue())
+
+    def test_mint_refuses_what_it_must(self):
+        import time
+        lab = self.lab
+        rec, pid = lab.payer.purchase_post("bw-forest", 50_000_000, 0.02, 3, 1.0, lab.t + self.WEEK, now=lab.t + 1, post=False)
+        self.assertEqual(lab.payer.load_purchases(), [])
+        post = lambda r: bwkit.http_post(lab.mint_url + "/purchase", r)   # noqa: E731
+        self.assertEqual(post(rec), (200, {"stored": pid}))
+        status, body = post(rec)
+        self.assertEqual((status, body["error"]), (409, "duplicate"))
+        self.assertEqual(post(dict(rec, escrow=2.0))[0], 400)            # the id and the signature no longer fit
+
+        def resign(priv, **changes):
+            body = bwkit.purchase_body(rec)
+            body.update(changes)
+            return dict(body, id=bwkit.purchase_id(body), sig=bwkit.sign_purchase(priv, body))
+
+        stranger = bwkit.Ed25519PrivateKey.generate()
+        snym = bwkit.nym_of_pub(stranger.public_key())
+        self.assertEqual(post(resign(stranger, poster=snym, route=dict(rec["route"], **{"from": snym})))[0], 403)
+        status, body = post(resign(lab.payer.priv, route=dict(rec["route"], to=snym), posted_at=lab.t + 2))
+        self.assertEqual(status, 403)                                    # an unknown hop
+        status, body = post(resign(lab.payer.priv, route=dict(rec["route"], to="nowhere"), posted_at=lab.t + 2))
+        self.assertEqual((status, body["error"].split(":")[0]), (409, "route"))   # a place not on the map
+        status, body = post(resign(lab.payer.priv, posted_at=int(time.time()) - 60))
+        self.assertEqual((status, body["error"]), (409, "since"))        # backdated
+        status, body = post(resign(lab.payer.priv, program="first_link", route={"from": None, "to": "the-cabin", "not_via": []}, posted_at=lab.t + 2))
+        self.assertEqual(status, 403)                                    # only the Steward posts its programs
+        lab.hour(1000, 1000)                                             # a window the Mint holds, from lab.t - 3600
+        status, body = post(resign(lab.payer.priv, posted_at=lab.t - 3600, windows=4))
+        self.assertEqual((status, body["error"]), (409, "since"))
+        self.assertIn("already held", body["detail"])
+        for bad in (dict(rec, windows=0), dict(rec, unit="EUR"), dict(rec, program="bounty"), dict(rec, matches="a" * 64),
+                    dict(rec, min_bytes=-1), dict(rec, proto=2), dict(rec, route={"from": None, "to": lab.hop.nym}),
+                    dict(rec, id="0" * 64), dict(rec, premium_per_gb=True)):
+            with self.assertRaises(ValueError):
+                bwkit.check_purchase(bad)
+        path = os.path.join(lab.root, "p.json")
+        with open(path, "w") as f:
+            json.dump(rec, f)
+        rc, text = cli(["verify", path], {})
+        self.assertEqual((rc, "purchase %s by %s (payer)" % (pid[:16], lab.payer.nym) in text), (0, True))
+
+    def test_the_stewards_match_pays_after_the_poster_under_the_cap(self):
+        lab = self.lab
+        spriv = self.steward_key()
+        lab.hour(100_000_000, 100_000_000)
+        lab.hour(200_000_000, 200_000_000)                        # fees in so far: $0.02 gross
+        rec, pid = lab.payer.purchase_post("bw-forest", 50_000_000, 0.02, 5, 0.001, lab.t + self.WEEK, now=lab.t)   # half a window's premium
+        match, mid = lab.payer.purchase_post("bw-forest", 50_000_000, 0.02, 5, 0.5, lab.t + self.WEEK, now=lab.t, poster_priv=spriv,
+                                             program="match", route_from=lab.payer.nym, matches=pid)
+        self.assertEqual((match["program"], match["matches"], match["poster"]), ("match", pid, lab.mint.index["steward_nym"]))
+        self.assertEqual(len(lab.mint.load_purchases()), 2)
+        lab.hour(300_000_000, 300_000_000)                        # 100 MB: premium due 0.002; the poster's 0.001 first, then the Steward's under the cap
+        s = self.settlements()[-1]
+        # the cap: (f - margin) of the payer's $0.02 fees in = 0.0008, so 0.0002 of the match is held back
+        self.assertEqual([s[k] for k in bwkit.PURCHASE_KEYS], [pid, mid, 0.0018, 0.0, 0.001, 0.0008, 0.0002])
+        self.assertEqual(s["fee_usd"], round((0.01 + 0.0018) * 0.05, 6))
+        book = lab.mint.index["book"]
+        self.assertEqual((book.pool(rec), book.pool(match)), (0.0, 0.4992))
+        self.assertEqual((book.paid_on[lab.payer.nym], book.use[mid]["steward"], book.use[mid]["held"]), (0.0008, 0.0008, 0.0002))
+        lab.hour(400_000_000, 400_000_000)                        # the poster's pool is empty; the cap has grown by 0.0004 with the last window's fees
+        s = self.settlements()[-1]
+        self.assertEqual([s[k] for k in bwkit.PURCHASE_KEYS], [pid, mid, 0.0004, 0.0, 0.0, 0.0004, 0.0016])
+        # the rebuild, from the Mint's purchases.jsonl, agrees
+        entries, rep = bwkit.rebuild(bwkit.read_jsonl(lab.payer.path("receipts.jsonl"))[0], bwkit.read_jsonl(lab.hop.path("acks.jsonl"))[0], (),
+                                     purchases=bwkit.read_jsonl(lab.mint.path("purchases.jsonl"))[0], now=lab.t + 9)
+        agree, verdict, lines = bwkit.compare(entries, lab.mint.ledger_lines())
+        self.assertTrue(agree, (verdict, lines))
+        # a match is never settled against on its own, and a payer cannot post one
+        with self.assertRaises(SystemExit):
+            lab.payer.purchase_post("bw-forest", 1, 0.02, 1, 0.1, lab.t + self.WEEK, now=lab.t, program="match", matches=pid)
 
 
 class Rules(unittest.TestCase):
