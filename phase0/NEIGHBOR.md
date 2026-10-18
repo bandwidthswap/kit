@@ -117,6 +117,23 @@ It pulls both logs, the house's purchase records and fetch journal, and the Mint
 
 **What the numbers are and are not.** The clock figure is the difference of two chrony estimates, each against a different reference (the house's LAN server, the pool), not a measurement across the link; it bounds how far apart the two signing clocks can be, which is what the receipt's five-second rule rests on, and it says nothing about the link's delay. The per-day overhead from the ten-minute counters includes each node's own traffic (the tailnet's control plane, chrony, ssh), which a day of purchases dwarfs; the per-purchase ratio from `bwkit-fetch` does not. A counter reset (reboot, interface recreated) shows as a negative delta and the report skips that interval. The rate is curl's: bytes over the whole request, including the connection.
 
+## Updating the kit, and the link's terms
+
+A newer `bwkit.py` goes to the Mint first, so that every record the other nodes send is read by a Mint that already knows the new shapes, then to the payer, then to the hops; every record an older kit wrote stays valid (spec/PROTOCOL.md, Section 14). From the Mac on the tailnet:
+
+```
+SSH_SUFFIX=-ts FOREST_JUMP=bw-house-ts UPDATE_HOSTS=bw-mint  phase0/provision.sh update
+SSH_SUFFIX=-ts FOREST_JUMP=bw-house-ts UPDATE_HOSTS=bw-house phase0/provision.sh update
+SSH_SUFFIX=-ts phase0/neighbor.sh update
+SSH_SUFFIX=-ts FOREST_JUMP=bw-house-ts UPDATE_HOSTS=bw-forest phase0/provision.sh update
+```
+
+The payer has no service to restart; its timer runs the new code at the next hour. Nothing here touches a node's key, peers, state or ledger.
+
+**The link's terms** (bwkit 0.3.0, the paper's Appendix A.1). The neighbor's link is a relayed path whose two meters disagree by a tenth, so its agreement margin is ten percent, not the bench's one. `SSH_SUFFIX=-ts phase0/neighbor.sh announce` writes the terms into the hop's config (`LINK_PRICE` 0.10 USD/GB, `LINK_MARGIN` 0.10, `LINK_MIN_BYTES` 65536, `LINK_PATIENCE` 0, `LINK_MEDIUM` wifi, `LINK_RANGE` building, each overridable in the environment), installs the `on_decline` hook, restarts the hop and runs `bwkit announce`: the hop signs the terms and registers them with the Mint, which keeps them in `links.jsonl` and settles every window that starts from then on under them, with `margin` 0.10, `price_usd_per_gb` from the announcement and `link` naming it by hash. A window that started before the announcement settles under the pilot's defaults, so the first settlement under the new terms is the window after the one running when `announce` ran. `sudo -u bwkit bwkit links` on `bw-mint` lists what it holds.
+
+The hook is `/usr/local/bin/bwkit-on-decline`, run with the payer's NYM the first time the hop's patience declines that payer: it logs the fact and withdraws the exit node (`tailscale set --advertise-exit-node=false`, the one command a sudoers line lets the `bwkit` user run), since declining a receipt by itself costs the hop the window and the payer nothing. With `LINK_PATIENCE` 0 the hop never declines and the hook never runs; it is there so that the rule has teeth when the terms say so. To serve a declined payer again: `sudo -u bwkit bwkit patience --reset <NYM>` on the hop, and offer the exit node again by hand.
+
 ## What to watch for a month
 
 - The clock: `phase0/link-report.sh` gives the day-by-day figure between the sites; `chronyc tracking` on both ends is the live view, and the hop's journal says if it ever declines a receipt (since bwkit 0.1.1). Section 10 lists drift between sites as unmeasured; this is the measurement.

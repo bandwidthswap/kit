@@ -15,6 +15,11 @@
 #                       to it at that point, which is harmless once everything else is set
 #   phase0/neighbor.sh check    after the move: tailnet status, ping, the hop's status over the tailnet, the Mint's view
 #   phase0/neighbor.sh fetch    (re)install the hourly purchase script and its timer on bw-house, nothing else
+#   phase0/neighbor.sh update   copy a newer bwkit.py and units to bw-neighbor and restart its hop (the Mint first:
+#                               SSH_SUFFIX=-ts UPDATE_HOSTS=bw-mint phase0/provision.sh update)
+#   phase0/neighbor.sh announce write the link's terms (LINK_* below) and the on_decline hook into the hop's config, then
+#                               `bwkit announce`: the signed announcement is registered with the Mint and governs every
+#                               window that starts from now
 #   phase0/neighbor.sh bench    put bw-house's payer back on bw-forest over wg0 (the bench as it was)
 #
 # Environment:
@@ -31,8 +36,12 @@
 #   MINT_TS / NEIGH_TS   the Mint's and the neighbor's tailnet addresses, when the script cannot ask them itself
 #   NEIGH_SSH        the SSH alias to reach bw-neighbor by when it is not on the Mac's network: bw-neighbor-away in
 #                    ~/.ssh/config goes to its tailnet address through bw-house, once bw-house is on the tailnet
+#   LINK_PRICE LINK_MARGIN LINK_MIN_BYTES LINK_PATIENCE LINK_MEDIUM LINK_RANGE
+#                    the link's terms for `announce` (defaults: 0.10 USD/GB, 0.10, 65536, 0, wifi, building): the price per
+#                    gigabyte, the agreement margin as a fraction, its floor in bytes, how many windows short of the hop's
+#                    count beyond the margin it bears before declining a payer (0: never), the medium and the range class
 #
-# Steps, each usable on its own: upgrade time logs tailnet kit peers house fetch check wifi bench
+# Steps, each usable on its own: upgrade time logs tailnet kit peers house fetch update announce check wifi bench
 #
 # Nothing here prints or copies a private key. Tailscale's keys are made on each node; the node's NYM key is made by
 # install.sh and stays on the node, which is the neighbor's. The Mac keeps SSH access through bw-house (phase0/NEIGHBOR.md).
@@ -216,6 +225,50 @@ echo "bw-house: bwkit-fetch.timer enabled ($urls)"
 EOS
 }
 
+step_update() {
+  say "bwkit.py and the units to $N, the hop restarted (the Mint should already run the newer kit)"
+  COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py install.sh systemd | $SSH "$(host_of $N)" 'mkdir -p ~/kit && tar -C ~/kit -xf - && sudo install -m 0755 ~/kit/bwkit.py /usr/local/bin/bwkit && sudo install -m 0644 ~/kit/systemd/*.service ~/kit/systemd/*.timer /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl restart bwkit && sleep 1 && echo "$(hostname): bwkit $(grep -m1 "^VERSION" /usr/local/bin/bwkit | cut -d\" -f2), server $(systemctl is-active bwkit)"'
+  run $N 'curl -s http://127.0.0.1:8710/status | head -c 400; echo'
+}
+
+step_announce() {
+  price="${LINK_PRICE:-0.10}"; margin="${LINK_MARGIN:-0.10}"; minb="${LINK_MIN_BYTES:-65536}"; patience="${LINK_PATIENCE:-0}"
+  medium="${LINK_MEDIUM:-wifi}"; range="${LINK_RANGE:-building}"
+  say "the link's terms on $N: $price USD/GB, margin $margin, min_bytes $minb, patience $patience, $medium/$range; the on_decline hook"
+  # The hook: declining a receipt costs the hop the window and the payer nothing, so the remedy with teeth is to stop
+  # offering the exit node. It runs as the bwkit user, so one sudoers line lets it run that one command and no other.
+  sudo_sh $N "$price" "$margin" "$minb" "$patience" "$medium" "$range" <<'EOS'
+set -e
+price="$1"; margin="$2"; minb="$3"; patience="$4"; medium="$5"; range="$6"
+ts="$(command -v tailscale || echo /usr/bin/tailscale)"
+cat > /usr/local/bin/bwkit-on-decline <<EOC
+#!/bin/sh
+# bwkit's on_decline hook: the hop has stopped serving the payer named in \$1 (its patience is spent). A declined receipt
+# costs the hop the window and the payer nothing, so this withdraws the service the receipts pay for: the exit node.
+logger -t bwkit-decline "payer \$1 declined; withdrawing the exit node"
+sudo -n $ts set --advertise-exit-node=false
+EOC
+chmod 755 /usr/local/bin/bwkit-on-decline
+printf 'bwkit ALL=(root) NOPASSWD: %s set --advertise-exit-node=false\n' "$ts" > /etc/sudoers.d/bwkit-decline
+chmod 440 /etc/sudoers.d/bwkit-decline
+visudo -cf /etc/sudoers.d/bwkit-decline >/dev/null
+python3 - "$price" "$margin" "$minb" "$patience" "$medium" "$range" <<'PYC'
+import json, sys
+p = '/etc/bwkit/config.json'
+c = json.load(open(p))
+c['link'] = {'price': float(sys.argv[1]), 'margin': float(sys.argv[2]), 'min_bytes': int(sys.argv[3]), 'patience_windows': int(sys.argv[4]),
+             'medium': sys.argv[5], 'range_class': sys.argv[6]}
+c['on_decline'] = '/usr/local/bin/bwkit-on-decline'
+json.dump(c, open(p, 'w'), indent=2)
+print('hop config: link', c['link'], 'on_decline', c['on_decline'])
+PYC
+systemctl restart bwkit; sleep 1; echo "$(hostname): bwkit $(systemctl is-active bwkit)"
+EOS
+  run $N 'sudo -u bwkit bwkit announce'
+  say "the Mint's registry"
+  run bw-mint 'sudo -u bwkit bwkit links'
+}
+
 step_check() {
   say "the tailnet, as bw-house sees it"
   run bw-house 'tailscale status | head -5'
@@ -239,6 +292,6 @@ case "${1:-}" in
   prep)  step_upgrade; step_time; step_logs; step_tailnet; step_kit; step_peers; step_house; step_check; step_wifi ;;
   check) step_check ;;
   bench) step_bench ;;
-  upgrade|time|logs|wifi|tailnet|kit|peers|house|fetch) "step_$1" ;;
+  upgrade|time|logs|wifi|tailnet|kit|peers|house|fetch|update|announce) "step_$1" ;;
   *) sed -n '2,20p' "$0"; exit 2 ;;
 esac

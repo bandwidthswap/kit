@@ -14,6 +14,10 @@
 #   phase0/provision.sh check      the four verifications, nothing changed
 #   phase0/provision.sh all        upgrade, time, tunnel, logs and kit, in order
 #
+# From the tailnet (the Mac away from the house LAN): SSH_SUFFIX=-ts reaches bw-house and bw-mint by the -ts aliases in
+# ~/.ssh/config, and FOREST_JUMP=bw-house-ts reaches bw-forest, which is not on the tailnet, through bw-house:
+#   SSH_SUFFIX=-ts FOREST_JUMP=bw-house-ts phase0/provision.sh update
+#
 # Nothing here prints or copies a private key: WireGuard keys are made on the
 # nodes and only the public halves cross the LAN. The status token travels once,
 # inside the script on stdin of `status`, and is never echoed.
@@ -22,16 +26,21 @@ kit="$(cd "$(dirname "$0")/.." && pwd)"
 HOSTS="bw-house bw-forest bw-mint"
 LAN="${LAN:-192.168.0.0/24}"
 SSH="ssh -o ConnectTimeout=8 -o BatchMode=yes"
+SSH_SUFFIX="${SSH_SUFFIX:-}"
 
 say() { printf '\n== %s\n' "$*"; }
-run() { h="$1"; shift; $SSH "$h" "$@"; }
-sudo_sh() { h="$1"; $SSH "$h" sudo sh -s; }   # script on stdin
+ssh_to() {   # ssh_to <node> [command...]: by its alias plus SSH_SUFFIX, or through FOREST_JUMP for bw-forest
+  h="$1"; shift
+  if [ "$h" = bw-forest ] && [ -n "${FOREST_JUMP:-}" ]; then $SSH -J "$FOREST_JUMP" bw-forest "$@"; else $SSH "$h$SSH_SUFFIX" "$@"; fi
+}
+run() { ssh_to "$@"; }
+sudo_sh() { ssh_to "$1" sudo sh -s; }   # script on stdin
 
 wait_up() {
   for h in "$@"; do
     printf 'waiting for %s ' "$h"
     i=0
-    until $SSH "$h" true 2>/dev/null; do
+    until ssh_to "$h" true 2>/dev/null; do
       i=$((i+1)); [ $i -gt 90 ] && { echo " gave up after 15 min"; exit 1; }
       printf .; sleep 10
     done
@@ -42,7 +51,7 @@ wait_up() {
 step_upgrade() {
   say "upgrade and reboot (the three in parallel; 5 to 15 minutes)"
   for h in $HOSTS; do
-    ( $SSH "$h" 'sudo apt-get -o DPkg::Lock::Timeout=600 update -q && sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 full-upgrade -y -q && sudo apt-get -o DPkg::Lock::Timeout=600 autoremove -y -q && sudo reboot' > "/tmp/bwkit-upgrade-$h.log" 2>&1; echo "$h: exit $?" ) &
+    ( ssh_to "$h" 'sudo apt-get -o DPkg::Lock::Timeout=600 update -q && sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 full-upgrade -y -q && sudo apt-get -o DPkg::Lock::Timeout=600 autoremove -y -q && sudo reboot' > "/tmp/bwkit-upgrade-$h.log" 2>&1; echo "$h: exit $?" ) &
   done
   wait
   sleep 20
@@ -161,7 +170,7 @@ EOS
 step_kit() {
   say "bwkit on the three nodes"
   for h in $HOSTS; do
-    COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py install.sh systemd | $SSH "$h" 'mkdir -p ~/kit && tar -C ~/kit -xf -'
+    COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py install.sh systemd | ssh_to "$h" 'mkdir -p ~/kit && tar -C ~/kit -xf -'
   done
   run bw-house 'cd ~/kit && sudo ./install.sh payer'
   run bw-forest 'cd ~/kit && sudo ./install.sh hop'
@@ -182,12 +191,15 @@ step_kit() {
 }
 
 step_update() {
-  say "bwkit.py and the units to the three nodes, services restarted"
-  for h in $HOSTS; do
-    COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py install.sh systemd | $SSH "$h" 'mkdir -p ~/kit && tar -C ~/kit -xf - && sudo install -m 0755 ~/kit/bwkit.py /usr/local/bin/bwkit && sudo install -m 0644 ~/kit/systemd/*.service ~/kit/systemd/*.timer /etc/systemd/system/ && sudo systemctl daemon-reload && echo "$(hostname): updated"'
+  # The Mint first, so that every record the other nodes send is read by a Mint that already knows the new shapes;
+  # UPDATE_HOSTS narrows it (UPDATE_HOSTS=bw-mint for the Mint alone). The payer has no service to restart: its timer
+  # runs the new code at the next hour.
+  hosts="${UPDATE_HOSTS:-bw-mint bw-house bw-forest}"
+  say "bwkit.py and the units to $hosts, services restarted"
+  for h in $hosts; do
+    COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py install.sh systemd | ssh_to "$h" 'mkdir -p ~/kit && tar -C ~/kit -xf - && sudo install -m 0755 ~/kit/bwkit.py /usr/local/bin/bwkit && sudo install -m 0644 ~/kit/systemd/*.service ~/kit/systemd/*.timer /etc/systemd/system/ && sudo systemctl daemon-reload && echo "$(hostname): updated to bwkit $(grep -m1 "^VERSION" /usr/local/bin/bwkit | cut -d\" -f2)"'
+    case "$h" in bw-mint|bw-forest) run "$h" 'sudo systemctl restart bwkit && sleep 1 && echo "$(hostname): bwkit $(systemctl is-active bwkit)"' ;; esac
   done
-  run bw-forest 'sudo systemctl restart bwkit && sleep 1 && systemctl is-active bwkit'
-  run bw-mint 'sudo systemctl restart bwkit && sleep 1 && systemctl is-active bwkit'
   check_kit
 }
 
@@ -209,7 +221,7 @@ step_status() {
     fi
   fi
   url="${BWKIT_STATUS_URL:-https://status.bandwidthswap.com/status}"
-  COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py install.sh systemd | $SSH bw-mint 'mkdir -p ~/kit && tar -C ~/kit -xf - && sudo install -m 0755 ~/kit/bwkit.py /usr/local/bin/bwkit && sudo install -m 0644 ~/kit/systemd/*.service ~/kit/systemd/*.timer /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl restart bwkit && sleep 1 && echo "bw-mint: bwkit $(grep -m1 "^VERSION" /usr/local/bin/bwkit | cut -d\" -f2), server $(systemctl is-active bwkit)"'
+  COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py install.sh systemd | ssh_to bw-mint 'mkdir -p ~/kit && tar -C ~/kit -xf - && sudo install -m 0755 ~/kit/bwkit.py /usr/local/bin/bwkit && sudo install -m 0644 ~/kit/systemd/*.service ~/kit/systemd/*.timer /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl restart bwkit && sleep 1 && echo "bw-mint: bwkit $(grep -m1 "^VERSION" /usr/local/bin/bwkit | cut -d\" -f2), server $(systemctl is-active bwkit)"'
   if [ -n "${BWKIT_STATUS_TOKEN:-}" ]; then
     sudo_sh bw-mint <<EOS
 set -e
