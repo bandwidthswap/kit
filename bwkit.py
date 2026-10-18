@@ -57,8 +57,9 @@ the window (a SHA-256 over them) until a chunked data plane exists.
 Files: config in /etc/bwkit/config.json (BWKIT_CONFIG), everything else in
 /var/lib/bwkit (BWKIT_DIR): key.priv, peers.json, state.json, ledger.jsonl,
 links.jsonl, outbox/, sent/. Every node keeps its own signed copies: the
-payer appends receipts.jsonl and acks.jsonl, the hop acks.jsonl and
-links.jsonl, and both append sent.jsonl with the Mint's answer to each
+payer appends receipts.jsonl and acks.jsonl, the hop receipts.jsonl (the
+payer's receipts it countersigned), acks.jsonl and links.jsonl, and both
+append sent.jsonl with the Mint's answer to each
 envelope, which carries the Mint's signed commitment when one was made.
 """
 

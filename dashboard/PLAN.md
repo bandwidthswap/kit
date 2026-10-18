@@ -63,6 +63,8 @@ No node knows the fleet; the list lives in the browser, and nothing about the fl
 
 ## 6. Order and sessions
 
+**Done, Oct 18, 2026.** A, bwkit, on all four nodes since 12:43 CDT (the last change at 16:26): `health` in `/status` (87038d2), CORS on every answer (2966115), `/ledger?since=` (2a01d2d), the hop's receipts, the hop's and payer's endpoints and the Mint proxied (766d71a), the directory served with `/fleet` and the self-contained `/snapshot` (10fa6f7, installers 9b955e9), `dashboard/test.mjs` (fd2eab4), a lost window listed for a day (38f40ce). B, the page, landed before it (fece7f1). Checked live: the Mint's view with Attention from `health`, the hop's with its month and the Mint card, the payer's, the fleet with three nodes up and bw-forest not answering (it is not on the tailnet), and a saved snapshot opened as a file with no network. Verifying in the page works from localhost and from a snapshot but not at a tailnet address over plain http, where the browser has no WebCrypto; that is on `PUNCH-LIST.md`. C is the site's.
+
 A: bwkit, in the kit: `health`, CORS, `/ledger?since=`, the hop's and payer's endpoints, serving the directory; tests for each; rollout. B: the page, in the kit: the split into the directory, the three views with Section 1's principles, the snapshot mode for each, the fleet mode; checked on real snapshots of bw-mint, bw-neighbor and bw-house. A before B's rollout, since B reads what A serves; B's front end can be built on snapshots while A runs, so they run in parallel in two sessions and B installs once A has landed. C: the site vendors `bsp.js` from the kit and the Lab status links each node's page by name where the operator allows it.
 
 ## 7. Is this the best we can do? Each part
