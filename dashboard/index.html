@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>bwkit</title>
+<link rel="stylesheet" href="dash/style.css">
+</head>
+<body>
+<header class="bar">
+  <span class="name" id="h-name">bwkit</span>
+  <span class="role" id="h-role">node</span>
+  <span class="nym" id="h-nym"></span>
+  <span class="v" id="h-ver"></span>
+  <span class="spacer"></span>
+  <span class="snap" id="h-snap" hidden>snapshot</span>
+  <a id="h-fleet" href="fleet" hidden>the fleet</a>
+  <a id="h-snapshot" href="snapshot" hidden title="this page with its data embedded, as one file to save or send">save a snapshot</a>
+  <span class="v" id="h-at"></span>
+  <div class="asof" id="asof" hidden><span>as of</span><input id="asof-range" type="range" aria-label="draw the books as they stood at this moment"><b id="asof-label">now</b><button id="asof-now" type="button">now</button></div>
+</header>
+<main id="main">
+  <div class="err" id="err" hidden></div>
+  <div id="sections"></div>
+</main>
+<script id="snapshot" type="application/json"></script>
+<script src="dash/data.js"></script>
+<script src="dash/rules.js"></script>
+<script src="dash/charts.js"></script>
+<script src="dash/view-mint.js"></script>
+<script src="dash/view-node.js"></script>
+<script src="dash/view-fleet.js"></script>
+<script type="module">import * as bsp from './dash/bsp.js'; window.bsp = bsp;</script>
+<script src="dash/app.js"></script>
+</body>
+</html>

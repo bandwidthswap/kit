@@ -67,8 +67,35 @@ A: bwkit, in the kit: `health`, CORS, `/ledger?since=`, the hop's and payer's en
 
 ## 7. Is this the best we can do? Each part
 
-*Filled in after the mockups, one entry per view.*
+Asked of each view on its own, on a snapshot of the real node, after the first look.
+
+**The Mint's view.**
+- The in-page verifier failed on the Mint's newest proof while the same code passed it under Node. The page had re-serialised the proof, which rewrites Python's floats and changes every leaf. A proof now travels as the Mint's own text, from the snapshot and from `/proof`, and bwkit's `/snapshot` must embed it the same way. The failure was the verifier doing its job, and the page's first real catch.
+- The drill-down first landed below the whole table and was cut off by the table's sideways scroll. It is now a row under its own row whose content sticks to the table's left edge.
+- The as-of control moves every record but not the Steward's balances or the node's health, which exist only as of now; the page says so. A history of Steward runs (`steward.jsonl`) would let the control move those too: a later step.
+- Baselines need a week of windows and are silent until then. The lab has two days, so the first week's run is the test of whether they fire usefully.
+- "Verify here" is one hour at a time. A "verify the last day" button is the obvious next step and costs little.
+
+**The node's view.**
+- A hop cannot draw the gap from its own records: its acks carry its own count and the payer's signature, not the payer's count. The page joins the Mint's settlements instead, which is right when the Mint answers and empty when it does not. bwkit should keep the receipts a hop countersigns beside its acks, so the hop's page stands on its own during an outage, which is when it matters most.
+- The payer's "my link" can only show the terms its windows settled under, not the hop's announcement, which the Mint holds. The node should proxy `/mint/links` as it proxies the ledger.
+- "Owed to me" is the page's arithmetic over the Mint's settlements, not an invoice. It matches `bwkit invoice` by construction; a hop still deserves the invoice itself for its own windows, which is a Mint endpoint away.
+- The margin in force on a payer's page comes from the newest settlement's own `margin` field when there is no announcement to read, which is what made the payer's false alarm (a one-percent default against a ten-percent link) go away.
+
+**The fleet's view.**
+- A fleet snapshot first judged every node stale against the real clock, because loading it set the mode to fleet and lost the fact that it was a snapshot. The two are now separate flags, and "now" is the moment the snapshot was taken.
+- "Behind" for a Mint's last hour was computed against the current hour, which has not closed. A window is due five minutes after it closes, and that is what the page checks now.
+- The fleet computes attention from each node's status alone until bwkit carries `health` in `/status`; then every node's own verdicts appear here with one request each.
+- Every listed node is "mine". An operator who also lists a counterparty's node to watch it would mis-count their position; a per-node switch is small and should come with the list editor.
+- The list lives in one browser. That is by design, since no node should know the fleet, but it means a second device starts empty; a paste-able `?nodes=` link is the way to carry it.
 
 ## 8. Is this the best we can do? The whole
 
-*Filled in after the parts.*
+Asked of the three views together.
+
+- **One derivation serves all three**, and it shows: the hop's "my windows" are the Mint's windows filtered to the hop, the fleet's map is the Mint's map with the operator's places marked, and a fix in one place (the lost window, the margin in force) reaches every view. That is the main reason this is one page and not three.
+- **Every view opens the same way**: what the node sees now, what needs attention, this hour. Someone who has read one has read the others.
+- **The rules still live in the page.** Until bwkit computes `health`, the fleet's attention is thinner than the node's, and a timer cannot ping anyone. Moving the shared checks into bwkit is the first thing the build does.
+- **Nothing is tested.** Eight files and some two thousand lines of page draw real money and real disputes with no test. The build adds `dashboard/test.mjs`: the modules loaded under Node against the three snapshots, with the numbers the pages show asserted (windows, disputes, what is owed, the attention items), so a regression in the derivation is caught before a rollout.
+- **The verifier is now in two repos.** `bsp.js` lives in the kit and the site vendors it; the site's vector check should also check the two files are identical, so they cannot drift.
+- **What the lab cannot show yet**: a node offline with a full outbox, a declined payer, a fleet with two Mints. The views have sections for each, drawn from the same data model, and the first week of running will say whether they read right when it happens.
