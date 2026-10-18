@@ -19,6 +19,12 @@ These are the month's tests from `phase0/NEIGHBOR.md`, none run yet.
 
 ## Kit fixes
 
+- **The page cannot verify a proof when it is opened at a node's tailnet address.** On Oct 18, "verify here" on the Mint's page and "verify the latest hour here" on bw-neighbor's both said "the signature does not verify" for every hour. The proofs are good. `bwkit verify-proof` passes them, and the same page passes them in two other places: at `http://localhost:8711/` through `ssh -N -L 8711:127.0.0.1:8710 bw-mint-ts` (13:00, 14:00 and 15:00 verified), and in a saved `/snapshot` opened as a file. The cause is the browser. A plain-http page at an address other than localhost is not a secure context, so it has no `crypto.subtle`. `dashboard/bsp.js` needs it for SHA-256 (the leaves) and for Ed25519. Its fallback, noble, needs it for SHA-512. The resulting error is caught and reported as a bad signature. Until it is fixed, verify through the tunnel or from a saved snapshot. To pick it up:
+  1. Give `bsp.js` its own SHA-256 and SHA-512 in plain JavaScript, used when `crypto.subtle` is missing, and hand the SHA-512 to noble (`etc.sha512Async`).
+  2. Vendor noble into `dashboard/` instead of importing it from jsDelivr. A node's page loads nothing from anywhere else (`dashboard/PLAN.md`, principle 1), and a node on the tailnet may have no internet.
+  3. When verification cannot run, say so in the page ("this browser has no WebCrypto on a plain-http page") instead of reporting a bad signature.
+  4. Add the no-WebCrypto case to `dashboard/test.mjs` and to the site's vector runner, then vendor the new `bsp.js` into the site.
+  Serving the nodes over HTTPS with `tailscale serve` would also give a secure context, but the page should not depend on it.
 - **One test is flaky.** `test_bwkit.py` failed once in four runs on Oct 18, before `bwkit.py` changed, and the name of the failing test was not captured. Run it in a loop until it fails, then fix the cause.
 - **bw-forest is not on the tailnet.** It runs 0.4.0 on the bench and answers on the house LAN, but a fleet page reading over the tailnet cannot reach it. Join it with `NODES=bw-forest phase0/neighbor.sh tailnet`, which needs a fresh pre-authentication key in `~/.config/bwkit/neighbor.env`. Or decide that it waits for Phase 1, when it becomes the radio hop.
 
