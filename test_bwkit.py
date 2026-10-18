@@ -1235,8 +1235,13 @@ class Vectors(unittest.TestCase):
         self.assertEqual(self.vectors.check(), [])
         files = self.vectors.generate(self.vectors.inputs())
         self.assertEqual(set(files), {"keys.json", "receipt.json", "ack.json", "link.json", "settlement-default.json",
-                                      "settlement-disputed.json", "settlement-settled.json", "commitment.json", "proof.json",
-                                      "rebuild/receipts.jsonl", "rebuild/acks.jsonl", "rebuild/links.jsonl", "rebuild/ledger.jsonl"})
+                                      "settlement-disputed.json", "settlement-settled.json", "purchase.json", "settlement-purchased.json",
+                                      "commitment.json", "proof.json", "rebuild/receipts.jsonl", "rebuild/acks.jsonl",
+                                      "rebuild/links.jsonl", "rebuild/purchases.jsonl", "rebuild/ledger.jsonl"})
+        sp = files["settlement-purchased.json"]
+        self.assertEqual((sp["purchase"], sp["premium_usd"], sp["from_poster_usd"], sp["from_steward_usd"], sp["refund_usd"], sp["fee_usd"]),
+                         (files["purchase.json"]["id"], 0.0006, 0.0006, 0.0, 0.0, 0.00033))
+        self.assertIn('"from_steward_usd":0.0,', bwkit.canon_json(sp))          # floats, never the integer 0, in the leaf's bytes
         self.assertEqual((files["settlement-default.json"]["link"], files["settlement-default.json"]["status"]), (None, "settled"))
         self.assertEqual((files["settlement-disputed.json"]["link"], files["settlement-disputed.json"]["status"]),
                          (bwkit.link_hash(files["link.json"]), "disputed"))
@@ -1427,8 +1432,8 @@ class Purchases(unittest.TestCase):
         spriv = self.steward_key()
         lab.hour(100_000_000, 100_000_000)
         lab.hour(200_000_000, 200_000_000)                        # fees in so far: $0.02 gross
-        rec, pid = lab.payer.purchase_post("bw-forest", 50_000_000, 0.02, 5, 0.001, lab.t + self.WEEK, now=lab.t)   # half a window's premium
-        match, mid = lab.payer.purchase_post("bw-forest", 50_000_000, 0.02, 5, 0.5, lab.t + self.WEEK, now=lab.t, poster_priv=spriv,
+        rec, pid = lab.payer.purchase_post("bw-forest", 50_000_000, 0.02, 5, 0.001, lab.t + self.WEEK, now=lab.t + 1)   # half a window's premium
+        match, mid = lab.payer.purchase_post("bw-forest", 50_000_000, 0.02, 5, 0.5, lab.t + self.WEEK, now=lab.t + 1, poster_priv=spriv,
                                              program="match", route_from=lab.payer.nym, matches=pid)
         self.assertEqual((match["program"], match["matches"], match["poster"]), ("match", pid, lab.mint.index["steward_nym"]))
         self.assertEqual(len(lab.mint.load_purchases()), 2)
@@ -1450,7 +1455,7 @@ class Purchases(unittest.TestCase):
         self.assertTrue(agree, (verdict, lines))
         # a match is never settled against on its own, and a payer cannot post one
         with self.assertRaises(SystemExit):
-            lab.payer.purchase_post("bw-forest", 1, 0.02, 1, 0.1, lab.t + self.WEEK, now=lab.t, program="match", matches=pid)
+            lab.payer.purchase_post("bw-forest", 1, 0.02, 1, 0.1, lab.t + self.WEEK, now=lab.t + 1, program="match", matches=pid)
 
 
 class StewardRole(unittest.TestCase):
@@ -1536,7 +1541,7 @@ class StewardRole(unittest.TestCase):
         self.assertAlmostEqual(fl[0]["escrow"], 0.00048, places=6)            # 0.0020 - 0.00144 - m x 0.0020
         self.assertEqual(run2["posted"], [fl[0]["id"]])
         # the match: the house's purchase, from a payer the Mint has known long enough, at m of the Steward's whole income
-        rec, pid = lab.payer.purchase_post("bw-forest", 50_000_000, 0.02, 168, 1.0, lab.t + self.WEEK, now=lab.t)
+        rec, pid = lab.payer.purchase_post("bw-forest", 50_000_000, 0.02, 168, 1.0, lab.t + self.WEEK, now=lab.t + 1)
         st.params["min_payer_age_s"] = 10 ** 9
         run3 = st.run(lab.t + 300)
         self.assertEqual(run3["posted"], [])
@@ -1592,7 +1597,7 @@ class StewardRole(unittest.TestCase):
         lab, st = self.lab, self.st
         lab.hour(100_000_000, 100_000_000)
         st.run(lab.t + 300)
-        rec, pid = lab.payer.purchase_post("bw-forest", 50_000_000, 0.02, 168, 1.0, lab.t + self.WEEK, now=lab.t)
+        rec, pid = lab.payer.purchase_post("bw-forest", 50_000_000, 0.02, 168, 1.0, lab.t + self.WEEK, now=lab.t + 1)
         lab.hour(200_000_000, 200_000_000)
         rep = lab.mint.status_report(now=lab.t + 60, service=True)
         self.assertEqual(rep["mint"], lab.mint.nym)

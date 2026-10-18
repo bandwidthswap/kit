@@ -4,7 +4,7 @@
  "kind": "proof",
  "mint": "ed25519:ZSkFPo6PQCl9IKHZpRXT7zp_1vBFqEcpwW0Zucj1Wsg",
  "proto": 1,
- "root": "b508f406ee39c146e376950c502dda195b5195af4b37692c44a30052b0f2c74a",
+ "root": "e386337ae321aa95d461e9bc2c47551475aa83d2030d9f27c99d95e7ac3902ae",
  "settlements": [
   {
    "index": 0,
@@ -16,7 +16,7 @@
     ],
     [
      "R",
-     "08959e44f6856f32141fafcec39c84280c40d27787ed0ac1d2001224c35204bc"
+     "6afc37be888c648a49ed94f751f442df7a08fa60aa7428fab7e260e4d0cba064"
     ]
    ],
    "settlement": {
@@ -54,7 +54,7 @@
     ],
     [
      "R",
-     "08959e44f6856f32141fafcec39c84280c40d27787ed0ac1d2001224c35204bc"
+     "6afc37be888c648a49ed94f751f442df7a08fa60aa7428fab7e260e4d0cba064"
     ]
    ],
    "settlement": {
@@ -84,7 +84,7 @@
   },
   {
    "index": 2,
-   "leaf": "08959e44f6856f32141fafcec39c84280c40d27787ed0ac1d2001224c35204bc",
+   "leaf": "6afc37be888c648a49ed94f751f442df7a08fa60aa7428fab7e260e4d0cba064",
    "path": [
     [
      "L",
@@ -96,7 +96,7 @@
     "amount_usd": 0.006,
     "fee_usd": 0.00033,
     "from_poster_usd": 0.0006,
-    "from_steward_usd": 0,
+    "from_steward_usd": 0.0,
     "hop": "ed25519:7NXLckho5kxw7Bht2Dcjv_v4-ShUgY1sAdYX3V0RVec",
     "hop_bytes": 31000000,
     "hop_index": 1,
@@ -112,18 +112,18 @@
     "proto": 1,
     "purchase": "de808d70b6e808c88fa73249e27f098e0bc210885f474cc33be4b49456d498a1",
     "receipt_sig": "I6ud8AYp_d7tUBS0tb590Iri82exWQQDAHiDzK-wKU8r6nVCVjAHEvneORtqZUJ19OEbsNUtCtsNqD8lYHmKDw",
-    "refund_usd": 0,
+    "refund_usd": 0.0,
     "rule": "the smaller of the two signed counts; neither party is bound beyond what it signed",
     "settled_bytes": 30000000,
     "status": "settled",
     "steward_fee": 0.05,
-    "steward_held_usd": 0,
+    "steward_held_usd": 0.0,
     "t": 1800014402,
     "t_first": 1800012600,
     "t_last": 1800014400
    }
   }
  ],
- "signature": "w1zaIWVppW7czXXyPZiWwiMWGXa3iQu5gpRCE9fEphImG1YWTSvYQiO0lZI_ihpKINTrH-zdRcDAV96fuJaSDA",
+ "signature": "Y-vddqjKMXc8YgneiaX1zYb04tIQCO3R4Ru8a-bA8KoHv8nkDH1WQLNruYEUxqHgFcg665H6VtsjYMFT7JMICA",
  "window": 1800010800
 }

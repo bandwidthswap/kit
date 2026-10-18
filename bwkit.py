@@ -565,10 +565,10 @@ def resolve(receipt_env, ack_env, price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB, now
         rec = purchase["rec"]
         due, refund = rules.premium_split(settled, rec["min_bytes"], rec["premium_per_gb"])
         own, steward, held = rules.draw(due, purchase["pool_own"], purchase["pool_steward"], purchase["allowance"])
-        own, steward, held = round(own, 6), round(steward, 6), round(held, 6)
+        own, steward, held = round(float(own), 6), round(float(steward), 6), round(float(held), 6)   # floats, never the integer 0
         premium = round(own + steward, 6)
         extra = {"purchase": rec["id"], "match": purchase["match"]["id"] if purchase.get("match") else None,
-                 "premium_usd": premium, "refund_usd": round(refund, 6),
+                 "premium_usd": premium, "refund_usd": round(float(refund), 6),
                  "from_poster_usd": own, "from_steward_usd": steward, "steward_held_usd": held}
     out = {
         "kind": "settlement", "proto": PROTO,
