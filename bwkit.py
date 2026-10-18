@@ -1303,7 +1303,7 @@ class Node:
         return {"receipt": env, "ack": ack, "sent": sent, "left": left}
 
     def purchase_post(self, to, min_bytes, premium_per_gb, windows, escrow, deadline, now=None, post=True, poster_priv=None,
-                      program="payer", route_from="self", not_via=(), matches=None):
+                      program="payer", route_from="self", not_via=(), matches=None, mint_url=None, keep=True):
         """Sign a purchase (spec, Section 15) and register it with the Mint. Returns (record, id).
 
         to is a peer name, a NYM or a place id; route_from "self" is this
@@ -1324,7 +1324,7 @@ class Node:
         rec = dict(body, id=purchase_id(body), sig=sign_purchase(priv, body))
         check_purchase(rec)
         if post:
-            mint = (self.config.get("mint") or "").rstrip("/")
+            mint = (mint_url or self.config.get("mint") or "").rstrip("/")
             if not mint:
                 raise SystemExit("config has no mint URL")
             try:
@@ -1333,7 +1333,8 @@ class Node:
                 raise SystemExit("mint unreachable: %s" % e)
             if not 200 <= status < 300:
                 raise SystemExit("the Mint refused the purchase: %s %s" % (status, json.dumps(ans)))
-            self.append("purchases.jsonl", rec)
+            if keep:
+                self.append("purchases.jsonl", rec)
             log("posted purchase %s to the Mint: %s -> %s, >= %d bytes a window, premium %s/GB, %d windows, escrow %s" % (
                 rec["id"][:16], rec["route"]["from"], rec["route"]["to"], rec["min_bytes"], rec["premium_per_gb"], rec["windows"], rec["escrow"]))
         return rec, rec["id"]
@@ -1505,7 +1506,7 @@ class Node:
         peers = self.peers()
         self.map = self.load_map()
         sp = self.steward_params()
-        ix = {"by_sig": {}, "receipt_by_window": {}, "acks_by_prev": {}, "settled": {},
+        ix = {"by_sig": {}, "receipt_by_window": {}, "acks_by_prev": {}, "settled": {}, "first_seen": {},
               "commitments": {}, "last_commitment": None, "lines": 0, "links": self.load_links(skip_partial),
               "book": PurchaseBook(place_lookup(self.map, peers), self.config.get("steward_fee", DEFAULT_STEWARD_FEE), sp["margin"]),
               "steward_nym": self.steward_nym()}
@@ -1523,9 +1524,11 @@ class Node:
         if k == "receipt":
             ix["by_sig"][entry["sig"]] = entry
             ix["receipt_by_window"][window_key(entry["receipt"])] = entry
+            ix["first_seen"].setdefault(entry["receipt"]["payer"], entry["received_at"])
         elif k == "ack":
             ix["by_sig"][entry["sig"]] = entry
             ix["acks_by_prev"][entry["receipt"]["prev_sig"]] = entry
+            ix["first_seen"].setdefault(entry["receipt"]["hop"], entry["received_at"])
         elif k == "settlement":
             ix["settled"][entry["receipt_sig"]] = entry
             ix["book"].note(entry)
@@ -2020,6 +2023,279 @@ class Node:
         return srv
 
 
+# ---------------------------------------------------------------- the Steward (paper, Section 7; PLAN.md 2.4)
+
+def usd(x):
+    """Five places: at the lab's scale the Steward's whole income is a fifth of a cent."""
+    return "%.5f" % x
+
+
+class Steward:
+    """The Network Steward of a one-Mint domain: a rule run on the Mint's host after each hour's commitment.
+
+    Its income is every settlement's fee_usd. Its only act is to post
+    purchases (spec, Section 15) through the Mint's own /purchase, signed
+    with its own key (steward.priv beside the Mint's): a match on a payer's
+    purchase (program 1), a bounty for a second path around a link that
+    carried fees between two places (program 2), and a standing offer for the
+    first link to every mapped place that has none (program 3), topped up
+    toward its size on every run. Every balance here is read from the ledger
+    and the purchases; steward.jsonl is the log of its runs.
+    """
+
+    def __init__(self, node):
+        if node.role != "mint":
+            raise SystemExit("the Steward runs on the Mint's host, under the Mint's config")
+        self.node = node
+        self.params = node.steward_params()
+        self.priv = None
+        kp = node.path("steward.priv")
+        if os.path.exists(kp):
+            with open(kp, "rb") as f:
+                self.priv = Ed25519PrivateKey.from_private_bytes(f.read())
+
+    def keygen(self):
+        kp = self.node.path("steward.priv")
+        if os.path.exists(kp):
+            raise SystemExit("%s exists; not overwriting the Steward's identity" % kp)
+        priv = Ed25519PrivateKey.generate()
+        raw = priv.private_bytes(serialization.Encoding.Raw, serialization.PrivateFormat.Raw, serialization.NoEncryption())
+        fd = os.open(kp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+        self.priv = priv
+        return self.nym
+
+    @property
+    def nym(self):
+        if self.priv is None:
+            raise SystemExit("the Steward has no key yet: run `bwkit steward keygen`")
+        return nym_of_pub(self.priv.public_key())
+
+    def mint_url(self):
+        return (self.node.config.get("steward_mint") or "http://127.0.0.1:%d" % int(self.node.config.get("port", DEFAULT_PORT))).rstrip("/")
+
+    # ---- what the ledger says
+
+    def tally(self, now=None):
+        """Every balance, from the Mint's ledger, purchases and map (reloaded). Nothing here is stored."""
+        now = int(now if now is not None else time.time())
+        node = self.node
+        node.load_index(skip_partial=True)
+        ix, book, peers = node.index, node.index["book"], node.peers()
+        nym = self.nym if self.priv else ix["steward_nym"]
+        f, m = node.config.get("steward_fee", DEFAULT_STEWARD_FEE), self.params["m"]
+        settled = sorted(ix["settled"].values(), key=lambda st: (st["t"], settlement_order(st)))
+        income = round(sum(st.get("fee_usd", 0.0) for st in settled), 6)
+        place_of = book.place_of
+        recs = [book.purchases[pid] for pid in book.order]
+        rows = []
+        for rec in recs:
+            u = book.use.get(rec["id"], {})
+            used = u.get("windows", 0)
+            target = book.purchases.get(rec["matches"]) if rec["program"] == "match" else None
+            if target is not None:
+                used = book.use.get(target["id"], {}).get("windows", 0)
+            pool = book.pool(rec)
+            if now > rec["deadline"]:
+                status = "expired"
+            elif used >= rec["windows"]:
+                status = "complete"
+            elif pool <= 0:
+                status = "spent"
+            else:
+                status = "open"
+            rows.append({"rec": rec, "status": status, "used": used, "pool": pool, "paid": round(rec["escrow"] - pool, 6),
+                         "mine": rec["poster"] == nym, "refund": u.get("refund", 0.0),
+                         "match": book.match_for(rec["id"]) if rec["program"] == "payer" else None})
+        mine = [r for r in rows if r["mine"]]
+        posted = round(sum(r["rec"]["escrow"] for r in mine), 6)
+        paid = round(sum(r["paid"] for r in mine), 6)
+        returned = round(sum(r["pool"] for r in mine if r["status"] != "open"), 6)
+        in_offers = round(sum(r["pool"] for r in mine if r["status"] == "open"), 6)
+        held = round(sum(st.get("steward_held_usd", 0.0) for st in settled), 6)
+        matched = round(sum(r["rec"]["escrow"] for r in mine if r["rec"]["program"] == "match"), 6)
+        escrow = round(income - posted + returned, 6)
+        reserve = round(max(0.0, m * income - matched), 6)
+        # the links of the program window: (payer's place, hop's place) with the fees they carried
+        since = now - self.params["program_window_s"]
+        links = {}
+        for st in settled:
+            if st["t_last"] < since:
+                continue
+            key = (place_of(st["payer"]), place_of(st["hop"]), peers.get(st["payer"], "?"), peers.get(st["hop"], "?"))
+            L = links.setdefault(key, {"windows": 0, "bytes": 0, "fees": 0.0, "take": 0.0})
+            L["windows"] += 1
+            L["bytes"] += st["settled_bytes"]
+            L["fees"] = round(L["fees"] + st["amount_usd"], 6)
+            L["take"] = round(L["take"] + st.get("fee_usd", 0.0), 6)
+        # a place is linked once a settled receipt has either end there: a link has two ends, and the paper's standing offer is
+        # for a place no receipt has crossed a link to
+        linked = ({place_of(st["hop"]) for st in settled} | {place_of(st["payer"]) for st in settled}) - {None}
+        return {"now": now, "nym": nym, "f": f, "m": m, "income": income, "escrow": escrow, "reserve": reserve, "posted": posted,
+                "paid": paid, "returned": returned, "in_offers": in_offers, "held": held, "matched": matched, "rows": rows,
+                "links": links, "linked": linked, "settled": settled, "peers": peers, "place_of": place_of, "book": book, "ix": ix}
+
+    # ---- the programs
+
+    def post(self, t, program, to, route_from, not_via, min_bytes, premium, windows, escrow, deadline, matches=None):
+        rec, pid = self.node.purchase_post(to, min_bytes, premium, windows, escrow, deadline, now=t["now"], post=True,
+                                           poster_priv=self.priv, program=program, route_from=route_from, not_via=not_via,
+                                           matches=matches, mint_url=self.mint_url(), keep=False)
+        t["escrow"] = round(t["escrow"] - escrow, 6)
+        t["posted"] = round(t["posted"] + escrow, 6)
+        return rec
+
+    def run(self, now=None):
+        """One run of the three programs over the ledger as it stands. Returns the run record, also appended to steward.jsonl."""
+        if rules is None:
+            raise SystemExit("steward_rules.py is not installed beside bwkit")
+        t = self.tally(now)
+        now, p, f, m = t["now"], self.params, t["f"], t["m"]
+        posted, skipped = [], []
+        budget = lambda: rules.bounty_budget(t["escrow"], m, t["income"], t["matched"])   # noqa: E731
+        # 1. matching: a payer's open purchase that has no match yet, from a payer the Mint has known long enough
+        for r in t["rows"]:
+            rec = r["rec"]
+            if rec["program"] != "payer" or r["status"] != "open" or r["match"] is not None:
+                continue
+            age = now - t["ix"]["first_seen"].get(rec["poster"], now)
+            if age < p["min_payer_age_s"]:
+                skipped.append("match %s: %s has been on the ledger %d s, the program needs %d" % (rec["id"][:8], t["peers"].get(rec["poster"], "?"), age, p["min_payer_age_s"]))
+                continue
+            amt = round(rules.match_size(m, rec["escrow"], t["income"], t["matched"], t["escrow"]), 6)
+            if amt <= 0:
+                skipped.append("match %s: nothing to match with (m of income %s, matched %s, escrow %s)" % (rec["id"][:8], usd(m * t["income"]), usd(t["matched"]), usd(t["escrow"])))
+                continue
+            mrec = self.post(t, "match", rec["route"]["to"], rec["route"]["from"], rec["route"]["not_via"], rec["min_bytes"],
+                             rec["premium_per_gb"], rec["windows"], amt, rec["deadline"], matches=rec["id"])
+            t["matched"] = round(t["matched"] + amt, 6)
+            posted.append(mrec)
+            log("steward: matched %s with %s (m = %s of the poster's %s, within m of income %s)" % (rec["id"][:16], usd(amt), m, usd(rec["escrow"]), usd(t["income"])))
+        # 2. the second bridge: every link between two places that carried fees this window and has no open bounty
+        for (a, b, pn, hn), L in sorted(t["links"].items(), key=lambda kv: (-kv[1]["fees"], str(kv[0]))):
+            if a is None or b is None:
+                skipped.append("second bridge %s -> %s: a node is not on the map" % (pn, hn))
+                continue
+            if a == b:
+                skipped.append("second bridge %s -> %s: both ends are at %s; no second place to go through" % (pn, hn, a))
+                continue
+            if any(r["status"] == "open" and r["rec"]["program"] == "second_bridge" and r["rec"]["route"]["from"] == a and r["rec"]["route"]["to"] == b
+                   for r in t["rows"]):
+                continue
+            value = round(rules.second_bridge_size(f, L["fees"], budget()), 6)
+            if value <= 0:
+                skipped.append("second bridge %s -> %s: the escrow is spent (the link carried %s, the Steward's take %s)" % (a, b, usd(L["fees"]), usd(L["take"])))
+                continue
+            windows = max(1, p["program_window_s"] // 3600)
+            premium = round(rules.second_bridge_premium(value, L["bytes"]), 6)
+            rec = self.post(t, "second_bridge", b, a, [a, b], L["bytes"] // windows, premium, windows, value, now + p["bounty_deadline_s"])
+            posted.append(rec)
+            log("steward: posted %s for a second path from %s to %s (the sole link carried %s this window, the Steward's take %s), premium %s/GB" % (
+                usd(value), a, b, usd(L["fees"]), usd(L["take"]), premium))
+        # 3. the first link: every mapped place with no settled receipt across a link to it
+        for pid, place in sorted(self.node.map.get("places", {}).items()):
+            if not place.get("mapped", True) or pid in t["linked"]:
+                continue
+            standing = [r for r in t["rows"] if r["status"] == "open" and r["rec"]["program"] == "first_link" and r["rec"]["route"]["to"] == pid]
+            open_so_far = round(sum(r["rec"]["escrow"] for r in standing), 6)
+            value = round(rules.first_link_size(p["first_link_usd"], budget(), open_so_far), 6)
+            if value <= 0:
+                skipped.append("first link to %s: %s" % (pid, "the offer stands at its size" if open_so_far >= p["first_link_usd"] else "the escrow is spent"))
+                continue
+            windows = max(1, p["bounty_deadline_s"] // 3600)
+            rec = self.post(t, "first_link", pid, None, [], 0, p["first_link_premium"], windows, value, now + p["bounty_deadline_s"])
+            posted.append(rec)
+            log("steward: %s the first-link offer for %s by %s (now %s toward %s)" % (
+                "topped up" if standing else "posted", pid, usd(value), usd(open_so_far + value), usd(p["first_link_usd"])))
+        run = {"kind": "steward-run", "proto": PROTO, "t": now, "steward": t["nym"], "income_usd": t["income"], "escrow_usd": t["escrow"],
+               "posted_usd": t["posted"], "paid_usd": t["paid"], "refunded_usd": t["returned"], "held_by_cap_usd": t["held"],
+               "posted": [r["id"] for r in posted], "skipped": skipped}
+        self.node.append("steward.jsonl", run)
+        return run
+
+    def last_run(self):
+        runs = self.node.read_lines("steward.jsonl", skip_partial=True)
+        return runs[-1] if runs else None
+
+    # ---- the book, in text and as the feed's object (the same function)
+
+    def feed(self, now=None):
+        """The Steward's book as the status feed carries it (PLAN.md 2.5): names and places only, never a NYM but the Steward's own."""
+        t = self.tally(now)
+        peers, place_of = t["peers"], t["place_of"]
+        places = self.node.map.get("places", {})
+
+        def name(x):
+            if x is None:
+                return None
+            if isinstance(x, str) and x.startswith("ed25519:"):
+                return "steward" if x == t["nym"] else peers.get(x, "unknown")
+            return x
+
+        purchases = []
+        for r in t["rows"]:
+            rec = r["rec"]
+            purchases.append({"id": rec["id"][:16], "program": rec["program"], "poster": name(rec["poster"]),
+                              "route": {"from": name(rec["route"]["from"]), "to": name(rec["route"]["to"]), "not_via": list(rec["route"]["not_via"])},
+                              "premium_per_gb": rec["premium_per_gb"], "min_bytes": rec["min_bytes"],
+                              "windows": rec["windows"], "windows_left": max(0, rec["windows"] - r["used"]), "deadline": rec["deadline"],
+                              "posted_at": rec["posted_at"], "escrow_usd": rec["escrow"], "paid_usd": r["paid"], "refund_usd": r["refund"],
+                              "match_usd": r["match"]["escrow"] if r["match"] else None, "status": r["status"]})
+        payouts = []
+        for st in sorted((st for st in t["settled"] if st.get("purchase")), key=lambda st: (-st["t"], -st["t_last"]))[:24]:
+            payouts.append({"t": st["t"], "window": {"t_first": st["t_first"], "t_last": st["t_last"]}, "payer": name(st["payer"]),
+                            "hop": name(st["hop"]), "purchase": st["purchase"][:16], "settled_bytes": st["settled_bytes"],
+                            "premium_usd": st["premium_usd"], "from_steward_usd": st["from_steward_usd"], "from_poster_usd": st["from_poster_usd"],
+                            "refund_usd": st["refund_usd"]})
+        last = self.last_run()
+        return {"nym": t["nym"], "f": t["f"], "m": t["m"], "margin": self.params["margin"],
+                "program_window_s": self.params["program_window_s"], "first_link_usd": self.params["first_link_usd"],
+                "income_usd": t["income"], "escrow_usd": t["escrow"], "reserve_usd": t["reserve"], "posted_usd": t["posted"],
+                "in_offers_usd": t["in_offers"], "paid_usd": t["paid"], "refunded_usd": t["returned"], "held_by_cap_usd": t["held"],
+                "last_run": last["t"] if last else None,
+                "purchases": purchases, "payouts": payouts,
+                "links": [{"from": a, "to": b, "payer": pn, "hop": hn, "windows": L["windows"], "bytes": L["bytes"], "fees_usd": L["fees"], "take_usd": L["take"]}
+                          for (a, b, pn, hn), L in sorted(t["links"].items(), key=lambda kv: str(kv[0]))],
+                "map": {"domains": self.node.map.get("domains", {}),
+                        "places": [{"id": pid, "name": pl.get("name", pid), "medium": pl.get("medium"), "range_class": pl.get("range_class"),
+                                    "linked": pid in t["linked"]} for pid, pl in sorted(places.items())]}}
+
+    def book(self, now=None):
+        """The book in text: the page in the operator's terminal, built from the same feed."""
+        fd = self.feed(now)
+        dom = next(iter(fd["map"]["domains"].items()), (None, {}))
+        out = ["Steward %s  domain %s (%s)  f %s  m %s  cap f - %s per payer" % (
+            fd["nym"][:12] + "..." + fd["nym"][-4:] if fd["nym"] else "(no key)", dom[0] or "?", dom[1].get("unit", "USD"), pct(fd["f"]), pct(fd["m"]), pct(fd["margin"]))]
+        out.append("income     %s  escrow %s  reserve %s" % (usd(fd["income_usd"]), usd(fd["escrow_usd"]), usd(fd["reserve_usd"])))
+        out.append("posted     %s  paid   %s  returned %s  held %s  in open offers %s" % (
+            usd(fd["posted_usd"]), usd(fd["paid_usd"]), usd(fd["refunded_usd"]), usd(fd["held_by_cap_usd"]), usd(fd["in_offers_usd"])))
+        opened = [pu for pu in fd["purchases"] if pu["status"] == "open"]
+        out.append("open" if opened else "open: nothing")
+        short = {"payer": "payer", "match": "match", "second_bridge": "bridge", "first_link": "first"}
+        for pu in opened:
+            route = "%s -> %s%s" % (pu["route"]["from"] or "*", pu["route"]["to"], (" !via " + ",".join(pu["route"]["not_via"])) if pu["route"]["not_via"] else "")
+            out.append("  %s  %-6s %-34s %s  %s/GB  %s  %s%s" % (
+                pu["id"][:8], short[pu["program"]], route, (">=" + fmt_bytes(pu["min_bytes"])) if pu["min_bytes"] else "standing",
+                pu["premium_per_gb"], ("%d left" % pu["windows_left"]) if pu["program"] != "first_link" else "until %s" % time.strftime("%b %d", time.localtime(pu["deadline"])),
+                usd(pu["escrow_usd"]), (" + %s match" % usd(pu["match_usd"])) if pu["match_usd"] else ""))
+        for L in fd["links"]:
+            out.append("link  %s -> %s (%s -> %s): %d windows, %s, paid %s, the Steward's %s this program window" % (
+                L["from"], L["to"], L["payer"], L["hop"], L["windows"], fmt_bytes(L["bytes"]), usd(L["fees_usd"]), usd(L["take_usd"])))
+        for pl in fd["map"]["places"]:
+            out.append("place %-12s %s/%s  %s" % (pl["id"], pl["medium"], pl["range_class"], "linked" if pl["linked"] else "no link yet"))
+        last = self.last_run()
+        if last:
+            out.append("last run  %s  posted %d, skipped %d%s" % (time.strftime("%Y-%m-%d %H:%M", time.localtime(last["t"])), len(last["posted"]), len(last["skipped"]),
+                                                               (": " + "; ".join(last["skipped"][:3])) if last["skipped"] else ""))
+        return "\n".join(out)
+
+
+def pct(x):
+    v = x * 100
+    return ("%.4f" % v).rstrip("0").rstrip(".") + "%"
+
+
 # ---------------------------------------------------------------- cli
 
 def fmt_bytes(n):
@@ -2053,6 +2329,16 @@ def main(argv=None):
     sv.add_argument("--port", type=int, default=None)
     sub.add_parser("status", help="what this node knows")
     sub.add_parser("links", help="mint: the link announcements it holds")
+    sw = sub.add_parser("steward", help="the Network Steward, run on the Mint's host (paper, Section 7)")
+    sws = sw.add_subparsers(dest="swcmd", required=True)
+    sws.add_parser("keygen", help="make the Steward's own key (once) and print its NYM")
+    sws.add_parser("nym", help="print the Steward's NYM")
+    sws.add_parser("status", help="the balances in one line")
+    sws.add_parser("book", help="the Steward's book: balances, open offers, links, the map")
+    swr = sws.add_parser("run", help="run the three programs over the ledger and post what they size (the hourly timer)")
+    swr.add_argument("--now", type=int, help="the clock to run with (tests)")
+    sws.add_parser("feed", help="print the `steward` object the status report carries")
+    sws.add_parser("map", help="the map: domains, places and which node is where")
     pu = sub.add_parser("purchase", help="purchases (spec, Section 15): a payer posts one, the Mint lists them")
     pus = pu.add_subparsers(dest="pucmd", required=True)
     pp = pus.add_parser("post", help="payer: sign a purchase on a route and register it with the Mint")
@@ -2302,6 +2588,40 @@ def main(argv=None):
                     (", %d used" % u["windows"]) if u.get("windows") else "", rec["escrow"],
                     (", %s paid" % round(u.get("own", 0.0) + u.get("steward", 0.0), 6)) if u else "",
                     time.strftime("%Y-%m-%d %H:%M", time.localtime(rec["deadline"]))))
+    elif args.cmd == "steward":
+        st = Steward(node)
+        if args.swcmd == "keygen":
+            print(st.keygen())
+        elif args.swcmd == "nym":
+            print(st.nym)
+        elif args.swcmd == "run":
+            run = st.run(args.now)
+            print("steward run at %d: income %s, escrow %s, posted %d (%s), skipped %d" % (
+                run["t"], usd(run["income_usd"]), usd(run["escrow_usd"]), len(run["posted"]), ", ".join(x[:8] for x in run["posted"]), len(run["skipped"])))
+            for line in run["skipped"]:
+                print("  skipped: " + line)
+        elif args.swcmd == "book":
+            print(st.book())
+        elif args.swcmd == "feed":
+            print(json.dumps(st.feed(), indent=1, sort_keys=True))
+        elif args.swcmd == "status":
+            fd = st.feed()
+            print("steward %s: income %s, escrow %s, in open offers %s, paid %s, returned %s, held by the cap %s; %d purchases, last run %s" % (
+                fd["nym"][:20] if fd["nym"] else "(no key)", usd(fd["income_usd"]), usd(fd["escrow_usd"]), usd(fd["in_offers_usd"]), usd(fd["paid_usd"]),
+                usd(fd["refunded_usd"]), usd(fd["held_by_cap_usd"]), len(fd["purchases"]),
+                time.strftime("%Y-%m-%d %H:%M", time.localtime(fd["last_run"])) if fd["last_run"] else "never"))
+        elif args.swcmd == "map":
+            m = node.load_map()
+            peers = node.peers()
+            for did, d in sorted(m.get("domains", {}).items()):
+                print("domain %s: %s, unit %s, Mint %s" % (did, d.get("name", did), d.get("unit", "USD"), d.get("mint", "?")))
+            for pid, pl in sorted(m.get("places", {}).items()):
+                here = sorted(n for n, where in m.get("nodes", {}).items() if where == pid)
+                print("place  %-12s %s  %s/%s%s  nodes: %s" % (pid, pl.get("name", pid), pl.get("medium"), pl.get("range_class"),
+                                                           "" if pl.get("mapped", True) else " (not mapped)", ", ".join(here) or "none"))
+            for n in sorted(peers.values()) + ([node.name] if node.name not in peers.values() else []):
+                if n not in m.get("nodes", {}):
+                    print("node   %s is on the peer list but at no place on the map" % n)
     elif args.cmd == "links":
         if node.role != "mint":
             raise SystemExit("only the Mint holds announcements")

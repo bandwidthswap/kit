@@ -1452,6 +1452,150 @@ class Purchases(unittest.TestCase):
             lab.payer.purchase_post("bw-forest", 1, 0.02, 1, 0.1, lab.t + self.WEEK, now=lab.t, program="match", matches=pid)
 
 
+class StewardRole(unittest.TestCase):
+    """The Steward on the Mint's host: its key, the three programs over a real ledger, the book and the feed."""
+
+    WEEK = 7 * 86400
+
+    def setUp(self):
+        self.lab = Lab()
+        self.map_path = os.path.join(self.lab.root, "map.json")
+        with open(self.map_path, "w") as f:
+            json.dump({"domains": {"earth": {"name": "Earth", "unit": "USD", "mint": "bw-mint"}},
+                       "places": {"house": {"name": "the house", "domain": "earth", "medium": "wire", "range_class": "building", "mapped": True},
+                                  "next-door": {"name": "next door", "domain": "earth", "medium": "wifi", "range_class": "building", "mapped": True},
+                                  "the-cabin": {"name": "the cabin", "domain": "earth", "medium": "lora", "range_class": "hill", "mapped": True}},
+                       "nodes": {"bw-house": "house", "bw-mint": "house", "bw-forest": "next-door"}}, f)
+        self.lab.mint.config["map"] = self.map_path
+        self.lab.mint.config["steward"] = {"m": 0.04, "margin": 0.01, "program_window_s": self.WEEK, "first_link_usd": 1.0,
+                                           "first_link_premium": 0.05, "min_payer_age_s": 3600, "bounty_deadline_s": self.WEEK}
+        self.lab.mint.config["steward_mint"] = self.lab.mint_url
+        self.st = bwkit.Steward(self.lab.mint)
+        self.st.keygen()
+        self.lab.mint.load_index()                                 # the running Mint learns the Steward's NYM
+
+    def tearDown(self):
+        self.lab.close()
+
+    def recs(self, program=None):
+        self.lab.mint.load_index()
+        book = self.lab.mint.index["book"]
+        return [book.purchases[pid] for pid in book.order if program is None or book.purchases[pid]["program"] == program]
+
+    def test_the_programs_over_a_ledger(self):
+        lab, st = self.lab, self.st
+        self.assertEqual(json.loads(bwkit.http_get(lab.mint_url + "/status")[1])["steward"], st.nym)
+        with self.assertRaises(SystemExit):
+            st.keygen()                                            # never overwritten
+        for i in range(3):
+            lab.hour((i + 1) * 100_000_000, (i + 1) * 100_000_000)   # three windows of 100 MB, house -> next door: $0.03 carried, $0.0015 the Steward's
+        now = lab.t + 300
+        run = st.run(now)
+        self.assertEqual((run["kind"], run["proto"], run["t"], run["steward"], run["income_usd"]), ("steward-run", 1, now, st.nym, 0.0015))
+        # program 2 first: f of what the sole link carried, within the budget (income less the match reserve); the cabin gets nothing this run
+        bridge = self.recs("second_bridge")
+        self.assertEqual(len(bridge), 1)
+        b = bridge[0]
+        self.assertEqual((b["poster"], b["route"], b["windows"], b["deadline"], b["matches"]),
+                         (st.nym, {"from": "house", "to": "next-door", "not_via": ["house", "next-door"]}, 168, now + self.WEEK, None))
+        self.assertAlmostEqual(b["escrow"], 0.00144, places=6)                 # min(f x 0.03, 0.0015 - m x 0.0015)
+        self.assertAlmostEqual(b["premium_per_gb"], 0.0048, places=6)          # 0.00144 over 0.3 GB
+        self.assertEqual(b["min_bytes"], 300_000_000 // 168)
+        self.assertEqual(self.recs("first_link"), [])
+        self.assertEqual(run["posted"], [b["id"]])
+        self.assertTrue(any(x.startswith("first link to the-cabin: the escrow is spent") for x in run["skipped"]), run["skipped"])
+        self.assertEqual(len(lab.mint.read_lines("steward.jsonl")), 1)
+        fd = st.feed(now)
+        self.assertEqual((fd["nym"], fd["f"], fd["m"], fd["margin"]), (st.nym, 0.05, 0.04, 0.01))
+        for k, v in (("income_usd", 0.0015), ("posted_usd", 0.00144), ("escrow_usd", 0.00006), ("in_offers_usd", 0.00144), ("reserve_usd", 0.00006),
+                     ("paid_usd", 0.0), ("refunded_usd", 0.0), ("held_by_cap_usd", 0.0)):
+            self.assertAlmostEqual(fd[k], v, places=6, msg=k)
+        self.assertEqual(fd["last_run"], now)
+        pu = fd["purchases"][0]
+        self.assertEqual((pu["program"], pu["poster"], pu["route"], pu["status"], pu["windows_left"], pu["match_usd"]),
+                         ("second_bridge", "steward", {"from": "house", "to": "next-door", "not_via": ["house", "next-door"]}, "open", 168, None))
+        self.assertEqual(fd["links"], [{"from": "house", "to": "next-door", "payer": "bw-house", "hop": "bw-forest", "windows": 3,
+                                        "bytes": 300_000_000, "fees_usd": 0.03, "take_usd": 0.0015}])
+        self.assertEqual([(p["id"], p["linked"]) for p in fd["map"]["places"]], [("house", True), ("next-door", True), ("the-cabin", False)])
+        text = json.dumps(fd)
+        self.assertEqual(text.count("ed25519:"), 1)                           # the Steward's own NYM and no other
+        bwkit.assert_public(text)
+        book = st.book(now)
+        self.assertIn("income     0.00150  escrow 0.00006  reserve 0.00006", book)
+        self.assertIn("bridge house -> next-door !via house,next-door", book.replace("  ", " ").replace("  ", " "))
+        self.assertIn("place the-cabin", book.replace("  ", " "))
+        self.assertIn("no link yet", book)
+        # the next hour: the bridge stands, the cabin gets what is left after the reserve
+        lab.hour(400_000_000, 400_000_000)
+        run2 = st.run(lab.t + 300)
+        self.assertEqual(len(self.recs("second_bridge")), 1)
+        fl = self.recs("first_link")
+        self.assertEqual(len(fl), 1)
+        self.assertEqual((fl[0]["route"], fl[0]["min_bytes"], fl[0]["premium_per_gb"], fl[0]["windows"]), ({"from": None, "to": "the-cabin", "not_via": []}, 0, 0.05, 168))
+        self.assertAlmostEqual(fl[0]["escrow"], 0.00048, places=6)            # 0.0020 - 0.00144 - m x 0.0020
+        self.assertEqual(run2["posted"], [fl[0]["id"]])
+        # the match: the house's purchase, from a payer the Mint has known long enough, at m of the Steward's whole income
+        rec, pid = lab.payer.purchase_post("bw-forest", 50_000_000, 0.02, 168, 1.0, lab.t + self.WEEK, now=lab.t)
+        st.params["min_payer_age_s"] = 10 ** 9
+        run3 = st.run(lab.t + 300)
+        self.assertEqual(run3["posted"], [])
+        self.assertTrue(any("the program needs" in x for x in run3["skipped"]), run3["skipped"])
+        st.params["min_payer_age_s"] = 3600
+        run4 = st.run(lab.t + 301)
+        match = self.recs("match")
+        self.assertEqual(len(match), 1)
+        self.assertEqual((match[0]["matches"], match[0]["route"], match[0]["windows"], match[0]["deadline"]), (pid, rec["route"], 168, rec["deadline"]))
+        self.assertAlmostEqual(match[0]["escrow"], 0.00008, places=6)         # m of income 0.002, all the Steward had left
+        self.assertEqual(run4["posted"], [match[0]["id"]])
+        fd = st.feed(lab.t + 302)
+        house = [p for p in fd["purchases"] if p["program"] == "payer"][0]
+        self.assertEqual((house["poster"], house["route"], house["status"]), ("bw-house", {"from": "bw-house", "to": "bw-forest", "not_via": []}, "open"))
+        self.assertAlmostEqual(house["match_usd"], 0.00008, places=6)
+        self.assertAlmostEqual(fd["escrow_usd"], 0.0, places=6)
+        # a window settles against it: the poster's pool covers the premium, the Steward's match is untouched
+        lab.hour(500_000_000, 500_000_000)
+        s = [e for e in lab.mint.ledger_lines() if e["kind"] == "settlement"][-1]
+        self.assertEqual((s["purchase"], s["match"], s["premium_usd"], s["from_poster_usd"], s["from_steward_usd"]), (pid, match[0]["id"], 0.002, 0.002, 0.0))
+        fd = st.feed(lab.t + 5)
+        self.assertEqual(fd["payouts"][0]["payer"], "bw-house")
+        self.assertEqual((fd["payouts"][0]["hop"], fd["payouts"][0]["premium_usd"], fd["payouts"][0]["window"]), ("bw-forest", 0.002, {"t_first": lab.t - 3600, "t_last": lab.t}))
+        self.assertEqual(fd["paid_usd"], 0.0)
+        bwkit.assert_public(json.dumps(fd))
+        # the command line
+        env = mint_env(lab)
+        rc, text = cli(["steward", "book"], env)
+        self.assertEqual(rc, 0)
+        self.assertIn("payer bw-house -> bw-forest", text.replace("  ", " ").replace("  ", " "))
+        rc, text = cli(["steward", "status"], env)
+        self.assertIn("4 purchases", text)
+        rc, text = cli(["steward", "map"], env)
+        self.assertIn("the-cabin", text)
+        rc, text = cli(["steward", "feed"], env)
+        self.assertEqual(json.loads(text)["income_usd"], fd["income_usd"])
+        rc, text = cli(["steward", "nym"], env)
+        self.assertEqual(text.strip(), st.nym)
+        # past every deadline: the postings expire, their escrow returns, and the cabin's offer is posted again from it
+        far = lab.t + 8 * 86400
+        fd = st.feed(far)
+        self.assertEqual({p["status"] for p in fd["purchases"]}, {"expired"})
+        self.assertAlmostEqual(fd["refunded_usd"], 0.00144 + 0.00048 + 0.00008, places=6)
+        run5 = st.run(far)
+        fl = self.recs("first_link")
+        self.assertEqual(len(fl), 2)
+        income = fd["income_usd"]
+        self.assertAlmostEqual(fl[1]["escrow"], round(income - 0.04 * income + 0.00008, 6), places=6)   # all the Steward has, less the match reserve
+        self.assertEqual(len(self.recs("second_bridge")), 1)      # no link carried fees in the last program window
+        self.assertEqual(run5["posted"], [fl[1]["id"]])
+
+    def test_the_steward_needs_the_mints_config_and_a_key(self):
+        with self.assertRaises(SystemExit):
+            bwkit.Steward(self.lab.hop)
+        other = bwkit.Node(os.path.join(self.lab.root, "mint2"), {"role": "mint", "name": "m2"})
+        st = bwkit.Steward(other)
+        with self.assertRaises(SystemExit):
+            st.nym   # noqa: B018
+
+
 class Rules(unittest.TestCase):
     """steward_rules.py with the floats the Mint's Steward feeds it; the simulator holds the same functions to exact figures."""
 

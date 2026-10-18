@@ -1,0 +1,9 @@
+{
+ "domains": {"earth": {"name": "Earth", "unit": "USD", "mint": "bw-mint"}},
+ "places": {
+  "house": {"name": "the house", "domain": "earth", "medium": "wire", "range_class": "building", "mapped": true},
+  "next-door": {"name": "next door", "domain": "earth", "medium": "wifi", "range_class": "building", "mapped": true},
+  "the-cabin": {"name": "the cabin", "domain": "earth", "medium": "lora", "range_class": "hill", "mapped": true}
+ },
+ "nodes": {"bw-house": "house", "bw-mint": "house", "bw-forest": "house", "bw-neighbor": "next-door"}
+}

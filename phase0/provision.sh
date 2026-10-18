@@ -11,6 +11,9 @@
 #   phase0/provision.sh status     bw-mint: the status reporter (bwkit report, every two minutes) with its
 #                                  token from $BWKIT_STATUS_TOKEN, written to the root-only /etc/bwkit/status.env;
 #                                  with no token given, the file already there is kept and only the code is updated
+#   phase0/provision.sh steward    bw-mint: the Network Steward (PLAN.md 2.4): the map (phase0/map.json to /etc/bwkit/map.json),
+#                                  the Steward's key, the Mint restarted so it accepts the Steward's postings, and the hourly
+#                                  bwkit-steward.timer (five past the hour, after the commitment); run once at the end
 #   phase0/provision.sh check      the four verifications, nothing changed
 #   phase0/provision.sh all        upgrade, time, tunnel, logs and kit, in order
 #
@@ -170,7 +173,7 @@ EOS
 step_kit() {
   say "bwkit on the three nodes"
   for h in $HOSTS; do
-    COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py install.sh systemd | ssh_to "$h" 'mkdir -p ~/kit && tar -C ~/kit -xf -'
+    COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py steward_rules.py install.sh systemd phase0/map.json | ssh_to "$h" 'mkdir -p ~/kit && tar -C ~/kit -xf -'
   done
   run bw-house 'cd ~/kit && sudo ./install.sh payer'
   run bw-forest 'cd ~/kit && sudo ./install.sh hop'
@@ -197,7 +200,7 @@ step_update() {
   hosts="${UPDATE_HOSTS:-bw-mint bw-house bw-forest}"
   say "bwkit.py and the units to $hosts, services restarted"
   for h in $hosts; do
-    COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py install.sh systemd | ssh_to "$h" 'mkdir -p ~/kit && tar -C ~/kit -xf - && sudo install -m 0755 ~/kit/bwkit.py /usr/local/bin/bwkit && sudo install -m 0644 ~/kit/systemd/*.service ~/kit/systemd/*.timer /etc/systemd/system/ && sudo systemctl daemon-reload && echo "$(hostname): updated to bwkit $(grep -m1 "^VERSION" /usr/local/bin/bwkit | cut -d\" -f2)"'
+    COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py steward_rules.py install.sh systemd phase0/map.json | ssh_to "$h" 'mkdir -p ~/kit && tar -C ~/kit -xf - && sudo install -m 0755 ~/kit/bwkit.py /usr/local/bin/bwkit && sudo install -m 0644 ~/kit/steward_rules.py /usr/local/bin/steward_rules.py && sudo install -m 0644 ~/kit/systemd/*.service ~/kit/systemd/*.timer /etc/systemd/system/ && sudo systemctl daemon-reload && echo "$(hostname): updated to bwkit $(grep -m1 "^VERSION" /usr/local/bin/bwkit | cut -d\" -f2)"'
     case "$h" in bw-mint|bw-forest) run "$h" 'sudo systemctl restart bwkit && sleep 1 && echo "$(hostname): bwkit $(systemctl is-active bwkit)"' ;; esac
   done
   check_kit
@@ -221,7 +224,7 @@ step_status() {
     fi
   fi
   url="${BWKIT_STATUS_URL:-https://status.bandwidthswap.com/status}"
-  COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py install.sh systemd | ssh_to bw-mint 'mkdir -p ~/kit && tar -C ~/kit -xf - && sudo install -m 0755 ~/kit/bwkit.py /usr/local/bin/bwkit && sudo install -m 0644 ~/kit/systemd/*.service ~/kit/systemd/*.timer /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl restart bwkit && sleep 1 && echo "bw-mint: bwkit $(grep -m1 "^VERSION" /usr/local/bin/bwkit | cut -d\" -f2), server $(systemctl is-active bwkit)"'
+  COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py steward_rules.py install.sh systemd phase0/map.json | ssh_to bw-mint 'mkdir -p ~/kit && tar -C ~/kit -xf - && sudo install -m 0755 ~/kit/bwkit.py /usr/local/bin/bwkit && sudo install -m 0644 ~/kit/steward_rules.py /usr/local/bin/steward_rules.py && sudo install -m 0644 ~/kit/systemd/*.service ~/kit/systemd/*.timer /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl restart bwkit && sleep 1 && echo "bw-mint: bwkit $(grep -m1 "^VERSION" /usr/local/bin/bwkit | cut -d\" -f2), server $(systemctl is-active bwkit)"'
   if [ -n "${BWKIT_STATUS_TOKEN:-}" ]; then
     sudo_sh bw-mint <<EOS
 set -e
@@ -234,6 +237,15 @@ EOS
   fi
   run bw-mint 'sudo systemctl enable -q --now bwkit-status.timer && sudo systemctl start bwkit-status.service && echo "bw-mint: bwkit-status.timer enabled, a report sent"'
   check_status
+}
+
+step_steward() {
+  say "the Network Steward on bw-mint: the map, the key, the timer"
+  COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py steward_rules.py install.sh systemd phase0/map.json | ssh_to bw-mint 'mkdir -p ~/kit && tar -C ~/kit -xf - && sudo install -m 0755 ~/kit/bwkit.py /usr/local/bin/bwkit && sudo install -m 0644 ~/kit/steward_rules.py /usr/local/bin/steward_rules.py && sudo install -m 0644 ~/kit/systemd/*.service ~/kit/systemd/*.timer /etc/systemd/system/ && sudo install -m 0644 ~/kit/phase0/map.json /etc/bwkit/map.json && sudo systemctl daemon-reload && echo "bw-mint: bwkit $(grep -m1 "^VERSION" /usr/local/bin/bwkit | cut -d\" -f2), map installed"'
+  run bw-mint 'sudo -u bwkit test -s /var/lib/bwkit/steward.priv && echo "bw-mint: the Steward already has a key, $(sudo -u bwkit bwkit steward nym)" || echo "bw-mint: Steward NYM $(sudo -u bwkit bwkit steward keygen)"'
+  run bw-mint 'sudo systemctl restart bwkit && sleep 1 && echo "bw-mint: bwkit $(systemctl is-active bwkit), accepts postings by $(curl -s http://127.0.0.1:8710/status | python3 -c "import json,sys; print(json.load(sys.stdin)[\"steward\"])")"'
+  run bw-mint 'sudo systemctl enable -q --now bwkit-steward.timer && sudo -u bwkit bwkit steward map && sudo -u bwkit bwkit steward run && sudo -u bwkit bwkit steward book'
+  run bw-mint 'systemctl list-timers bwkit-steward.timer --no-pager | head -2'
 }
 
 check_status() {
@@ -249,6 +261,7 @@ case "${1:-}" in
   kit) step_kit ;;
   update) step_update ;;
   status) step_status ;;
+  steward) step_steward ;;
   check) check_time; check_tunnel; check_kit; check_status ;;
   all) step_upgrade; step_time; step_tunnel; step_logs; step_kit ;;
   *) sed -n '2,18p' "$0"; exit 2 ;;

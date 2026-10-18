@@ -1,0 +1,10 @@
+[Unit]
+Description=bwkit: the Steward runs five minutes past the hour, after the hour's commitment
+
+[Timer]
+OnCalendar=*-*-* *:05:00
+AccuracySec=5s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

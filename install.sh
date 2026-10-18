@@ -3,7 +3,7 @@
 #
 #   sudo ./install.sh payer|hop|mint
 #
-# Puts bwkit.py at /usr/local/bin/bwkit, makes the bwkit system user and
+# Puts bwkit.py at /usr/local/bin/bwkit (with steward_rules.py beside it), makes the bwkit system user and
 # /var/lib/bwkit, writes a first /etc/bwkit/config.json for the role if none
 # exists (the pilot's defaults: the hop's link terms, the Mint's price and the
 # Steward's fee), installs the systemd units and generates the node's key. It does
@@ -19,6 +19,7 @@ id bwkit >/dev/null 2>&1 || useradd --system --home-dir /var/lib/bwkit --shell /
 install -d -o bwkit -g bwkit -m 0750 /var/lib/bwkit
 install -d -m 0755 /etc/bwkit
 install -m 0755 "$here/bwkit.py" /usr/local/bin/bwkit
+install -m 0644 "$here/steward_rules.py" /usr/local/bin/steward_rules.py   # imported by bwkit from its own directory
 install -m 0644 "$here"/systemd/*.service "$here"/systemd/*.timer /etc/systemd/system/
 systemctl daemon-reload
 

@@ -1,0 +1,11 @@
+[Unit]
+Description=bwkit: the Network Steward's hourly run over the Mint's ledger
+After=network-online.target bwkit.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=bwkit
+Group=bwkit
+ExecStart=/usr/local/bin/bwkit steward run
+Environment=PYTHONUNBUFFERED=1
