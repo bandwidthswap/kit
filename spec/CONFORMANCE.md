@@ -15,9 +15,11 @@ From the inputs in `spec/vectors/inputs.json` (test-only key seeds, the windows'
 | `settlement-default.json` | the first window, settled with no announcement in force: `link` null, the pilot defaults, the fee |
 | `settlement-disputed.json` | the second window, under the first announcement, disputed |
 | `settlement-settled.json` | a window under the second announcement, settled at its price and margin |
+| `purchase.json` | the payer's purchase on the link (Section 15): its id, which is the hash of the record, and its signature |
+| `settlement-purchased.json` | the seventh window, settled against that purchase: the premium on the bytes moved, from the poster's pool, and the fee on both |
 | `commitment.json` | the Mint's commitment over the hour with three settlements: the root over the leaves in leaf order with the odd split, and the signature |
 | `proof.json` | the proof document for that hour: every index, leaf and path |
-| `rebuild/receipts.jsonl`, `acks.jsonl`, `links.jsonl` | the three inputs of a rebuild, as the parties would hold them (every envelope and announcement signed by the test keys) |
+| `rebuild/receipts.jsonl`, `acks.jsonl`, `links.jsonl`, `purchases.jsonl` | the four inputs of a rebuild, as the parties would hold them (every envelope, announcement and purchase signed by the test keys) |
 | `rebuild/ledger.jsonl` | the ledger a rebuild makes from them (Section 11): every receipt, acknowledgement, settlement and unsigned commitment, in order, with the rebuild's fixed clock |
 
 Settlement records are compared whole, including `t`, which the inputs fix. Numbers must be encoded as Section 3 of the spec says (`0.0`, `5e-05` and `3e-06`, the fee on `5e-05` rounded from 2.5e-06, all occur in the vectors, on purpose). The rebuilt ledger is compared line by line.

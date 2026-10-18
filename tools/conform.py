@@ -95,6 +95,9 @@ def main(argv=None):
         ok = ok and not diff
     # the independent checks: signatures and the proof, with nothing but the files
     checks = []
+    if "purchase.json" in got:
+        checks.append(("purchase.json signed by the payer, id the hash of the record", lambda: (bwkit.check_purchase(got["purchase.json"]), bwkit.verify_purchase(got["purchase.json"]))[1]
+                       and got["purchase.json"]["poster"] == nym["payer"]))
     if "receipt.json" in got:
         checks.append(("receipt.json signed by the payer", lambda: bwkit.check_envelope(got["receipt.json"]) == nym["payer"]))
     if "ack.json" in got:

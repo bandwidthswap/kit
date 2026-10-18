@@ -70,8 +70,10 @@ def inputs():
              "medium": "wire", "range_class": "room", "since": T0 + 10800},
         ],
         "windows": windows,
+        "purchase": {"min_bytes": 20_000_000, "premium_per_gb": 0.02, "windows": 1, "escrow": 0.01, "deadline": T0 + 86400,
+                     "posted_at": T0 + 12700, "steward_margin": 0.01},    # governs the seventh window, the one ending after it
         "standalone": {"receipt": 1, "settlement-default": 0, "settlement-disputed": 1, "settlement-settled": 5, "link": 0,
-                       "commitment_hour": T0 + 10800},
+                       "settlement-purchased": 6, "commitment_hour": T0 + 10800},
         "rebuild_at": T0 + 20000,
     }
 
@@ -92,6 +94,14 @@ def generate(inp):
         body.update({"kind": "link", "proto": 1, "relay": nym["hop"], "domain": nym["mint"], "since": spec["since"],
                      "payer": nym["payer"] if spec["payer"] == "payer" else spec["payer"]})
         links.append(dict(body, sig=bwkit.sign_link(priv["hop"], body)))
+    pu = inp["purchase"]
+    body = {"kind": "purchase", "proto": 1, "poster": nym["payer"], "program": "payer",
+            "route": {"from": nym["payer"], "to": nym["hop"], "not_via": []}, "min_bytes": pu["min_bytes"],
+            "premium_per_gb": pu["premium_per_gb"], "windows": pu["windows"], "deadline": pu["deadline"], "proving": None,
+            "escrow": pu["escrow"], "unit": "USD", "posted_at": pu["posted_at"], "matches": None}
+    purchase = dict(body, id=bwkit.purchase_id(body), sig=bwkit.sign_purchase(priv["payer"], body))
+    book = bwkit.PurchaseBook(None, inp["steward_fee"], pu["steward_margin"])
+    book.add(purchase)
     receipts, acks, settlements = [], [], []
     for w in inp["windows"]:
         r = {"payer": nym["payer"], "hop": nym["hop"], "hop_index": 1, "merkle_root": bwkit.meter_root(nym["payer"], w["meter"]),
@@ -108,7 +118,9 @@ def generate(inp):
                "sig": bwkit.sign_receipt(priv["hop"], a), "meter": None}
         acks.append(ack)
         link = bwkit.link_in_force(links, r["payer"], r["hop"], r["t_first"])
-        settlements.append(bwkit.resolve(env, ack, inp["price_usd_per_gb"], w["settled_at"], link, inp["steward_fee"]))
+        st = bwkit.resolve(env, ack, inp["price_usd_per_gb"], w["settled_at"], link, inp["steward_fee"], book.context(r, r["t_last"]))
+        book.note(st)
+        settlements.append(st)
     sa = inp["standalone"]
     hour = sa["commitment_hour"]
     in_hour = [s for s in settlements if s and bwkit.commit_hour(s) == hour]
@@ -117,7 +129,8 @@ def generate(inp):
     ledger, _ = bwkit.rebuild([(i + 1, e) for i, e in enumerate(receipts)],
                               [(i + 1, a) for i, a in enumerate(x for x in acks if x)],
                               [(i + 1, l) for i, l in enumerate(links)],
-                              inp["price_usd_per_gb"], inp["steward_fee"], inp["rebuild_at"])
+                              inp["price_usd_per_gb"], inp["steward_fee"], inp["rebuild_at"],
+                              purchases=[(1, purchase)], steward_margin=pu["steward_margin"])
     return {
         "keys.json": {r: {"seed": inp["seeds"][r], "nym": nym[r], "name": names[r]} for r in ROLES},
         "receipt.json": receipts[sa["receipt"]],
@@ -126,11 +139,14 @@ def generate(inp):
         "settlement-default.json": settlements[sa["settlement-default"]],
         "settlement-disputed.json": settlements[sa["settlement-disputed"]],
         "settlement-settled.json": settlements[sa["settlement-settled"]],
+        "purchase.json": purchase,
+        "settlement-purchased.json": settlements[sa["settlement-purchased"]],
         "commitment.json": commitment,
         "proof.json": proof,
         "rebuild/receipts.jsonl": receipts,
         "rebuild/acks.jsonl": [a for a in acks if a],
         "rebuild/links.jsonl": links,
+        "rebuild/purchases.jsonl": [purchase],
         "rebuild/ledger.jsonl": ledger,
     }
 
@@ -147,7 +163,7 @@ README = """# `bsp/1` test vectors
 anyone can reproduce every signature here. Never use them on a node; a Mint should refuse their NYMs.
 
 Written by `tools/vectors.py` from `inputs.json`: fixed seeds, fixed timestamps (T0 = 1800000000, an hour boundary), seven
-windows' meter readings and counts, two announcements, the price and the fee. `spec/CONFORMANCE.md` says what each file
+windows' meter readings and counts, two announcements, a purchase, the price and the fee. `spec/CONFORMANCE.md` says what each file
 is and how `tools/conform.py` checks a directory in this layout. `test_bwkit.py` fails when the kit no longer writes
 exactly these files.
 
@@ -160,8 +176,10 @@ exactly these files.
 | `settlement-default.json` | the first window, no announcement in force |
 | `settlement-disputed.json` | the second window, under the first announcement |
 | `settlement-settled.json` | the sixth window, under the second announcement (price 0.2, margin 5%) |
+| `purchase.json` | the payer's purchase on the link, posted at T0+12700: 20 MB a window, 2 cents a GB, one window, a cent escrowed |
+| `settlement-purchased.json` | the seventh window, settled against it: the premium on 30 MB from the poster, the fee on both |
 | `commitment.json`, `proof.json` | the hour T0+10800, three settlements |
-| `rebuild/` | the three inputs of a rebuild and the ledger it must make |
+| `rebuild/` | the four inputs of a rebuild and the ledger it must make |
 """
 
 

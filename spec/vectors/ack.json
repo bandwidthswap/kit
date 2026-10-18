@@ -1,6 +1,6 @@
 {
  "from": "vec-hop",
- "impl": "bwkit/0.3.0",
+ "impl": "bwkit/0.4.0",
  "kind": "ack",
  "meter": null,
  "proto": 1,

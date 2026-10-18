@@ -31,6 +31,15 @@
  "note": "Test-only seeds; never use these keys on a node. Timestamps are fixed; T0 is an hour boundary.",
  "price_usd_per_gb": 0.1,
  "proto": 1,
+ "purchase": {
+  "deadline": 1800086400,
+  "escrow": 0.01,
+  "min_bytes": 20000000,
+  "posted_at": 1800012700,
+  "premium_per_gb": 0.02,
+  "steward_margin": 0.01,
+  "windows": 1
+ },
  "rebuild_at": 1800020000,
  "seeds": {
   "hop": "37de99ca6d1d1f7de3ae97914e8a05d09e222ac72156bcb33b78694f4075b86c",
@@ -43,6 +52,7 @@
   "receipt": 1,
   "settlement-default": 0,
   "settlement-disputed": 1,
+  "settlement-purchased": 6,
   "settlement-settled": 5
  },
  "steward_fee": 0.05,

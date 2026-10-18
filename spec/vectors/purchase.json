@@ -1,0 +1,22 @@
+{
+ "deadline": 1800086400,
+ "escrow": 0.01,
+ "id": "de808d70b6e808c88fa73249e27f098e0bc210885f474cc33be4b49456d498a1",
+ "kind": "purchase",
+ "matches": null,
+ "min_bytes": 20000000,
+ "posted_at": 1800012700,
+ "poster": "ed25519:IGSk-aXtuMXYJ8tMVPFTPqR2hXXtCjkDgRKur2IWVuM",
+ "premium_per_gb": 0.02,
+ "program": "payer",
+ "proto": 1,
+ "proving": null,
+ "route": {
+  "from": "ed25519:IGSk-aXtuMXYJ8tMVPFTPqR2hXXtCjkDgRKur2IWVuM",
+  "not_via": [],
+  "to": "ed25519:7NXLckho5kxw7Bht2Dcjv_v4-ShUgY1sAdYX3V0RVec"
+ },
+ "sig": "o5OYezhhUPREG-KiWUXBRHYXNayL720OyMVIx-2L8PVuzE_ZsVBXKmKwhqQpVOceLu4CoXsj-1PBgvHrLWm7AQ",
+ "unit": "USD",
+ "windows": 1
+}

@@ -1330,19 +1330,19 @@ class Purchases(unittest.TestCase):
         self.assertEqual((lab.payer.load_purchases(), lab.mint.load_purchases()), ([rec], [rec]))
         self.assertEqual(json.loads(bwkit.http_get(lab.mint_url + "/purchases")[1]), [rec])
         self.assertEqual(json.loads(bwkit.http_get(lab.mint_url + "/status")[1])["purchases"], 1)
-        lab.hour(200_000_000, 200_000_000)                        # started before posted_at: no premium
-        self.assertNotIn("purchase", self.settlements()[-1])
-        lab.hour(300_000_000, 300_000_000)                        # 100 MB, above the 50 MB minimum: the full premium, from the poster
+        lab.hour(200_000_000, 200_000_000)                        # running when the purchase was posted: governed, 100 MB above the 50 MB minimum
         s = self.settlements()[-1]
         self.assertEqual([s[k] for k in bwkit.PURCHASE_KEYS], [pid, None, 0.002, 0.0, 0.002, 0.0, 0.0])
         self.assertEqual((s["amount_usd"], s["fee_usd"]), (0.01, 0.0006))      # f is taken from the premium as from any fee
+        lab.hour(300_000_000, 300_000_000)                        # the full premium again, from the poster
+        self.assertEqual(self.settlements()[-1]["premium_usd"], 0.002)
         lab.hour(320_000_000, 320_000_000)                        # 20 MB, 40% of the minimum: the premium in proportion, the rest returns
         s = self.settlements()[-1]
         self.assertEqual([s[k] for k in bwkit.PURCHASE_KEYS], [pid, None, 0.0004, 0.0006, 0.0004, 0.0, 0.0])
         self.assertEqual(s["fee_usd"], 0.00012)
-        lab.hour(420_000_000, 420_000_000)                        # the third of three windows
-        self.assertEqual(self.settlements()[-1]["purchase"], pid)
-        lab.hour(520_000_000, 520_000_000)                        # the windows are spent
+        lab.hour(420_000_000, 420_000_000)                        # the three windows are spent
+        self.assertNotIn("purchase", self.settlements()[-1])
+        lab.hour(520_000_000, 520_000_000)
         self.assertNotIn("purchase", self.settlements()[-1])
         book = lab.mint.index["book"]
         self.assertEqual(book.use[pid], {"windows": 3, "own": 0.0044, "steward": 0.0, "refund": 0.0006, "held": 0.0})

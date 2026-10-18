@@ -88,7 +88,7 @@ try:
 except ImportError:                 # an older install without it: everything but purchases and the Steward still runs
     rules = None
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 IMPL = "bwkit/" + VERSION               # `impl` in every envelope: informational, never the profile
 PROTO = 1                               # the profile every record this kit writes carries (spec, Section 14)
 PROTOS = (1,)                           # the profiles it accepts; a record without `proto` is profile 1
@@ -489,8 +489,13 @@ class PurchaseBook:
         return None
 
     def applies(self, rec, r, t_last):
-        """Does this purchase govern a window (payer, hop, t_first, t_last)? Programs other than match only."""
-        if rec["program"] == "match" or rec["posted_at"] > r["t_first"] or t_last > rec["deadline"]:
+        """Does this purchase govern a window (payer, hop, t_first, t_last)? Programs other than match only.
+
+        A purchase is open from posted_at: it governs the windows that end at
+        or after it was posted (the window running when it was posted
+        included) and at or before its deadline.
+        """
+        if rec["program"] == "match" or rec["posted_at"] > t_last or t_last > rec["deadline"]:
             return False
         if self.use.get(rec["id"], {}).get("windows", 0) >= rec["windows"]:
             return False
@@ -1657,8 +1662,8 @@ class Node:
             if rec["program"] != "match":
                 for e in self.index["by_sig"].values():
                     r = e["receipt"]
-                    if r["t_first"] >= rec["posted_at"] and book.applies(rec, r, r["t_last"]):
-                        raise Decline("since: a window from %d that this purchase would govern is already held" % r["t_first"])
+                    if r["t_last"] >= rec["posted_at"] and book.applies(rec, r, r["t_last"]):
+                        raise Decline("since: a window ending at %d that this purchase would govern is already held" % r["t_last"])
             self.append("purchases.jsonl", rec)
             book.add(rec)
         log("purchase %s registered: %s by %s, %s -> %s, >= %d bytes a window, premium %s/GB, %d windows, escrow %s, until %d" % (

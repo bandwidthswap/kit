@@ -4,7 +4,7 @@
 anyone can reproduce every signature here. Never use them on a node; a Mint should refuse their NYMs.
 
 Written by `tools/vectors.py` from `inputs.json`: fixed seeds, fixed timestamps (T0 = 1800000000, an hour boundary), seven
-windows' meter readings and counts, two announcements, the price and the fee. `spec/CONFORMANCE.md` says what each file
+windows' meter readings and counts, two announcements, a purchase, the price and the fee. `spec/CONFORMANCE.md` says what each file
 is and how `tools/conform.py` checks a directory in this layout. `test_bwkit.py` fails when the kit no longer writes
 exactly these files.
 
@@ -17,5 +17,7 @@ exactly these files.
 | `settlement-default.json` | the first window, no announcement in force |
 | `settlement-disputed.json` | the second window, under the first announcement |
 | `settlement-settled.json` | the sixth window, under the second announcement (price 0.2, margin 5%) |
+| `purchase.json` | the payer's purchase on the link, posted at T0+12700: 20 MB a window, 2 cents a GB, one window, a cent escrowed |
+| `settlement-purchased.json` | the seventh window, settled against it: the premium on 30 MB from the poster, the fee on both |
 | `commitment.json`, `proof.json` | the hour T0+10800, three settlements |
-| `rebuild/` | the three inputs of a rebuild and the ledger it must make |
+| `rebuild/` | the four inputs of a rebuild and the ledger it must make |

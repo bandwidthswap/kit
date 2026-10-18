@@ -316,34 +316,39 @@ The reference implementation's version is informational (`impl`), and is not the
 
 ## 15. Extension: purchases
 
-Not implemented in the reference implementation at this version; defined here so that the Steward's work conforms when it is. The paper calls both the Merkle commitment (Section 10) and the bounty of Section 5.1 a commitment; in records the bounty is a **purchase**.
+Implemented by the reference implementation from 0.4.0 (October 18, 2026). The paper calls both the Merkle commitment (Section 10) and the bounty of Section 5.1 a commitment; in records the bounty is a **purchase**.
 
-**The record**, signed by its poster over the domain string `bandwidthswap/purchase/v1`, a newline, and its canonical JSON without `sig`:
+**The record**, signed by its poster. Its `id` is the SHA-256 of the canonical JSON of the record without `id` and `sig`; the signed bytes are the domain string `bandwidthswap/purchase/v1`, a newline, and those same bytes.
 
 ```
 {"kind": "purchase", "proto": 1,
- "id": "<hash of the canonical record without sig>",
+ "id": "<hash of the canonical record without id and sig>",
  "poster": "<NYM>",                          a payer, or the Steward's own key
  "program": "payer" | "match" | "second_bridge" | "first_link",
  "route": {"from": <NYM or place id, or null>, "to": <NYM or place id>, "not_via": [place ids]},
  "min_bytes": <integer>,                     the minimum rate, as bytes per window
- "premium_per_gb": <number>,                 the premium above the posted price, in `unit`
- "windows": <integer>,                       how many windows it pays for
+ "premium_per_gb": <number>,                 the premium above the posted price, in `unit` per 10^9 bytes
+ "windows": <integer, at least 1>,           how many windows it pays for
  "deadline": <time>,
  "proving": null | {"windows_per_period": <integer>, "period_s": <integer>},
  "escrow": <number>,                         the prepaid value in `unit`; in the pilot a line on the invoice
- "unit": "USD/GB",
+ "unit": "USD",                              the only unit in profile 1
  "posted_at": <time>,
+ "matches": null | "<purchase id>",          a match names the payer's purchase it adds to; only a match has it
  "sig": "<base64url>"}
 ```
 
-`route.from` is null when any relay may serve it (a first link). The Steward's postings are signed by the Steward's own key; `program` says which rule posted it.
+A place id is 1 to 32 characters of `a-z`, `0-9` and `-`, and never begins with `ed25519:`. `route.from` is null when any relay may serve the route (a first link). The Steward's postings are signed by the Steward's own key; `program` says which rule posted it: `payer` is a payer's own, `match` the Steward's addition to one, `second_bridge` and `first_link` the Steward's programs 2 and 3 (paper, Section 7).
 
-**Lifecycle.** A purchase is `open` from `posted_at`; windows settle against it; it is `closed` when its windows are spent or its deadline passes, and the unspent escrow returns to the poster.
+**Registration.** A poster sends the record to the Mint (`POST /purchase`, 200 `{"stored": id}`). The Mint MUST check, and refuse if any fails: the shape above and `id` (400); the signature under `poster` (400); for program `payer`, that the poster is in its peer list, that `route.from` is null or the poster, and that `route.to` is a peer's NYM or a place on its map (403 or 409 `route`); for the other programs, that the poster is the Steward's NYM (403), and for a match that `matches` names a purchase it holds; that `posted_at` is not earlier than its clock less its clock tolerance (409 `since`: a purchase cannot be backdated); and that it holds no receipt the purchase would govern (below) whose `t_last` is at or after `posted_at` (409 `since`). A second registration of the same `id` is 409 `duplicate`. The Mint appends the record to `purchases.jsonl` and lists its purchases at `GET /purchases`. A Mint without this extension answers 404 to `POST /purchase`.
 
-**Settlement against a purchase** (paper, Section 5.1). When a window's receipt matches an open purchase (its payer is the poster, or the poster is the Steward and the route matches), the Mint applies one more rule after the smaller count. The rate is `settled_bytes` over the window; at or above `min_bytes` per window the relay is paid the full premium, `settled_bytes / 10^9 × premium_per_gb`; below it, the premium in proportion to `settled_bytes / min_bytes`, and the rest of that window's premium returns to the poster. The settlement record then carries `purchase` (the id), `premium_usd`, `refund_usd`, and who paid the premium, `from_poster_usd` and `from_steward_usd`. *f* is taken from the premium as from any fee. The invoice gains a premium column and a refund line.
+**Which purchase governs a window.** For a window (payer *P*, hop *H*, `t_first`, `t_last`) a purchase is a candidate when its program is not `match`, `posted_at` ≤ `t_last` (it is open from `posted_at`, and governs the window running when it was posted), `t_last` ≤ `deadline`, fewer than `windows` windows have settled against it, at least one of its pools (below) is not empty, and its route matches: for program `payer`, *P* is the poster, `route.from` is null or *P*, and `route.to` is *H* or the place *H* is at; for `first_link`, `route.from` is null and *H* is at the place `route.to`; for `second_bridge`, *P* is at the place `route.from` and *H* is at a place that is neither in `not_via` nor `route.from`. A node's place is the map's (`nodes` in `map.json`, by the node's name in the peer list); a node on no place matches no place route. Of the candidates, the payer's own purchases come first, then the Steward's, each by `posted_at` and then `id`; the first governs. *Note (paper):* with one hop a route "through a place that is not on the existing path" cannot be checked beyond the hop's own place, so a second-bridge purchase matches any hop at a third place; nobody on the pilot can collect one.
 
-**The interface.** `POST /purchase` registers a purchase with the Mint (200 `{"stored": id}`); a Mint without the extension answers 404. The Steward's per-payer cap, its programs and its map are the Steward's rules, not this profile's, and are specified with it.
+**Pools.** A payer's purchase holds the poster's escrow; a match holds the Steward's; the Steward's own postings hold the Steward's. What is left of a pool is its `escrow` less what the settlements naming it have drawn (`from_poster_usd` for the poster's, `from_steward_usd` for the Steward's; a settlement names the match it drew from in `match`). A purchase is `open` while it has windows and a deadline left and a pool to draw from; `complete` when its windows are spent, `spent` when its pools are, `expired` past its deadline, and what it did not spend returns to whoever put it in.
+
+**Settlement against a purchase** (paper, Section 5.1). After the smaller count, with (paid, refund) = `premium_split(settled_bytes, min_bytes, premium_per_gb)` of `steward_rules.py`: the premium is paid on the bytes moved (`settled_bytes / 10^9 × premium_per_gb`); below the minimum, the rest of that window's premium (the premium on the minimum less what was paid) is `refund_usd`, returned to the poster. The premium is drawn by `draw`: from the poster's pool first, then from the Steward's pool (the match, or the Steward's own posting) up to the per-payer cap `allowance(f, margin, fees_in, paid_on)`, where `fees_in` is the sum of `amount_usd` on the payer's settlements so far and `paid_on` the sum of `from_steward_usd` on them; what the cap stops is `steward_held_usd`. The settlement record gains `purchase` (the id), `match` (the match's id or null), `premium_usd` (what was paid), `refund_usd`, `from_poster_usd`, `from_steward_usd` and `steward_held_usd`, each rounded to six places, and its `fee_usd` is `round6((amount_usd + premium_usd) × f)`: *f* is taken from the premium as from any fee. The invoice gains a premium column and a refund line. *Note:* the pools and the cap are accumulated in the order the Mint settles, so a window settled late (an outbox) may draw differently in a rebuild that orders windows by their bounds; the rebuild names the difference.
+
+**The Steward.** The reference implementation's Steward runs on the Mint's host, hourly after the commitment, with its own key, over the ledger and the purchases: it posts a match at `match_size(m, escrow, income, matched, steward_escrow)` on a payer's open purchase that has none (the payer known to the Mint for `min_payer_age_s`), a bounty of `second_bridge_size(f, fees, budget)` with premium `second_bridge_premium(value, bytes)` for every link that carried fees between two different places in the program window and has no open bounty, and a first-link offer of `first_link_size(first_link_usd, budget, open_so_far)` for every mapped place no settled window has an end at, where `budget` is `bounty_budget(steward_escrow, m, income, matched)`; its income is the sum of `fee_usd`. Its parameters (*m*, the cap's margin, the program window, the first link's size and premium, the payer age, the bounty deadline) are the Mint's configuration, and the map is the membership's file. The rule's arithmetic is `steward_rules.py`, which the simulator shares; this section fixes the records and the Mint's behavior, and the plan (PLAN.md, Section 2) describes the rule.
 
 ## Appendix A. Where this profile departs from the paper
 
@@ -358,6 +363,7 @@ Each is marked *Note (paper)* above.
 7. Patience declines the payer's next receipt and keeps declining until cleared; the decline has no teeth beyond the operator's hook (Section 12).
 8. The window key has five fields, not three (Section 6, against the build plan rather than the paper).
 9. Amounts are doubles rounded to six places, with the number encoding of Section 3; integer micro-units would be cleaner and are a matter for profile 2.
+10. A second-bridge purchase matches by the hop's place alone, since a one-hop route has no path through a third place to check; and a window's premium is drawn in the Mint's settlement order, not the windows' (Section 15).
 
 ## Appendix B. The pilot's values
 

@@ -1,6 +1,6 @@
 {
  "from": "vec-payer",
- "impl": "bwkit/0.3.0",
+ "impl": "bwkit/0.4.0",
  "kind": "receipt",
  "meter": {
   "reset": false,
