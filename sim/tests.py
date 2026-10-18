@@ -280,6 +280,60 @@ class UnderRemit(unittest.TestCase):
         self.assertEqual(sorted((d, b) for (_, _, d, b) in r["slashed"]), [("earth", F(50000)), ("mars", F(50000))])
 
 
+class Rules(unittest.TestCase):
+    """steward_rules.py, the one file both the simulator and the kit's Steward import, held to the field note's figures."""
+
+    def test_the_rules_give_the_field_notes_numbers(self):
+        import steward_rules as rules
+        # the street's second bridge: the Steward's take of the Wi-Fi's 60 cents, premium a tenth of a cent on 30 GB
+        self.assertEqual(rules.second_bridge_size(F("0.05"), F("0.60"), F(100)), F("0.03"))
+        self.assertEqual(rules.second_bridge_premium(F("0.03"), 30 * GB), F("0.001"))
+        # the cabin: a full window pays the premium on the bytes moved; the rain pays in proportion and returns the rest
+        self.assertEqual(rules.premium_split(F(1_200_000_000), 1_000_000_000, F("0.25")), (F("0.30"), 0))
+        self.assertEqual(rules.premium_split(500_000_000, 700_000_000, F("0.25")), (F("0.125"), F("0.05")))
+        # the match: m of the escrow, within m of the income less matches made, within the escrow in hand
+        self.assertEqual(rules.match_size(F("0.025"), F(180), F(200), F(0), F(200)), F("4.50"))
+        self.assertEqual(rules.match_size(F("0.025"), F(180), F(10), F(0), F(200)), F("0.25"))
+        self.assertEqual(rules.match_size(F("0.025"), F(180), F(200), F(5), F(200)), 0)
+        # the cap: (f - margin) of the fees paid in, less what was paid out; the draw takes the poster's money first
+        self.assertEqual(rules.allowance(F("0.05"), F("0.005"), F(100), F(1)), F("3.5"))
+        self.assertEqual(rules.draw(F(10), F(4), F(10), F("3.5")), (F(4), F("3.5"), F("2.5")))
+        self.assertEqual(rules.draw(F(3), F(4), F(10), F(0)), (F(3), 0, 0))
+        self.assertEqual(rules.bounty_budget(F(10), F("0.025"), F(100), F(1)), F("8.5"))
+        self.assertEqual(rules.first_link_size(F(2), F(10), F("0.5")), F("1.5"))
+        self.assertEqual(rules.first_link_size(F(2), F("0.3"), F(0)), F("0.3"))
+
+    def one_place(self, windows):
+        return {
+            "scenario": {"name": "one place", "description": "a link inside one place, and a mapped place with none",
+                         "windows": windows, "window_seconds": 3600},
+            "params": {"f": "0.05", "m": "0", "program_window": 1, "first_link_size": "1.00", "first_link_premium": "0.05",
+                       "bounty_deadline": 168},
+            "domains": [{"id": "lab", "name": "the lab", "unit": "USD", "symbol": "$", "mint": "bw-mint"}],
+            "places": [{"id": "house", "name": "the house", "domain": "lab", "medium": "wire", "range": "building"},
+                       {"id": "cabin", "name": "the cabin", "domain": "lab", "medium": "lora", "range": "hill"}],
+            "nodes": [{"id": "bw-house", "name": "bw-house", "place": "house", "roles": ["payer"]},
+                      {"id": "bw-forest", "name": "bw-forest", "place": "house", "roles": ["relay"]},
+                      {"id": "bw-mint", "name": "bw-mint", "place": "house", "roles": ["mint"]}],
+            "links": [{"id": "wg0", "src": "bw-house", "dst": "bw-forest", "owner": "bw-forest", "price": 0.10,
+                       "medium": "wire", "range": "building", "clock_tolerance_s": 5, "window_kind": "hour"}],
+            "demands": [{"id": "tunnel", "payer": "bw-house", "src": "bw-house", "dst": "bw-forest", "bytes_per_window": GB}],
+        }
+
+    def test_a_link_inside_one_place_has_no_second_bridge_and_the_first_link_is_topped_up(self):
+        from sim.attacks import run_dict
+        r = run_dict(self.one_place(3), "one-place")
+        self.assertFalse([c for c in r.commitments.values() if c.kind == "second_bridge"])
+        self.assertTrue(any("inside one place" in text for _, text in r.events_log), r.events_log[-5:])
+        fl = [c for c in r.commitments.values() if c.kind == "first_link"]
+        self.assertEqual(len(fl), 1)                              # one standing offer, not one per run
+        self.assertEqual(fl[0].to_place, "cabin")
+        self.assertEqual(fl[0].escrow, F("0.015"))                # posted at half a cent, topped up twice toward $1.00
+        self.assertEqual(r.stewards["lab"].posted, F("0.015"))
+        self.assertEqual(r.stewards["lab"].escrow, 0)
+        self.assertEqual(sum(1 for p in r.payments if p.kind == "post" and p.commitment == fl[0].id), 3)
+
+
 class Output(unittest.TestCase):
     def test_render_and_csv(self):
         for name in ("bench", "street", "cabin", "cabin-nomatch", "earth-moon", "earth-mars-jupiter"):

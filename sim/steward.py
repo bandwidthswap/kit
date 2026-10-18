@@ -16,13 +16,22 @@ commitments only (Section 5.1), under three programs:
    settles across it. Funded from what is left.
 
 Everything a commitment returns comes back to the escrow and is posted again.
+
+The sizes and the cap are the pure functions of steward_rules.py at the kit's
+root, which the Mint's Steward in bwkit.py imports too, so the simulator that
+found the wash trader's second hill and the Steward on the Mint are one rule.
 """
 
+import os
+import sys
 from fractions import Fraction
 
 from . import routing
 from .model import Commitment
 from .money import GB, fmt, pct
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import steward_rules as rules  # noqa: E402
 
 
 class Steward:
@@ -64,21 +73,18 @@ class Steward:
     def allowance(self, payer):
         """What the Steward may still pay out on this payer's receipts: (f - margin) of its fees in, less what it has."""
         p = self.run.params
-        cap = max(Fraction(0), (p["f"] - p["steward_margin"]) * self.fees_in.get(payer, Fraction(0)))
-        return max(Fraction(0), cap - self.paid_on.get(payer, Fraction(0)))
+        return Fraction(rules.allowance(p["f"], p["steward_margin"], self.fees_in.get(payer, Fraction(0)),
+                                        self.paid_on.get(payer, Fraction(0))))
 
     def draw(self, cm, amount, payer):
         """Take `amount` from a commitment's pools for a payout on `payer`'s receipt: the poster's money first,
         then the Steward's, which the per-payer cap limits. Returns (from the poster, from the Steward)."""
-        own = min(amount, cm.pool_own)
+        own, match, held = rules.draw(amount, cm.pool_own, cm.pool_match, self.allowance(payer))
+        own, match, held = Fraction(own), Fraction(match), Fraction(held)
         cm.pool_own -= own
-        rest = amount - own
-        match = Fraction(0)
-        if rest > 0 and cm.pool_match > 0:
-            match = min(rest, cm.pool_match, self.allowance(payer))
-            held = min(rest, cm.pool_match) - match
-            if held > 0:
-                self.capped += held
+        if held > 0:
+            self.capped += held
+        if match > 0:
             cm.pool_match -= match
             self.paid_on[payer] = self.paid_on.get(payer, Fraction(0)) + match
             self.paid_out += match
@@ -99,8 +105,7 @@ class Steward:
             self.declined.append((w, "match " + cm.id, "the poster's bond is %d windows old, the program needs %d" % (age, p["min_bond_age"])))
             self.run.log(w, "Steward (%s): no match for %s, the poster's bond is too young" % (self.domain, cm.label or cm.id))
             return Fraction(0)
-        allowance = m * self.income - self.matched
-        amt = min(m * cm.escrow, allowance, self.escrow)
+        amt = Fraction(rules.match_size(m, cm.escrow, self.income, self.matched, self.escrow))
         if amt <= 0:
             why = "no escrow" if self.escrow <= 0 else "the match allowance (m of income) is spent"
             self.declined.append((w, "match " + cm.id, why))
@@ -128,8 +133,7 @@ class Steward:
     def bounty_budget(self):
         """What the second-bridge and first-link programs may spend: the escrow less the unspent match allowance."""
         p = self.run.params
-        reserve = max(Fraction(0), p["m"] * self.income - self.matched)
-        return max(Fraction(0), self.escrow - reserve)
+        return Fraction(rules.bounty_budget(self.escrow, p["m"], self.income, self.matched))
 
     def run_programs(self, w):
         run = self.run
@@ -140,6 +144,13 @@ class Steward:
         stats.sort(key=lambda t: (-t[0], t[1]))
         for fees, lid, st in stats:
             link = run.links[lid]
+            ends = (set(st["origin_places"]) | set(st["dest_places"])) - {None}
+            if len(ends) <= 1:
+                # a link whose two ends are at one place, like the bench wire: there is no second place to go
+                # through, so there is no second bridge to post for (PLAN.md 2.4, NOTES.md 36)
+                run.log(w, "Steward (%s): %s carried %s inside one place; no second bridge to post for" % (
+                    self.domain, lid, fmt(fees, self.unit, run.symbol(self.unit))))
+                continue
             if not routing.is_sole(run, link, w, st["origins"], st["dests"], st["places"]):
                 continue
             if any(c.open and c.kind == "second_bridge" and c.avoid_link == lid for c in run.commitments.values()):
@@ -151,9 +162,9 @@ class Steward:
                     self.domain, lid, fmt(fees, self.unit, run.symbol(self.unit))))
                 break
             take = p["f"] * fees                       # the Steward's income from the sole link
-            value = min(take, budget)
+            value = Fraction(rules.second_bridge_size(p["f"], fees, budget))
             windows = p["program_window"]
-            premium = value / Fraction(st["bytes"], GB) if st["bytes"] else Fraction(0)
+            premium = Fraction(rules.second_bridge_premium(value, st["bytes"]))
             cm = Commitment(id=run.new_id(self.domain + "-bridge"), kind="second_bridge", poster=self.account,
                             domain=self.domain, unit=self.unit, min_bytes=st["bytes"] // windows, premium=premium,
                             windows=windows, deadline=w + 1 + p["bounty_deadline"], posted_at=w + 1,
@@ -175,10 +186,25 @@ class Steward:
                     continue
                 if place.id in run.place_linked:
                     continue
-                if any(c.open and c.kind == "first_link" and c.to_place == place.id for c in run.commitments.values()):
+                standing = [c for c in run.commitments.values() if c.open and c.kind == "first_link" and c.to_place == place.id]
+                if standing:
+                    # the offer stands: top it up toward the program's size from what the budget allows (PLAN.md 2.4, NOTES.md 37)
+                    cm = standing[0]
+                    value = Fraction(rules.first_link_size(p["first_link_size"], self.bounty_budget(), cm.escrow))
+                    if value > 0:
+                        self.escrow -= value
+                        self.posted += value
+                        cm.escrow += value
+                        cm.pool_match += value
+                        cm.contributions[self.account] = cm.contributions.get(self.account, Fraction(0)) + value
+                        run.pay(self.account, "escrow:" + cm.id, value, self.unit, w, "the Steward tops up %s" % cm.label,
+                                kind="post", commitment=cm.id)
+                        run.log(w, "Steward (%s): tops up %s by %s to %s (toward %s)" % (
+                            self.domain, cm.label, fmt(value, self.unit, run.symbol(self.unit)),
+                            fmt(cm.escrow, self.unit, run.symbol(self.unit)), fmt(p["first_link_size"], self.unit, run.symbol(self.unit))))
                     continue
                 budget = self.bounty_budget()
-                value = min(p["first_link_size"], budget)
+                value = Fraction(rules.first_link_size(p["first_link_size"], budget, Fraction(0)))
                 if value <= 0:
                     self.declined.append((w, "first link to " + place.id, "no escrow left"))
                     break

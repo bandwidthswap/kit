@@ -1290,5 +1290,31 @@ class Vectors(unittest.TestCase):
         self.assertIn('"amount_usd":5e-05,"fee_usd":3e-06,', bwkit.canon_json(small).replace('"hop"', "").replace("", ""))
 
 
+class Rules(unittest.TestCase):
+    """steward_rules.py with the floats the Mint's Steward feeds it; the simulator holds the same functions to exact figures."""
+
+    def test_the_rules_with_floats(self):
+        import steward_rules as rules
+        self.assertAlmostEqual(rules.allowance(0.05, 0.01, 4.194, 0.0), 0.16776)
+        self.assertEqual(rules.allowance(0.05, 0.01, 1.0, 0.05), 0)
+        self.assertEqual(rules.draw(0.01, 0.004, 0.1, 0.002), (0.004, 0.002, 0.004))
+        self.assertEqual(rules.draw(0.01, 0.1, 0.0, 0.0), (0.01, 0, 0))
+        self.assertAlmostEqual(rules.match_size(0.04, 1.0, 0.0021, 0.0, 0.0021), 0.000084)   # m of the Steward's whole income
+        self.assertEqual(rules.match_size(0.04, 0.0, 1.0, 0.0, 1.0), 0)
+        self.assertAlmostEqual(rules.bounty_budget(0.0021, 0.04, 0.0021, 0.0), 0.0021 * 0.96)
+        self.assertAlmostEqual(rules.second_bridge_size(0.05, 0.03752, 1.0), 0.001876)
+        self.assertAlmostEqual(rules.second_bridge_premium(0.001876, 375_190_000), 0.005, places=4)
+        self.assertEqual(rules.second_bridge_premium(0.1, 0), 0)
+        self.assertAlmostEqual(rules.first_link_size(1.0, 0.00012, 0.0), 0.00012)
+        self.assertAlmostEqual(rules.first_link_size(1.0, 5.0, 0.4), 0.6)
+        paid, back = rules.premium_split(21_990_000, 50_000_000, 0.02)
+        self.assertAlmostEqual(paid, 0.0004398)
+        self.assertAlmostEqual(back, 0.0005602)
+        paid, back = rules.premium_split(117_430_000, 50_000_000, 0.02)
+        self.assertAlmostEqual(paid, 0.0023486)
+        self.assertEqual(back, 0)
+        self.assertEqual(rules.premium_split(0, 50_000_000, 0.02), (0, 0.001))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
