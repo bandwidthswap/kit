@@ -416,7 +416,7 @@ svg .chip rect{fill:var(--panel);stroke:var(--line);stroke-width:1} svg .chip te
   // The map: each place is a card holding its nodes; the settled links run between the cards with their labels in chips;
   // the offers the Steward and payers have open sit below the row, where nothing else is drawn.
   function chip(x, y, text, cls, anchor){                                   // a label on a small plate, so lines never run through it
-    var w=text.length*6.6+14, h=18, left=anchor==='start'?x:anchor==='end'?x-w:x-w/2;
+    var w=text.length*6.6+14, h=18, left=anchor==='start'?x:anchor==='end'?x-w:x-w/2; left=Math.max(4, Math.min(960-w-4, left));
     return '<g class="chip '+(cls||'')+'"><rect x="'+left.toFixed(1)+'" y="'+(y-13)+'" width="'+w.toFixed(1)+'" height="'+h+'" rx="4"/><text x="'+(left+w/2).toFixed(1)+'" y="'+y+'" text-anchor="middle">'+esc(text)+'</text></g>';
   }
   function mapChart(X, now){
@@ -424,20 +424,20 @@ svg .chip rect{fill:var(--panel);stroke:var(--line);stroke-width:1} svg .chip te
     var ids=Object.keys(m.places), n=ids.length, W=960;
     var byPlace={}; for(var nd in (m.nodes||{})) (byPlace[m.nodes[nd]]=byPlace[m.nodes[nd]]||[]).push(nd);
     var maxNodes=Math.max(1, Math.max.apply(null, ids.map(function(id){ return (byPlace[id]||[]).length; })));
-    var cw=Math.min(230, W/n-36), ch=60+18*maxNodes, top=84, cy=top+ch/2, bottom=top+ch;
+    var cw=Math.min(230, W/n-36), ch=60+18*maxNodes, top=92, cy=top+ch/2, bottom=top+ch;
     var cx=function(i){ return W*(i+0.5)/n; }, pos={}; ids.forEach(function(id,i){ pos[id]=i; });
     var placeOfNym=function(nym){ var nm=X.names[nym]; return nm && m.nodes ? m.nodes[nm] : null; };
     var P=(D.purchases||[]).filter(function(p){ return (!p.kind||p.kind==='purchase')&&p.deadline>=now&&!(X.closedAt&&X.closedAt[p.id]!=null&&X.closedAt[p.id]<=now); });   // open purchases only: not top-ups, closes or withdrawn ones
     var firstLinks={}; P.forEach(function(p){ if(p.program==='first_link') firstLinks[p.route.to]=(firstLinks[p.route.to]||0)+1; });
-    var Hh=bottom+128, out=svgo(W,Hh), links='', labels='', offers='';
+    var Hh=bottom+150, out=svgo(W,Hh), links='', labels='', offers='';
     // the settled links
     linkOrder(X).forEach(function(k,i){
       var l=X.links[k], a=placeOfNym(l.payer), b=placeOfNym(l.hop); if(a==null||b==null||pos[a]==null||pos[b]==null) return;
       var gb=l.windows.reduce(function(s,w){ return s+w.settled_bytes; },0), sw=Math.max(2, Math.min(10, 2+Math.log10(1+gb/1e6)*2)), text=X.name(l.payer)+' → '+X.name(l.hop)+' · '+bytes(gb);
       var pur=P.filter(function(p){ return p.program==='payer' && p.route.from===l.payer && p.route.to===l.hop; })[0];
-      if(a===b){ var x=cx(pos[a]); links+='<path class="link" d="M'+(x-22)+' '+top+' C '+(x-34)+' '+(top-52)+', '+(x+34)+' '+(top-52)+', '+(x+22)+' '+top+'" stroke-width="'+sw.toFixed(1)+'" stroke="'+col(i)+'"><title>'+esc(text)+', inside '+esc(m.places[a].name)+'</title></path>'; labels+=chip(x, top-48, text+' · inside the place'); }
+      if(a===b){ var x=cx(pos[a]); links+='<path class="link" d="M'+(x-22)+' '+top+' C '+(x-34)+' '+(top-52)+', '+(x+34)+' '+(top-52)+', '+(x+22)+' '+top+'" stroke-width="'+sw.toFixed(1)+'" stroke="'+col(i)+'"><title>'+esc(text)+', inside '+esc(m.places[a].name)+'</title></path>'; labels+=chip(x, top-64, text+' · inside the place'); }
       else { var l0=Math.min(pos[a],pos[b]), l1=Math.max(pos[a],pos[b]), x1=cx(l0)+cw/2, x2=cx(l1)-cw/2, xm=(x1+x2)/2;
-        if(l1-l0===1){ links+='<line class="link" x1="'+x1+'" y1="'+cy+'" x2="'+x2+'" y2="'+cy+'" stroke-width="'+sw.toFixed(1)+'" stroke="'+col(i)+'"><title>'+esc(text)+'</title></line>'; labels+=chip(xm, cy-16, text); if(pur) labels+=chip(xm, cy+22, 'purchase · ≥ '+bytes(pur.min_bytes)+' a window · '+usd(pur.premium_per_gb)+'/GB · '+usd(pur.escrow)+' escrow', 'offer'); }
+        if(l1-l0===1){ links+='<line class="link" x1="'+x1+'" y1="'+cy+'" x2="'+x2+'" y2="'+cy+'" stroke-width="'+sw.toFixed(1)+'" stroke="'+col(i)+'"><title>'+esc(text)+'</title></line><line class="grid" x1="'+xm+'" y1="'+(cy-4)+'" x2="'+xm+'" y2="'+(top-12)+'"/>'; labels+=chip(xm, top-20, text); if(pur) labels+=chip(xm, top-42, 'purchase · ≥ '+bytes(pur.min_bytes)+' a window · '+usd(pur.premium_per_gb)+'/GB · '+usd(pur.escrow)+' escrow', 'offer'); }
         else { var xa=cx(l0), xb=cx(l1), ya=top-10; links+='<path class="link" d="M'+xa+' '+top+' C '+xa+' '+(top-70)+', '+xb+' '+(top-70)+', '+xb+' '+top+'" stroke-width="'+sw.toFixed(1)+'" stroke="'+col(i)+'"><title>'+esc(text)+'</title></path>'; labels+=chip((xa+xb)/2, top-58, text); }
         if(pos[a]>pos[b]) links+='<text class="ax" x="'+(x1+6)+'" y="'+(cy+4)+'">◀</text>'; else links+='<text class="ax" x="'+(x2-14)+'" y="'+(cy+4)+'">▶</text>';
       }
@@ -445,7 +445,7 @@ svg .chip rect{fill:var(--panel);stroke:var(--line);stroke-width:1} svg .chip te
     // the offers, below the row
     P.forEach(function(p){
       var from = p.route.from==null ? null : (m.places[p.route.from]?p.route.from:placeOfNym(p.route.from)), to = m.places[p.route.to]?p.route.to:placeOfNym(p.route.to);
-      if(p.program==='second_bridge' && from!=null && to!=null && pos[from]!=null && pos[to]!=null){ var xa=cx(pos[from]), xb=cx(pos[to]), dip=bottom+84; offers+='<path class="offer" d="M'+xa+' '+(bottom+2)+' C '+xa+' '+dip+', '+xb+' '+dip+', '+xb+' '+(bottom+2)+'"><title>'+esc(p.id.slice(0,8))+': not via '+esc(p.route.not_via.join(', '))+'</title></path>'; offers+=chip((xa+xb)/2, bottom+74, 'second path wanted, through a third place · '+usd(p.escrow)+' at '+usd(p.premium_per_gb)+'/GB', 'offer'); }
+      if(p.program==='second_bridge' && from!=null && to!=null && pos[from]!=null && pos[to]!=null){ var xa=cx(pos[from])+cw*0.3, xb=cx(pos[to])-cw*0.3, y0=bottom+44, dip=bottom+130; offers+='<path class="offer" d="M'+xa+' '+(bottom+2)+' L '+xa+' '+y0+' C '+xa+' '+dip+', '+xb+' '+dip+', '+xb+' '+y0+' L '+xb+' '+(bottom+2)+'"><title>'+esc(p.id.slice(0,8))+': not via '+esc(p.route.not_via.join(', '))+'</title></path>'; offers+=chip((xa+xb)/2, bottom+112, 'second path wanted, through a third place · '+usd(p.escrow)+' at '+usd(p.premium_per_gb)+'/GB', 'offer'); }
     });
     // the cards
     var cards='';
