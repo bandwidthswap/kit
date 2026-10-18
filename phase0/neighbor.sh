@@ -147,9 +147,11 @@ cat > /usr/local/bin/bwkit-fetch <<'EOC'
 # the metered interface on both ends. The LAN stays reachable meanwhile (the Mint, the other nodes); afterwards the
 # exit node is dropped so the house's own traffic goes its own way for the rest of the hour.
 url="\$1"; exit_node="\$2"
-tailscale set --exit-node="\$exit_node" --exit-node-allow-lan-access=true || exit 1
-curl -s -o /dev/null --max-time 900 "\$url" && logger -t bwkit-fetch "fetched \$url through the neighbor"
+tailscale set --exit-node="\$exit_node" --exit-node-allow-lan-access=true || { logger -t bwkit-fetch "purchase skipped: could not set the exit node \$exit_node"; exit 1; }
+out="\$(curl -s -o /dev/null --max-time 900 -w '%{http_code} %{size_download} %{time_total}' "\$url")"; rc=\$?
 tailscale set --exit-node=
+set -- \$out
+if [ "\$rc" = 0 ] && [ "\$1" = 200 ] && [ "\${2:-0}" -gt 0 ]; then logger -t bwkit-fetch "purchase: \$2 bytes in \$3 s through \$exit_node"; else logger -t bwkit-fetch "purchase failed: curl \$rc, http \${1:-?}, \${2:-0} bytes"; exit 1; fi
 EOC
 chmod 755 /usr/local/bin/bwkit-fetch
 cat > /etc/systemd/system/bwkit-fetch.service <<EOC
