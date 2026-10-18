@@ -172,7 +172,8 @@ a{color:var(--accent)}
     var hours={}; X.S.forEach(function(s){ var w=Math.floor(s.t_first/H)*H; (hours[w]=hours[w]||[]).push(s); });
     var committed={}; X.C.forEach(function(c){ committed[c.window]=c; });
     var cur=Math.floor(now/H)*H;
-    Object.keys(hours).map(Number).sort().forEach(function(w){ if(w<cur && !committed[w] && now-w>H+300) items.push(['bad','The '+tstamp(w)+' hour has '+hours[w].length+' settlement'+(hours[w].length===1?'':'s')+' and no commitment.']); });
+    var firstC=X.C.length?Math.min.apply(null, X.C.map(function(c){ return c.window; })):Infinity;   // hours before the Mint began committing are not missing anything
+    Object.keys(hours).map(Number).sort().forEach(function(w){ if(w>=firstC && w<cur && !committed[w] && now-w>H+300) items.push(['bad','The '+tstamp(w)+' hour has '+hours[w].length+' settlement'+(hours[w].length===1?'':'s')+' and no commitment.']); });
     X.pending.forEach(function(p){ if(!p.ack && now-p.r.received_at>600) items.push(['warn','A receipt from '+esc(p.r.from)+' for the '+tstamp(p.r.receipt.t_first)+' window has waited '+ago(p.r.received_at, now).replace(' ago','')+' for the hop\'s countersignature.']); });
     if(X.R.length && now-X.R[X.R.length-1].received_at>2*H) items.push(['warn','No receipt for '+ago(X.R[X.R.length-1].received_at, now).replace(' ago','')+'; one is due at the top of every hour.']);
     if(st.last_report_at!=null && now-st.last_report_at>600) items.push(['warn','The public status was last posted '+ago(st.last_report_at, now)+'.']);
@@ -250,9 +251,7 @@ a{color:var(--accent)}
       var closed = p.deadline<now || (p.windows && paid.windows>=p.windows);
       return '<tr><td class="m">'+p.id.slice(0,8)+'</td><td>'+esc(p.program)+'</td><td>'+esc(routeName(p.poster))+'</td><td class="w">'+esc(routeName(p.route.from))+' → '+esc(routeName(p.route.to))+(p.route.not_via&&p.route.not_via.length?' <span class="m">not via '+esc(p.route.not_via.map(routeName).join(', '))+'</span>':'')+'</td><td class="n">'+(p.min_bytes?bytes(p.min_bytes):'any')+'</td><td class="n">'+usd(p.premium_per_gb)+'/GB</td><td class="n">'+usd(p.escrow)+'</td><td class="n">'+paid.windows+' / '+p.windows+'</td><td class="n">'+usd(paid.premium)+(paid.refund?' <span class="m">(−'+usd(paid.refund)+')</span>':'')+'</td><td><span class="st '+(closed?'closed':'open')+'">'+(closed?'closed':'open')+'</span></td><td class="m">'+tstamp(p.posted_at)+' → '+tstamp(p.deadline)+'</td></tr>';
     });
-    var openFirst={}; P.forEach(function(p){ if(p.program==='first_link'&&p.deadline>=now){ var k=p.route.to; openFirst[k]=(openFirst[k]||0)+1; } });
-    var warn=Object.keys(openFirst).filter(function(k){ return openFirst[k]>1; }).map(function(k){ return openFirst[k]+' open first-link offers for '+esc(routeName(k))+' (the rule should top up one standing offer)'; });
-    return '<h2>Purchases <small>'+P.length+' posted</small></h2>'+(warn.length?'<div class="err">'+warn.join('; ')+'</div>':'')+'<div class="tbl"><table><thead><tr><th>id</th><th>program</th><th>poster</th><th>route</th><th class="n">min / window</th><th class="n">premium</th><th class="n">escrow</th><th class="n">windows</th><th class="n">premium paid</th><th></th><th>posted → deadline</th></tr></thead><tbody>'+rows.join('')+'</tbody></table></div>';
+    return '<h2>Purchases <small>'+P.length+' posted</small></h2>'+'<div class="tbl"><table><thead><tr><th>id</th><th>program</th><th>poster</th><th>route</th><th class="n">min / window</th><th class="n">premium</th><th class="n">escrow</th><th class="n">windows</th><th class="n">premium paid</th><th></th><th>posted → deadline</th></tr></thead><tbody>'+rows.join('')+'</tbody></table></div>';
   }
 
   function stewardCard(X, now){
