@@ -9,6 +9,7 @@ The code for the Phase 0 lab: three Raspberry Pi 3 B nodes on a home LAN that ke
 | `install.sh` | Installs `bwkit` on one node: `sudo ./install.sh payer\|hop\|mint` |
 | `systemd/` | The hop's and Mint's service, the payer's hourly timer, the Mint's status timer (every two minutes). |
 | `phase0/provision.sh` | The whole lab from the Mac over SSH: upgrade, chrony, WireGuard, logs to RAM, bwkit; `status` installs the status reporter on `bw-mint`. |
+| `phase0/neighbor.sh`, `phase0/hub.sh`, `phase0/NEIGHBOR.md` | A fourth node at a neighbor's house, the first operated by someone else: provisioned on the house LAN, meeting the house at a small rendezvous host because neither house can open a port, then carried next door. `NEIGHBOR.md` is the whole procedure. |
 | `phase0/dispute-test.sh [hop\|payer]` | The dispute tests from the Mac: an agreeing window, then one where one side's counters restart mid-window. `hop` (the default) is the hop under-claiming, `payer` the hop over-claiming; the Mint settles both at the smaller count. |
 | `phase0/clock-test.sh` | The clock rule from the Mac: `bw-forest`'s clock stepped 10 s ahead, a receipt the hop declines, chrony restored, a receipt that settles. |
 | `sim/` | A deterministic simulator of the protocol's money over scenarios (the bench, the street, the cabin, Earth–Moon, Earth–Mars–Jupiter) and attacks (a wash trader, a monopolist's second key, an under-remitting Mint), with the paper's ambiguities listed. `python3 -m sim scenarios/street.toml`; see `sim/README.md`. |
