@@ -1,3 +1,5 @@
+// This file is the Bandwidth Swap verifier as the kit carries it (kit: dashboard/bsp.js); the two copies must stay
+// identical, and tools/check-vectors.mjs fails when they differ. Edit the kit's copy and copy it here.
 /* bsp.js: the commitment half of the Bandwidth Swap Protocol (pilot profile 1), checked in the browser.
 
    This is the second implementation. The reference is bwkit.py in github.com/bandwidthswap/kit
