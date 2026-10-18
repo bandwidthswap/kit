@@ -134,6 +134,8 @@ DASHBOARD_PATHS = ("/usr/local/share/bwkit/dashboard.html",   # the node's own p
 DECLINE_WORDS = ("clock", "patience", "since", "domain", "profile", "replay", "route")   # 409 reasons, the word before the colon
 TOKEN_RE = re.compile(r"^[a-z0-9-]{1,32}$")   # a medium or range class
 HTTP_TIMEOUT_S = 10
+MINT_INFO_S = (600, 60)                 # a hop or payer re-reads its Mint's name and NYM this often: after an answer, after none
+MINT_INFO_TIMEOUT_S = 2                 # and waits this long for it, so its own /status is not held up by a Mint that is away
 HOP_FLUSH_DELAY_S = 5                   # the hop sends its own copy of an ack this long after answering the payer
 FLUSH_EVERY_S = 300                     # and retries whatever is left in its outbox this often
 MAX_BODY = 1 << 20
@@ -1607,6 +1609,7 @@ class Node:
         short = nbytes - r["bytes"] > max(link["min_bytes"], link["margin"] * nbytes)
         with self.lock:
             self.commit_sample(r["t_last"], meter)
+            self.append("receipts.jsonl", env)        # the payer's receipt as it came, beside our ack: both counts, for our own page
             self.append("acks.jsonl", ack)
             self.outbox_put(ack)
             ps = self.note_short(signer, short, now)
@@ -2204,6 +2207,7 @@ class Node:
         else:
             st["sample"] = self.state().get("sample")
             st["outbox"] = len(os.listdir(self.path("outbox")))
+            st["mint_name"] = self.mint_info()["name"]
             if self.role == "hop":
                 st["link"] = self.my_link()
                 st["patience"] = self.patience_state()
@@ -2412,6 +2416,50 @@ class Node:
         except (SystemExit, ValueError, OSError):
             return None
 
+    # a hop's and a payer's view of its Mint
+
+    def outbox_list(self):
+        """GET /outbox: what waits for the Mint, oldest first: [{file, kind, t}], t the window's end the record is for."""
+        out = []
+        for name in sorted(os.listdir(self.path("outbox"))):
+            parts = name.split("-")
+            out.append({"file": name, "kind": parts[2] if len(parts) > 2 else None, "t": int(parts[0]) if parts and parts[0].isdigit() else None})
+        return out
+
+    def mint_url(self):
+        return (self.config.get("mint") or "").rstrip("/") or None
+
+    def mint_info(self, now=None):
+        """The Mint's name and NYM, read from its /status now and then (MINT_INFO_S) and remembered; `mint_name` in the
+        config stands in for the name. {name, nym, at, ok}; name None until the Mint has answered once."""
+        now = now if now is not None else time.time()
+        info = getattr(self, "_mint_info", None)
+        if info and now - info["at"] < MINT_INFO_S[0 if info["ok"] else 1]:
+            return info
+        info = {"name": self.config.get("mint_name") or (info["name"] if info else None), "nym": info["nym"] if info else None, "at": now, "ok": False}
+        if self.mint_url():
+            try:
+                status, text = http_get(self.mint_url() + "/status", timeout=MINT_INFO_TIMEOUT_S)
+                st = json.loads(text)
+                info.update({"name": self.config.get("mint_name") or st.get("name"), "nym": st.get("nym"), "ok": True})
+            except (urlerror.URLError, socket.timeout, OSError, ValueError, KeyError):
+                pass
+        self._mint_info = info
+        return info
+
+    def proxy_get(self, path):
+        """GET a path of this node's Mint for its own page (/mint/...): (status, body bytes, content type). Raises OSError
+        when the Mint does not answer. The Mint's bytes pass through untouched: a proof's floats are its own."""
+        url = self.mint_url()
+        if not url:
+            raise OSError("no Mint configured")
+        req = urlrequest.Request(url + path, headers={"User-Agent": USER_AGENT})
+        try:
+            with urlrequest.urlopen(req, timeout=HTTP_TIMEOUT_S) as resp:
+                return resp.status, resp.read(), resp.headers.get("Content-Type") or "application/json"
+        except urlerror.HTTPError as e:
+            return e.code, e.read(), e.headers.get("Content-Type") or "application/json"
+
     # the server
 
     def serve(self, host="0.0.0.0", port=None, block=True):
@@ -2472,8 +2520,22 @@ class Node:
                     return self.raw(html.encode("utf-8"), "text/html; charset=utf-8",
                                     "%s-snapshot-%s.html" % (node.name, time.strftime("%Y%m%dT%H%M")) if url.path == "/snapshot" else None)
                 if url.path == "/status":
+                    if node.role != "mint":
+                        node.mint_info()                     # the Mint's name, read outside the lock when it is time
                     with node.lock:
                         return self.reply(200, node.status_dict())
+                if node.role != "mint":
+                    if url.path in ("/acks", "/receipts") or (url.path == "/links" and node.role == "hop"):
+                        return self.raw(node.file_bytes(url.path[1:] + ".jsonl"), "application/x-ndjson")
+                    if url.path == "/outbox":
+                        return self.reply(200, node.outbox_list())
+                    if url.path in ("/mint/ledger", "/mint/commitments", "/mint/links", "/mint/proof", "/mint/map") or (url.path == "/map" and not node.map_path_exists()):
+                        path = url.path[5:] if url.path.startswith("/mint/") else url.path
+                        try:
+                            status, data, ctype = node.proxy_get(path + ("?" + url.query if url.query else ""))
+                        except (urlerror.URLError, socket.timeout, OSError, ValueError):
+                            return self.reply(502, {"error": "the Mint did not answer"})   # never its address
+                        return self.raw(data, ctype, status=status)
                 if url.path == "/ledger" and node.role == "mint":
                     since = urlparse.parse_qs(url.query).get("since", [""])[0]
                     if since and not since.isdigit():

@@ -1806,6 +1806,93 @@ class LedgerSince(unittest.TestCase):
         self.assertEqual(lab.mint.ledger_text(since=None), whole.encode())
 
 
+class NodeEndpoints(unittest.TestCase):
+    """A hop's and a payer's own records served for their pages, and their Mint proxied on the same origin."""
+
+    def setUp(self):
+        self.lab = Lab()
+        self.payer_srv = self.lab.payer.serve("127.0.0.1", 0, block=False)
+        self.payer_url = "http://127.0.0.1:%d" % self.payer_srv.server_address[1]
+
+    def tearDown(self):
+        self.payer_srv.shutdown()
+        self.payer_srv.server_close()
+        self.lab.close()
+
+    def test_the_hop_keeps_the_receipts_it_countersigns_and_both_serve_their_records(self):
+        lab = self.lab
+        out = lab.hour(100_000_000, 120_000_000)
+        lab.hop.flush()
+        hop_r = lab.hop.read_lines("receipts.jsonl")
+        self.assertEqual([r["sig"] for r in hop_r], [out["receipt"]["sig"]])               # the payer's receipt as it came
+        self.assertEqual(hop_r[0]["receipt"]["bytes"], 100_000_000)
+        self.assertEqual(lab.hop.read_lines("acks.jsonl")[0]["receipt"]["bytes"], 120_000_000)
+        self.assertEqual([(r["receipt"]["bytes"], a["receipt"]["bytes"]) for r, a in lab.hop.own_pairs()], [(100_000_000, 120_000_000)])
+        for url, role in ((lab.hop_url, "hop"), (self.payer_url, "payer")):
+            for path, name in (("/receipts", "receipts.jsonl"), ("/acks", "acks.jsonl"), ("/purchases", "purchases.jsonl")):
+                status, headers, body = get_raw(url + path)
+                self.assertEqual((status, headers["Content-Type"]), (200, "application/x-ndjson"), (role, path))
+                self.assertEqual(body, open(getattr(lab, role).path(name)).read() if os.path.exists(getattr(lab, role).path(name)) else "", (role, path))
+            self.assertEqual(json.loads(bwkit.http_get(url + "/outbox")[1]), [])
+        self.assertEqual(get_raw(lab.hop_url + "/links")[0:1], (200,))
+        self.assertEqual(bwkit.http_get(lab.hop_url + "/links")[1], "")                  # JSONL: nothing announced yet
+        lab.hop.config["mint_nym"] = lab.mint.nym
+        rec, h = lab.hop.announce(now=lab.t + 1)
+        self.assertEqual(json.loads(bwkit.http_get(lab.hop_url + "/links")[1])["sig"], rec["sig"])
+        with self.assertRaises(bwkit.urlerror.HTTPError) as cm:
+            bwkit.http_get(self.payer_url + "/links")                                     # a payer announces nothing
+        self.assertEqual(cm.exception.code, 404)
+
+    def test_the_outbox_listing(self):
+        lab = self.lab
+        port = lab.mint_srv.server_address[1]
+        lab.mint_srv.shutdown()
+        lab.mint_srv.server_close()
+        lab.hour(5_000_000, 5_000_000)
+        ob = json.loads(bwkit.http_get(self.payer_url + "/outbox")[1])
+        self.assertEqual([(o["kind"], o["t"]) for o in ob], [("receipt", lab.t), ("ack", lab.t)])
+        self.assertEqual(sorted(ob[0]), ["file", "kind", "t"])
+        self.assertEqual(ob[0]["file"], sorted(os.listdir(lab.payer.path("outbox")))[0])
+        self.assertEqual([o["kind"] for o in json.loads(bwkit.http_get(lab.hop_url + "/outbox")[1])], ["ack"])
+        status, _, body = get_raw(self.payer_url + "/mint/ledger")                        # the Mint away: a 502, no address in it
+        self.assertEqual((status, json.loads(body)), (502, {"error": "the Mint did not answer"}))
+        self.assertNotIn("127.0.0.1", body)
+        lab.mint_srv = lab.mint.serve("127.0.0.1", port, block=False)
+
+    def test_the_mint_proxied_on_the_nodes_origin(self):
+        lab = self.lab
+        lab.hour(100_000_000, 100_000_000)
+        time.sleep(1.1)
+        lab.hour(200_000_000, 200_000_000)
+        lab.hop.flush()
+        w = bwkit.commit_hour(sorted(lab.mint.index["settled"].values(), key=lambda s: s["t_first"])[-1])
+        mint_ledger = get_raw(lab.mint_url + "/ledger")
+        t1 = json.loads(mint_ledger[2].splitlines()[3])["t"]
+        for url, role in ((lab.hop_url, "hop"), (self.payer_url, "payer")):
+            for path in ("/ledger", "/ledger?since=%d" % (t1 + 1), "/commitments", "/links", "/proof?window=%d" % w, "/proof?window=x", "/proof?window=1", "/map"):
+                mine, theirs = get_raw(url + "/mint" + path), get_raw(lab.mint_url + path)
+                self.assertEqual((mine[0], mine[2]), (theirs[0], theirs[2]), (role, path))             # the Mint's bytes and status, untouched
+                self.assertEqual(mine[1]["Content-Type"], theirs[1]["Content-Type"], (role, path))
+            self.assertEqual(get_raw(url + "/mint/ledger?since=%d" % (t1 + 1))[2].count("\n"), 4)
+            self.assertEqual(get_raw(url + "/map")[0], 404)                                                # neither node has a map, nor the Mint
+            self.assertEqual(json.loads(bwkit.http_get(url + "/status")[1])["mint_name"], "bw-mint")
+        self.assertNotIn("mint_name", json.loads(bwkit.http_get(lab.mint_url + "/status")[1]))
+        # a map on the Mint reaches a node without one through /map
+        map_path = os.path.join(lab.root, "map.json")
+        with open(map_path, "w") as f:
+            json.dump({"domains": {}, "places": {"house": {"name": "the house", "domain": "earth"}}, "nodes": {"bw-house": "house"}}, f)
+        lab.mint.config["map"] = map_path
+        self.assertEqual(json.loads(bwkit.http_get(self.payer_url + "/map")[1])["nodes"], {"bw-house": "house"})
+        self.assertEqual(json.loads(bwkit.http_get(self.payer_url + "/mint/map")[1])["nodes"], {"bw-house": "house"})
+        # the Mint's name is remembered, and a configured one stands in
+        lab.payer.config["mint_name"] = "the-mint-next-door"
+        lab.payer._mint_info = None
+        self.assertEqual(json.loads(bwkit.http_get(self.payer_url + "/status")[1])["mint_name"], "the-mint-next-door")
+        fresh = bwkit.Node(os.path.join(lab.root, "fresh"), {"role": "payer", "name": "x", "iface": "file:" + lab.payer_meter, "mint": "http://127.0.0.1:1"})
+        fresh.keygen()
+        self.assertEqual(fresh.status_dict()["mint_name"], None)                                            # a Mint that never answered
+
+
 class Served(unittest.TestCase):
     """What the three roles serve over GET: open to every origin (CORS), and never an address."""
 
@@ -1951,6 +2038,10 @@ class Health(unittest.TestCase):
                 "raise the margin in the link's announcement or mend the path.")
         self.assertEqual(lab.mint.health({}, lab.t + 5)["items"], [{"level": "warn", "text": text, "since": None}])
         self.assertEqual(lab.payer.health({}, lab.t + 5)["items"], [{"level": "warn", "text": text, "since": None}])   # from its own receipts and acks
+        lab.hop.flush()                                                                   # its own copies of the acks, sent 5 s later otherwise
+        self.assertEqual(lab.hop.health({}, lab.t + 5)["items"],                         # and the hop's, against its own margin; it counted the payer short too
+                         [{"level": "warn", "text": text, "since": None},
+                          {"level": "info", "text": "Payer bw-house has 3 windows short beyond the margin against a patience of 0.", "since": None}])
         self.assertEqual(json.loads(bwkit.http_get(self.payer_url + "/status")[1])["health"]["items"][0]["text"], text)
 
     def test_more_than_one_open_first_link_offer_for_a_place(self):
@@ -2048,10 +2139,11 @@ class Dashboard(unittest.TestCase):
         view = json.loads(bwkit.http_get(lab.mint_url + "/steward")[1])
         self.assertEqual((view["nym"], view["last_run"], view["skipped"] is not None, "adjusted" in view), (st.nym, lab.t + 300, True, True))
         self.assertIn("the-cabin", json.loads(bwkit.http_get(lab.mint_url + "/map")[1])["places"])
-        for path in ("/steward", "/map", "/ledger", "/commitments"):
+        for path in ("/steward", "/ledger", "/commitments"):
             with self.assertRaises(bwkit.urlerror.HTTPError) as cm:
                 bwkit.http_get(lab.hop_url + path)
             self.assertEqual(cm.exception.code, 404, path)
+        self.assertIn("the-cabin", json.loads(bwkit.http_get(lab.hop_url + "/map")[1])["places"])    # the hop has no map: its Mint's
         self.assertEqual(bwkit.http_post(self.payer_url + "/receipt", {"kind": "receipt"})[0], 404)    # a payer takes no records
         # a successful report leaves last_report_at behind
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
