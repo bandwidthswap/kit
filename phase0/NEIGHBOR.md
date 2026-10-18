@@ -2,14 +2,14 @@
 
 The first node that is not on the bench, and the first operated by someone who is not the authors. It is the hop: the neighbor's Pi sells the neighbor's internet connection to the house, which buys a fixed download from it every hour, and the receipts settle on the house's Mint. The paper's success criterion (Section 9) is a month of that, with at least one dispute resolved from the receipts alone.
 
-Everything is set up while the Pi is still on the house LAN. When it is carried next door it needs only power and the neighbor's Wi-Fi, because it makes its own connection out to a rendezvous host and the house does the same: neither house can open a port (Starlink's carrier-grade NAT has no inbound ports), so the two nodes meet on a small public machine that forwards between them and does nothing else.
+Everything is set up while the Pi is still on the house LAN. When it is carried next door it needs only power and the neighbor's Wi-Fi. Neither house can open a port (Starlink's carrier-grade NAT has no inbound ports), so the nodes meet on a Tailscale tailnet: `bw-house`, `bw-neighbor` and `bw-mint` each join it, every one of them only connects outward, and Tailscale's relays carry the packets when no direct path can be punched. Underneath it is WireGuard; the kit meters `tailscale0` the way it meters `wg0` on the bench.
 
 ## What it takes
 
 | Thing | Notes |
 |---|---|
 | A Raspberry Pi 3 Model B or newer, a microSD card of 16 GB or more (A1 or A2), a 2.5 A supply | The same as the bench. A phone charger under 2 A gives random reboots. |
-| A rendezvous host | The smallest public virtual machine you can rent, Debian or Ubuntu, with a fixed address: a few dollars a month. `phase0/hub.sh prep` turns it into a WireGuard hub at `10.77.2.1` that forwards between its peers. It is a WireGuard peer, so it can read what crosses it, which is your hourly download and the receipts, which are signed; it is your machine. Open UDP 51820 inbound on it if it has a firewall. The alternative with no machine to rent is Tailscale on the three nodes, which does the same meeting through its own relays; the kit's metered interface would then be `tailscale0` and the scripts here would need that change. |
+| A Tailscale account | Free for personal use. From its admin console: a pre-authentication key (Settings, Keys; a one-off key is best, and the script sends it to each node once on stdin and never prints it), then after prep, approve `bw-neighbor` as an exit node (Machines, its row, Edit route settings) and disable key expiry on the three nodes so they stay joined for the month. Tailscale coordinates the connection and relays packets when it must; it cannot read them, since the WireGuard keys are made on the nodes. The alternative with no third party is a rented machine running plain WireGuard as a rendezvous host, which an earlier version of this procedure used; the kit's git history has it. |
 | The neighbor's Wi-Fi | The Pi 3 is 2.4 GHz only. Give `neighbor.sh` the network's name and password at prep time and it writes a profile that connects when the network is seen. Nothing on the neighbor's side is configured or opened; the Pi only makes one outbound connection. |
 | Their agreement | They hold the Pi and its keys. The house keeps SSH access through the tunnel for maintenance, and they can end that by removing the key, or end everything by unplugging it. |
 
@@ -34,30 +34,20 @@ Host bw-neighbor
   User bw
   IdentityFile ~/.ssh/bandwidthswap_ed25519
 Host bw-neighbor-away
-  HostName 10.77.1.2
+  HostName 100.x.y.z
   User bw
   IdentityFile ~/.ssh/bandwidthswap_ed25519
   ProxyJump bw-house
 ```
 
-The first name reaches it on the house LAN; the second reaches it at the neighbor's, through `bw-house` and the tunnel.
-
-## The rendezvous host, once
-
-With the machine rented and reachable as, say, `root@hub.example.net`:
-
-```
-HUB=root@hub.example.net phase0/hub.sh prep
-```
-
-It installs WireGuard, makes the hub's key there, brings up `wg0` at `10.77.2.1` on UDP 51820 with forwarding on, and prints the hub's public key. `neighbor.sh` adds the two peers to it itself.
+The first name reaches it on the house LAN; the second reaches it at the neighbor's, through `bw-house` and the tailnet, once `100.x.y.z` is replaced with the address `neighbor.sh prep` prints for it (or the Mac joins the tailnet itself and the jump is not needed).
 
 ## Provisioning, on the bench
 
-With the hub up and the Pi on the house switch, from the kit's clone:
+With the Pi on the house switch and a pre-authentication key from the Tailscale admin console, from the kit's clone:
 
 ```
-HUB=root@hub.example.net HUB_ENDPOINT=hub.example.net:51820 WIFI_SSID='their network' WIFI_PSK='their password' phase0/neighbor.sh prep
+TS_AUTHKEY='tskey-auth-...' WIFI_SSID='their network' WIFI_PSK='their password' phase0/neighbor.sh prep
 ```
 
 The script does, in order and each step ending with its check:
@@ -66,16 +56,16 @@ The script does, in order and each step ending with its check:
 2. **Time.** chrony from the pool, through the neighbor's own internet once it is there. The bench nodes take time from `bw-house`; this one cannot, so the clock rule of Section 3.5 is tested across two time sources for the first time.
 3. **Logs** in RAM.
 4. **Wi-Fi** profile, if given.
-5. **Tunnel.** Both nodes connect out to the hub with a keepalive every 25 seconds, so the connections survive both routers: `bw-house` on a second interface, `wg1` at `10.77.2.2`, and `bw-neighbor` on `wg0` at `10.77.2.3`. The hub's peer list gets both, with the Mint's LAN address routed to the house, and `bw-house` forwards the neighbor's packets to the Mint behind NAT, so the Mint needs no route back. The neighbor's node forwards and NATs the house's traffic out of its own connection: that is the thing being sold. The path for every byte is house, hub, neighbor, and back.
-6. **Kit.** `bwkit` as the hop, its Mint the house's through the tunnel, NYMs exchanged with `bw-house` and `bw-mint`.
-7. **The house side.** `bw-house`'s payer switches from `bw-forest` on `wg0` to `bw-neighbor` on `wg1` (the bench config is kept as `config.json.bench`; `neighbor.sh bench` puts it back), and a timer buys one download an hour through the tunnel, 100 MB from Cloudflare's speed test by default, so real bytes cross the metered interface. At ten cents a gigabyte that is about a quarter a day.
-8. **Check.** Handshakes at the hub, pings both ways, the hop's status through the tunnel, the neighbor's clock, the Mint's view.
+5. **Tailnet.** Tailscale is installed on `bw-house`, `bw-neighbor` and `bw-mint` (the official installer, fetched over HTTPS) and each joins with the key. `bw-neighbor` turns forwarding on and offers itself as an exit node, which is how it sells its connection: approve that in the admin console. The script prints each node's tailnet address.
+6. **Kit.** `bwkit` as the hop, metering `tailscale0`, its Mint reached at `bw-mint`'s tailnet address, NYMs exchanged with `bw-house` and `bw-mint`.
+7. **The house side.** `bw-house`'s payer switches from `bw-forest` on `wg0` to `bw-neighbor` on `tailscale0` (the bench config is kept as `config.json.bench`; `neighbor.sh bench` puts it back) and keeps talking to the Mint on the LAN, so that traffic is not counted. A timer buys one download an hour, 100 MB from Cloudflare's speed test by default, with `bw-neighbor` set as the exit node for the duration and the LAN still reachable, then drops the exit node again. That is the house buying the neighbor's connection, and the bytes cross `tailscale0` on both ends, where both meters count them. At ten cents a gigabyte it is about a quarter a day.
+8. **Check.** The tailnet as `bw-house` sees it, a ping to the neighbor, the hop's status over the tailnet, the neighbor's clock, the Mint's view.
 
-On the bench both nodes reach the hub over the house's connection, so the whole thing is tested before the Pi leaves the house.
+On the bench all three nodes reach the tailnet over the house's connection, so the whole thing is tested before the Pi leaves the house. The one thing that cannot be tested there is the neighbor's Wi-Fi.
 
 ## The move
 
-Unplug it, carry it over, plug in power, and let it find the Wi-Fi. Within a minute the keepalive brings the tunnel up through the hub. From the Mac:
+Unplug it, carry it over, plug in power, and let it find the Wi-Fi. Within a minute it is back on the tailnet. From the Mac:
 
 ```
 phase0/neighbor.sh check
@@ -93,4 +83,4 @@ The first receipt comes at the top of the next hour. `sudo -u bwkit bwkit ledger
 
 ## What the neighbor needs to know
 
-The box uses a little of their connection every hour, about the size of a short video, and nothing else. It makes one outbound connection to a machine the house rents and listens for nothing from the internet. The house can log into it through that connection to maintain it; they can stop that by removing the house's key, and stop everything by unplugging it. The receipts it signs are its own, kept on the box, and are the proof of what it carried and what it is owed.
+The box uses a little of their connection every hour, about the size of a short video, and nothing else. It only connects outward, to the house's private network, and listens for nothing from the internet. The house can log into it through that connection to maintain it; they can stop that by removing the house's key, and stop everything by unplugging it. The receipts it signs are its own, kept on the box, and are the proof of what it carried and what it is owed.

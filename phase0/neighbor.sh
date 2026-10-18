@@ -1,35 +1,35 @@
 #!/bin/sh
 # A fourth node at a neighbor's house: bw-neighbor, the hop that sells its own connection to the house.
 # Run from the Mac over SSH while bw-neighbor is still on the house LAN (bw-neighbor.local), so that
-# when it is carried next door it needs only power and a network. See phase0/NEIGHBOR.md.
+# when it is carried next door it needs only power and the neighbor's Wi-Fi. See phase0/NEIGHBOR.md.
 #
-# Neither house can open a port (Starlink's carrier-grade NAT), so the two nodes meet at a rendezvous host:
-# a small public machine running WireGuard (phase0/hub.sh), which bw-house and bw-neighbor each connect out to.
-# The hub forwards between them and nothing else; the Mint stays on the house LAN, reached through bw-house.
+# Neither house can open a port (Starlink's carrier-grade NAT), so the nodes meet on a Tailscale tailnet:
+# bw-house, bw-neighbor and bw-mint each join it, every one of them connects outward, and Tailscale's
+# relays carry the packets when no direct path can be punched. The metered interface is tailscale0 on
+# both ends. The house buys the neighbor's connection by using bw-neighbor as its exit node for one
+# download an hour.
 #
-#   HUB=user@host HUB_ENDPOINT=host:51820 phase0/neighbor.sh prep
-#                       everything, in order: upgrade, time, logs, wifi, tunnel (both nodes and the hub's peer list), kit, the house side
-#   phase0/neighbor.sh check    after the move: handshakes, pings, the hop's status through the tunnel, the Mint's view
+#   TS_AUTHKEY=tskey-auth-... phase0/neighbor.sh prep
+#                       everything, in order: upgrade, time, logs, wifi, tailnet (three nodes), kit, the house side, check
+#   phase0/neighbor.sh check    after the move: tailnet status, ping, the hop's status over the tailnet, the Mint's view
 #   phase0/neighbor.sh bench    put bw-house's payer back on bw-forest over wg0 (the bench as it was)
 #
 # Environment:
-#   HUB              required for prep: the SSH target of the rendezvous host, e.g. root@hub.example.net (hub.sh prep has run there)
-#   HUB_ENDPOINT     required for prep: the hub's public address and WireGuard port, e.g. hub.example.net:51820
+#   TS_AUTHKEY       required for prep: a Tailscale pre-authentication key from the admin console (one-off keys are best;
+#                    it goes to each node once on stdin and is never echoed). Disable key expiry for the three nodes afterwards.
 #   WIFI_SSID / WIFI_PSK   the neighbor's Wi-Fi, written as a NetworkManager profile that connects when the network is seen
 #   FETCH_URL        the house's hourly purchase from the neighbor (default: 100 MB from Cloudflare's speed test)
-#   MINT_LAN         the Mint's LAN address (default 192.168.0.61)
+#   MINT_LAN         the Mint's LAN address, which bw-house keeps using (default 192.168.0.61)
 #
-# Tunnel addresses: hub 10.77.2.1, bw-house 10.77.2.2 (interface wg1), bw-neighbor 10.77.2.3 (interface wg0).
-# Nothing here prints or copies a private key. WireGuard keys are made on each machine and only public halves cross;
-# the node's NYM key is made by install.sh and stays on the node, which is the neighbor's. The Mac keeps SSH access
-# through the tunnel (phase0/NEIGHBOR.md). The hub is a WireGuard peer, so it can read what crosses it; it is yours.
+# Nothing here prints or copies a private key. Tailscale's keys are made on each node; the node's NYM key is made by
+# install.sh and stays on the node, which is the neighbor's. The Mac keeps SSH access through bw-house (phase0/NEIGHBOR.md).
 set -eu
 kit="$(cd "$(dirname "$0")/.." && pwd)"
 SSH="ssh -o ConnectTimeout=8 -o BatchMode=yes"
 N="bw-neighbor"
 MINT_LAN="${MINT_LAN:-192.168.0.61}"
 FETCH_URL="${FETCH_URL:-https://speed.cloudflare.com/__down?bytes=100000000}"
-NET="10.77.2.0/24"; HUB_WG="10.77.2.1"; HOUSE_WG1="10.77.2.2"; NEIGH_WG1="10.77.2.3"
+ts_ip() { run "$1" 'tailscale ip -4' | head -1; }
 
 say() { printf '\n== %s\n' "$*"; }
 run() { h="$1"; shift; $SSH "$h" "$@"; }
@@ -71,84 +71,34 @@ step_wifi() {
   printf '%s\n%s\n' "$WIFI_SSID" "${WIFI_PSK:-}" | $SSH $N 'read ssid; read psk; sudo nmcli connection add type wifi con-name neighbor ifname wlan0 ssid "$ssid" wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$psk" connection.autoconnect yes >/dev/null && echo "wifi profile written for $ssid"'
 }
 
-step_tunnel() {
-  [ -n "${HUB:-}" ] && [ -n "${HUB_ENDPOINT:-}" ] || { echo "HUB=user@host and HUB_ENDPOINT=host:port are required (phase0/hub.sh prep must have run on the hub)"; exit 2; }
-  say "tunnel: bw-house wg1 ($HOUSE_WG1) and $N wg0 ($NEIGH_WG1), both out to the hub $HUB_ENDPOINT ($HUB_WG)"
-  for h in bw-house $N; do
-    sudo_sh "$h" <<EOS
-set -e
-DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 install -y -q wireguard-tools iptables >/dev/null
-install -d -m 0700 /etc/wireguard
-k=/etc/wireguard/\$( [ "\$(hostname)" = bw-house ] && echo wg1 || echo wg0 ).key
-if [ ! -s "\$k" ]; then (umask 077; wg genkey > "\$k"); fi
-wg pubkey < "\$k" > "\${k%.key}.pub"
-echo "\$(hostname): key present, public \$(cat "\${k%.key}.pub")"
-EOS
+step_tailnet() {
+  [ -n "${TS_AUTHKEY:-}" ] || { echo "TS_AUTHKEY=tskey-auth-... is required (a pre-authentication key from the Tailscale admin console)"; exit 2; }
+  say "tailnet: bw-house, $N and bw-mint join; $N offers itself as an exit node"
+  for h in bw-house $N bw-mint; do
+    run "$h" 'command -v tailscale >/dev/null || (curl -fsSL https://tailscale.com/install.sh | sudo sh >/dev/null); tailscale version | head -1'
   done
-  hub_pub="$($SSH "$HUB" 'sudo cat /etc/wireguard/wg0.pub')"
-  house_pub="$(run bw-house 'sudo cat /etc/wireguard/wg1.pub')"
-  neigh_pub="$(run $N 'sudo cat /etc/wireguard/wg0.pub')"
-  say "the hub's peer list: bw-house (and the Mint through it) and $N"
-  "$kit/phase0/hub.sh" peer bw-house "$house_pub" "$HOUSE_WG1/32, $MINT_LAN/32"
-  "$kit/phase0/hub.sh" peer $N "$neigh_pub" "$NEIGH_WG1/32"
-  # the house: out to the hub; the whole tunnel network routed through it; the neighbor's packets forwarded to the Mint behind NAT
-  sudo_sh bw-house <<EOS
+  sudo_sh $N <<'EOS'
 set -e
-umask 077
-lan="\$(ip route show default | awk '{print \$5; exit}')"
-cat > /etc/wireguard/wg1.conf <<EOC
-# Bandwidth Swap: the neighbor's tunnel, via the rendezvous host. Private key in /etc/wireguard/wg1.key.
-[Interface]
-Address = $HOUSE_WG1/24
-PostUp = wg set %i private-key /etc/wireguard/wg1.key
-PostUp = sysctl -q -w net.ipv4.ip_forward=1
-PostUp = iptables -t nat -A POSTROUTING -s $NET -o \$lan -j MASQUERADE
-PostDown = iptables -t nat -D POSTROUTING -s $NET -o \$lan -j MASQUERADE
-
-[Peer]
-PublicKey = $hub_pub
-AllowedIPs = $NET
-Endpoint = $HUB_ENDPOINT
-PersistentKeepalive = 25
-EOC
-systemctl enable -q wg-quick@wg1
-systemctl restart wg-quick@wg1
-echo "bw-house: wg1 $HOUSE_WG1 -> $HUB_ENDPOINT, forwarding $NET to the LAN via \$lan"
+printf 'net.ipv4.ip_forward = 1\nnet.ipv6.conf.all.forwarding = 1\n' > /etc/sysctl.d/99-bwkit-exit.conf
+sysctl -q -p /etc/sysctl.d/99-bwkit-exit.conf
+echo "$(hostname): forwarding on, for exit-node service"
 EOS
-  # the neighbor: out to the hub, the Mint routed through the tunnel, and its own connection shared with the house
-  sudo_sh $N <<EOS
-set -e
-umask 077
-cat > /etc/wireguard/wg0.conf <<'EOC'
-# Bandwidth Swap: the tunnel to the house, via the rendezvous host. Private key in /etc/wireguard/wg0.key. Outbound only.
-[Interface]
-Address = $NEIGH_WG1/24
-PostUp = wg set %i private-key /etc/wireguard/wg0.key
-PostUp = sysctl -q -w net.ipv4.ip_forward=1
-PostUp = sh -c 'iptables -t nat -A POSTROUTING -s $NET -o "\$(ip route show default | awk "{print \\\$5; exit}")" -j MASQUERADE'
-PostDown = sh -c 'iptables -t nat -D POSTROUTING -s $NET -o "\$(ip route show default | awk "{print \\\$5; exit}")" -j MASQUERADE'
-
-[Peer]
-PublicKey = $hub_pub
-AllowedIPs = $NET, $MINT_LAN/32
-Endpoint = $HUB_ENDPOINT
-PersistentKeepalive = 25
-EOC
-systemctl enable -q wg-quick@wg0
-systemctl restart wg-quick@wg0
-echo "$N: wg0 $NEIGH_WG1 -> $HUB_ENDPOINT, Mint $MINT_LAN routed through the tunnel"
-EOS
-  sleep 5
-  run bw-house "ping -c 3 -W 3 $HUB_WG | tail -1; ping -c 3 -W 3 $NEIGH_WG1 | tail -1"
-  run $N "ping -c 3 -W 3 $HOUSE_WG1 | tail -1; ping -c 2 -W 3 $MINT_LAN | tail -1"
+  for h in bw-house bw-mint; do
+    printf '%s\n' "$TS_AUTHKEY" | $SSH "$h" 'read k; sudo tailscale up --authkey "$k" --hostname "$(hostname)" >/dev/null && echo "$(hostname): on the tailnet at $(tailscale ip -4)"'
+  done
+  printf '%s\n' "$TS_AUTHKEY" | $SSH $N 'read k; sudo tailscale up --authkey "$k" --hostname "$(hostname)" --advertise-exit-node >/dev/null && echo "$(hostname): on the tailnet at $(tailscale ip -4), exit node offered (approve it in the admin console)"'
+  sleep 3
+  run bw-house "ping -c 3 -W 3 $(ts_ip $N) | tail -1"
+  run $N "ping -c 3 -W 3 $(ts_ip bw-mint) | tail -1"
 }
 
 step_kit() {
   say "bwkit on $N as the hop; NYMs exchanged with bw-house and bw-mint"
   COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py install.sh systemd | $SSH $N 'mkdir -p ~/kit && tar -C ~/kit -xf -'
   run $N 'cd ~/kit && sudo ./install.sh hop'
+  mint_ts="$(ts_ip bw-mint)"
   run $N "sudo -u bwkit python3 - <<'PY'
-import json; p='/etc/bwkit/config.json'; c=json.load(open(p)); c['mint']='http://$MINT_LAN:8710'; c['iface']='wg0'; json.dump(c,open(p,'w'),indent=2); print('hop config:',c)
+import json; p='/etc/bwkit/config.json'; c=json.load(open(p)); c['mint']='http://$mint_ts:8710'; c['iface']='tailscale0'; json.dump(c,open(p,'w'),indent=2); print('hop config:',c)
 PY"
   neigh_nym="$(run $N 'sudo -u bwkit bwkit nym')"
   house_nym="$(run bw-house 'sudo -u bwkit bwkit nym')"
@@ -158,18 +108,22 @@ PY"
 }
 
 step_house() {
-  say "the house buys from the neighbor: payer on wg1, hop $N, an hourly purchase"
+  say "the house buys from the neighbor: payer on tailscale0, hop $N, an hourly purchase through the exit node"
+  neigh_ts="$(ts_ip $N)"
   run bw-house "sudo cp -n /etc/bwkit/config.json /etc/bwkit/config.json.bench; sudo -u bwkit python3 - <<'PY'
-import json; p='/etc/bwkit/config.json'; c=json.load(open(p)); c['hop_name']='$N'; c['hop_url']='http://$NEIGH_WG1:8710'; c['iface']='wg1'; json.dump(c,open(p,'w'),indent=2); print('payer config:',c)
+import json; p='/etc/bwkit/config.json'; c=json.load(open(p)); c['hop_name']='$N'; c['hop_url']='http://$neigh_ts:8710'; c['iface']='tailscale0'; json.dump(c,open(p,'w'),indent=2); print('payer config:',c)
 PY"
   sudo_sh bw-house <<EOS
 set -e
 cat > /usr/local/bin/bwkit-fetch <<'EOC'
 #!/bin/sh
-# The house's hourly purchase from the neighbor: one download routed through the tunnel, so real bytes cross the metered interface.
-url="\$1"; host="\$(printf '%s' "\$url" | sed -E 's|^[a-z]+://([^/:]+).*|\\1|')"
-for ip in \$(getent ahostsv4 "\$host" | awk '{print \$1}' | sort -u); do ip route replace "\$ip/32" via $NEIGH_WG1 dev wg1; done
+# The house's hourly purchase from the neighbor: one download with bw-neighbor as the exit node, so real bytes cross
+# the metered interface on both ends. The LAN stays reachable meanwhile (the Mint, the other nodes); afterwards the
+# exit node is dropped so the house's own traffic goes its own way for the rest of the hour.
+url="\$1"; exit_node="\$2"
+tailscale set --exit-node="\$exit_node" --exit-node-allow-lan-access=true || exit 1
 curl -s -o /dev/null --max-time 900 "\$url" && logger -t bwkit-fetch "fetched \$url through the neighbor"
+tailscale set --exit-node=
 EOC
 chmod 755 /usr/local/bin/bwkit-fetch
 cat > /etc/systemd/system/bwkit-fetch.service <<EOC
@@ -177,7 +131,7 @@ cat > /etc/systemd/system/bwkit-fetch.service <<EOC
 Description=Bandwidth Swap: the house's hourly purchase from the neighbor
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/bwkit-fetch $FETCH_URL
+ExecStart=/usr/local/bin/bwkit-fetch $FETCH_URL $neigh_ts
 EOC
 cat > /etc/systemd/system/bwkit-fetch.timer <<EOC
 [Unit]
@@ -199,28 +153,28 @@ EOS
 }
 
 step_check() {
-  say "the tunnel, both ends to the hub"
-  run bw-house 'sudo wg show wg1 | grep -E "latest handshake|transfer" | tr -s " "'
-  [ -n "${HUB:-}" ] && $SSH "$HUB" 'wg show wg0 | grep -E "peer|latest handshake" | tr -s " "' || true
-  run bw-house "ping -c 3 -W 3 $NEIGH_WG1 | tail -1"
-  say "the hop, through the tunnel"
-  run bw-house "curl -s --max-time 5 http://$NEIGH_WG1:8710/status || echo 'hop not answering'"
+  say "the tailnet, as bw-house sees it"
+  run bw-house 'tailscale status | head -5'
+  neigh_ts="$(ts_ip $N)"; mint_ts="$(ts_ip bw-mint)"
+  run bw-house "ping -c 3 -W 3 $neigh_ts | tail -1"
+  say "the hop, over the tailnet"
+  run bw-house "curl -s --max-time 5 http://$neigh_ts:8710/status || echo 'hop not answering'"
   say "the neighbor's clock and its path to the Mint"
-  run $N "chronyc tracking | grep -E 'Stratum|System time'; curl -s --max-time 5 http://$MINT_LAN:8710/status | head -c 300; echo"
+  run $N "chronyc tracking | grep -E 'Stratum|System time'; curl -s --max-time 5 http://$mint_ts:8710/status | head -c 300; echo"
   say "the Mint's view"
   run bw-mint 'sudo -u bwkit bwkit status'
 }
 
 step_bench() {
   say "bw-house's payer back on bw-forest over wg0"
-  run bw-house 'sudo cp /etc/bwkit/config.json.bench /etc/bwkit/config.json && sudo systemctl disable -q --now bwkit-fetch.timer; sudo -u bwkit bwkit sample; echo restored'
+  run bw-house 'sudo cp /etc/bwkit/config.json.bench /etc/bwkit/config.json && sudo systemctl disable -q --now bwkit-fetch.timer; sudo tailscale set --exit-node=; sudo -u bwkit bwkit sample; echo restored'
   run bw-forest 'sudo -u bwkit bwkit sample'
 }
 
 case "${1:-}" in
-  prep)  step_upgrade; step_time; step_logs; step_wifi; step_tunnel; step_kit; step_house; step_check ;;
+  prep)  step_upgrade; step_time; step_logs; step_wifi; step_tailnet; step_kit; step_house; step_check ;;
   check) step_check ;;
   bench) step_bench ;;
-  upgrade|time|logs|wifi|tunnel|kit|house) "step_$1" ;;
+  upgrade|time|logs|wifi|tailnet|kit|house) "step_$1" ;;
   *) sed -n '2,20p' "$0"; exit 2 ;;
 esac
