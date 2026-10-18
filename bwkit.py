@@ -119,13 +119,17 @@ PURCHASE_DOMAIN = b"bandwidthswap/purchase/v1\n"   # prefixed to every signed pu
 PURCHASE_FIELDS = ("kind", "proto", "id", "poster", "program", "route", "min_bytes", "premium_per_gb", "windows", "deadline",
                    "proving", "escrow", "unit", "posted_at", "matches", "sig")
 PROGRAMS = ("payer", "match", "second_bridge", "first_link")   # who posted a purchase and under which rule (paper, Section 7)
+TOPUP_DOMAIN = b"bandwidthswap/top-up/v1\n"   # a poster adds escrow to its own purchase (spec, Section 15)
+CLOSE_DOMAIN = b"bandwidthswap/close/v1\n"    # a poster withdraws its own purchase; the unspent escrow returns
+TOPUP_FIELDS = ("kind", "proto", "id", "poster", "purchase", "escrow", "posted_at", "sig")
+CLOSE_FIELDS = ("kind", "proto", "id", "poster", "purchase", "posted_at", "sig")
 PURCHASE_KEYS = ("purchase", "match", "premium_usd", "refund_usd", "from_poster_usd", "from_steward_usd", "steward_held_usd")
 DEFAULT_STEWARD = {                     # the Steward's parameters (paper, Section 7; the mockup's values), under "steward" in the Mint's config
     "m": 0.04, "margin": 0.01, "program_window_s": 7 * 86400, "first_link_usd": 1.0, "first_link_premium": 0.05,
     "min_payer_age_s": 86400, "bounty_deadline_s": 7 * 86400,
 }
 DEFAULT_MAP_PATH = "/etc/bwkit/map.json"   # BWKIT_MAP: the membership's map of domains, places and which node is where
-DECLINE_WORDS = ("clock", "patience", "since", "domain", "profile", "replay")   # 409 reasons, the word before the colon
+DECLINE_WORDS = ("clock", "patience", "since", "domain", "profile", "replay", "route")   # 409 reasons, the word before the colon
 TOKEN_RE = re.compile(r"^[a-z0-9-]{1,32}$")   # a medium or range class
 HTTP_TIMEOUT_S = 10
 HOP_FLUSH_DELAY_S = 5                   # the hop sends its own copy of an ack this long after answering the payer
@@ -438,6 +442,51 @@ def check_purchase(rec):
         raise ValueError("sig is not an ed25519 signature")
 
 
+def adjust_body(rec):
+    return {k: v for k, v in rec.items() if k not in ("id", "sig")}
+
+
+def adjust_domain(kind):
+    return TOPUP_DOMAIN if kind == "top-up" else CLOSE_DOMAIN
+
+
+def sign_adjust(priv, body):
+    return b64u(priv.sign(adjust_domain(body["kind"]) + canon_json(body).encode()))
+
+
+def verify_adjust(rec):
+    """True when a top-up or close carries its poster's signature."""
+    try:
+        pub_of_nym(rec["poster"]).verify(b64u_dec(rec["sig"]), adjust_domain(rec["kind"]) + canon_json(adjust_body(rec)).encode())
+        return True
+    except (InvalidSignature, ValueError, KeyError, TypeError):
+        return False
+
+
+def check_adjust(rec):
+    """Raise ValueError unless rec is a well-formed top-up or close (spec, Section 15). Signature not checked here."""
+    if not isinstance(rec, dict) or rec.get("kind") not in ("top-up", "close"):
+        raise ValueError("kind must be top-up or close")
+    fields = TOPUP_FIELDS if rec["kind"] == "top-up" else CLOSE_FIELDS
+    if set(rec) != set(fields):
+        raise ValueError("a %s has exactly the fields %s" % (rec["kind"], ", ".join(fields)))
+    check_proto(rec)
+    pub_of_nym(rec["poster"])
+    pid = rec["purchase"]
+    if not (isinstance(pid, str) and len(pid) == 64 and all(c in "0123456789abcdef" for c in pid)):
+        raise ValueError("purchase is a purchase id")
+    if not is_int(rec["posted_at"]) or rec["posted_at"] < 0:
+        raise ValueError("posted_at must be a non-negative integer")
+    if rec["kind"] == "top-up":
+        v = rec["escrow"]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v or v <= 0 or v == float("inf"):
+            raise ValueError("escrow must be a positive number")
+    if rec["id"] != purchase_id(adjust_body(rec)):
+        raise ValueError("id is not the hash of the record")
+    if not isinstance(rec["sig"], str) or len(b64u_dec(rec["sig"])) != 64:
+        raise ValueError("sig is not an ed25519 signature")
+
+
 class PurchaseBook:
     """The purchases a Mint holds and what the settlements have drawn from them, kept in settlement order.
 
@@ -451,13 +500,38 @@ class PurchaseBook:
         self.place_of = place_of or (lambda nym: None)
         self.f, self.margin = f, margin
         self.purchases, self.order = {}, []
+        self.topups, self.closed = {}, {}     # purchase id -> [(posted_at, escrow)] of its top-ups; purchase id -> when its poster closed it
+        self.records = []                     # every record in registration order: purchases, top-ups and closes
+        self.ids = set()
         self.use = {}                         # purchase id -> {"windows", "own", "steward", "refund", "held"}
         self.fees_in, self.paid_on = {}, {}   # payer NYM -> gross amounts paid for carriage; what the Steward paid out on it
 
     def add(self, rec):
-        if rec["id"] not in self.purchases:
+        """A purchase, a top-up or a close, in registration order. Returns False when its id is already held."""
+        if rec["id"] in self.ids:
+            return False
+        self.ids.add(rec["id"])
+        self.records.append(rec)
+        if rec["kind"] == "purchase":
             self.purchases[rec["id"]] = rec
             self.order.append(rec["id"])
+        elif rec["kind"] == "top-up":
+            self.topups.setdefault(rec["purchase"], []).append((rec["posted_at"], rec["escrow"]))
+        elif rec["kind"] == "close":
+            self.closed.setdefault(rec["purchase"], rec["posted_at"])
+        return True
+
+    def total_escrow(self, rec, at=None):
+        """A purchase's escrow with its top-ups: all of them, or, for a window ending at `at`, those posted by then.
+
+        A top-up counts for the windows ending at or after it was posted,
+        as a purchase and a close do, so the Mint and a rebuild draw the same
+        pool for every window.
+        """
+        return round(rec["escrow"] + sum(e for t, e in self.topups.get(rec["id"], ()) if at is None or t <= at), 6)
+
+    def topups_total(self, rec):
+        return round(float(sum(e for _, e in self.topups.get(rec["id"], ()))), 6)
 
     def note(self, s):
         """A settlement happened: count the payer's fees in and what it drew from a purchase."""
@@ -476,10 +550,15 @@ class PurchaseBook:
             mu["held"] = round(mu["held"] + s["steward_held_usd"], 6)
         self.paid_on[s["payer"]] = round(self.paid_on.get(s["payer"], 0.0) + s["from_steward_usd"], 6)
 
-    def pool(self, rec):
-        """What is left of a purchase's escrow: the poster's own pool, or the Steward's for its own postings and matches."""
+    def pool(self, rec, at=None):
+        """What is left of a purchase's escrow (top-ups posted by `at` included): the poster's own pool, or the Steward's."""
         u = self.use.get(rec["id"], {})
-        return round(rec["escrow"] - u.get("own", 0.0) - u.get("steward", 0.0), 6)
+        return round(self.total_escrow(rec, at) - u.get("own", 0.0) - u.get("steward", 0.0), 6)
+
+    def closed_for(self, rec, t_last):
+        """Has the poster closed this purchase before this window ended? A close governs the windows ending at or after it."""
+        c = self.closed.get(rec["id"])
+        return c is not None and t_last >= c
 
     def match_for(self, pid):
         for mid in self.order:
@@ -495,7 +574,7 @@ class PurchaseBook:
         or after it was posted (the window running when it was posted
         included) and at or before its deadline.
         """
-        if rec["program"] == "match" or rec["posted_at"] > t_last or t_last > rec["deadline"]:
+        if rec["program"] == "match" or rec["posted_at"] > t_last or t_last > rec["deadline"] or self.closed_for(rec, t_last):
             return False
         if self.use.get(rec["id"], {}).get("windows", 0) >= rec["windows"]:
             return False
@@ -522,9 +601,9 @@ class PurchaseBook:
         for rec in cands:
             match = self.match_for(rec["id"]) if rec["program"] == "payer" else None
             if rec["program"] == "payer":
-                own, steward = self.pool(rec), (self.pool(match) if match else 0.0)
+                own, steward = self.pool(rec, t_last), (self.pool(match, t_last) if match else 0.0)
             else:
-                own, steward = 0.0, self.pool(rec)
+                own, steward = 0.0, self.pool(rec, t_last)
             if own <= 0 and steward <= 0:
                 continue
             allowed = rules.allowance(self.f, self.margin, self.fees_in.get(r["payer"], 0.0), self.paid_on.get(r["payer"], 0.0)) if rules else 0.0
@@ -815,9 +894,19 @@ def rebuild(receipts, acks, links=(), price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB,
     book = PurchaseBook(place_of, fee, steward_margin)
     for i, rec in purchases:
         try:
-            check_purchase(rec)
-            if not verify_purchase(rec):
-                raise ValueError("bad signature")
+            if isinstance(rec, dict) and rec.get("kind") in ("top-up", "close"):
+                check_adjust(rec)
+                if not verify_adjust(rec):
+                    raise ValueError("bad signature")
+                target = book.purchases.get(rec["purchase"])
+                if target is None:
+                    raise ValueError("%s names purchase %s, which is not held" % (rec["kind"], rec["purchase"][:16]))
+                if target["poster"] != rec["poster"]:
+                    raise ValueError("%s by %s on a purchase posted by another" % (rec["kind"], rec["poster"][:20]))
+            else:
+                check_purchase(rec)
+                if not verify_purchase(rec):
+                    raise ValueError("bad signature")
         except ValueError as e:
             bad.append("%s line %d: %s" % (names[3] if len(names) > 3 else "purchases.jsonl", i, e))
             continue
@@ -1345,6 +1434,30 @@ class Node:
                 rec["id"][:16], rec["route"]["from"], rec["route"]["to"], rec["min_bytes"], rec["premium_per_gb"], rec["windows"], rec["escrow"]))
         return rec, rec["id"]
 
+    def purchase_adjust(self, kind, pid, escrow=None, now=None, post=True, poster_priv=None, mint_url=None, keep=True):
+        """Sign a top-up (escrow added) or a close on a purchase and register it with the Mint. Returns (record, id)."""
+        now = int(now if now is not None else time.time())
+        priv = poster_priv or self.priv
+        body = {"kind": kind, "proto": PROTO, "poster": nym_of_pub(priv.public_key()), "purchase": pid, "posted_at": now}
+        if kind == "top-up":
+            body["escrow"] = float(escrow)
+        rec = dict(body, id=purchase_id(body), sig=sign_adjust(priv, body))
+        check_adjust(rec)
+        if post:
+            mint = (mint_url or self.config.get("mint") or "").rstrip("/")
+            if not mint:
+                raise SystemExit("config has no mint URL")
+            try:
+                status, ans = http_post(mint + "/purchase", rec)
+            except (urlerror.URLError, socket.timeout, OSError) as e:
+                raise SystemExit("mint unreachable: %s" % e)
+            if not 200 <= status < 300:
+                raise SystemExit("the Mint refused the %s: %s %s" % (kind, status, json.dumps(ans)))
+            if keep:
+                self.append("purchases.jsonl", rec)
+            log("posted %s %s on purchase %s%s" % (kind, rec["id"][:16], pid[:16], ": +%s" % rec["escrow"] if kind == "top-up" else ""))
+        return rec, rec["id"]
+
     # hop
 
     def my_link(self):
@@ -1627,11 +1740,42 @@ class Node:
             rec["price"], rec["unit"], rec["margin"], rec["min_bytes"], rec["patience_windows"], rec["since"]))
         return h
 
+    def register_adjust(self, rec, now):
+        """A top-up or a close on a purchase this Mint holds, by its poster (spec, Section 15). Returns the record's id."""
+        check_adjust(rec)
+        if not verify_adjust(rec):
+            raise ValueError("bad signature")
+        book = self.index["book"]
+        target = book.purchases.get(rec["purchase"])
+        if target is None:
+            raise Decline("route: %s names no purchase this Mint holds" % rec["kind"])
+        if rec["poster"] != target["poster"]:
+            raise Decline("unknown poster %s: only the poster may %s its purchase" % (rec["poster"], rec["kind"]))
+        with self.lock:
+            if rec["id"] in book.ids:
+                raise Decline("duplicate")
+            if rec["posted_at"] < now - CLOCK_TOLERANCE_S:
+                raise Decline("since: posted_at %d is in the past (the Mint's clock is %d); a %s cannot be backdated" % (rec["posted_at"], now, rec["kind"]))
+            if target["id"] in book.closed:
+                raise Decline("route: purchase %s is closed" % target["id"][:16])
+            if rec["kind"] == "close":
+                for e in self.index["by_sig"].values():
+                    r = e["receipt"]
+                    if r["t_last"] >= rec["posted_at"] and book.applies(target, r, r["t_last"]):
+                        raise Decline("since: a window ending at %d that the purchase governs is already held" % r["t_last"])
+            self.append("purchases.jsonl", rec)
+            book.add(rec)
+        log("%s %s on purchase %s by its poster%s" % (rec["kind"], rec["id"][:16], target["id"][:16],
+                                                      ": +%s escrow" % rec["escrow"] if rec["kind"] == "top-up" else ""))
+        return rec["id"]
+
     def register_purchase(self, rec, now=None):
-        """The Mint's /purchase (spec, Section 15). Checks the record, appends it to purchases.jsonl, returns its id."""
+        """The Mint's /purchase (spec, Section 15): a purchase, a top-up or a close. Appends it to purchases.jsonl, returns its id."""
         now = int(now if now is not None else time.time())
         if self.index is None:
             self.load_index()
+        if isinstance(rec, dict) and rec.get("kind") in ("top-up", "close"):
+            return self.register_adjust(rec, now)
         check_purchase(rec)
         if not verify_purchase(rec):
             raise ValueError("bad signature")
@@ -1655,7 +1799,7 @@ class Node:
                 raise Decline("route: a match names a purchase this Mint holds")
         book = self.index["book"]
         with self.lock:
-            if rec["id"] in book.purchases:
+            if rec["id"] in book.ids:
                 raise Decline("duplicate")
             if rec["posted_at"] < now - CLOCK_TOLERANCE_S:
                 raise Decline("since: posted_at %d is in the past (the Mint's clock is %d); a purchase cannot be backdated" % (rec["posted_at"], now))
@@ -2116,7 +2260,10 @@ class Steward:
             if target is not None:
                 used = book.use.get(target["id"], {}).get("windows", 0)
             pool = book.pool(rec)
-            if now > rec["deadline"]:
+            total = book.total_escrow(rec)
+            if rec["id"] in book.closed and now >= book.closed[rec["id"]]:
+                status = "closed"
+            elif now > rec["deadline"]:
                 status = "expired"
             elif used >= rec["windows"]:
                 status = "complete"
@@ -2124,16 +2271,16 @@ class Steward:
                 status = "spent"
             else:
                 status = "open"
-            rows.append({"rec": rec, "status": status, "used": used, "pool": pool, "paid": round(rec["escrow"] - pool, 6),
-                         "mine": rec["poster"] == nym, "refund": u.get("refund", 0.0),
+            rows.append({"rec": rec, "status": status, "used": used, "pool": pool, "paid": round(total - pool, 6), "total": total,
+                         "topups": book.topups_total(rec), "mine": rec["poster"] == nym, "refund": u.get("refund", 0.0),
                          "match": book.match_for(rec["id"]) if rec["program"] == "payer" else None})
         mine = [r for r in rows if r["mine"]]
-        posted = round(float(sum(r["rec"]["escrow"] for r in mine)), 6)
+        posted = round(float(sum(r["total"] for r in mine)), 6)
         paid = round(float(sum(r["paid"] for r in mine)), 6)
         returned = round(float(sum(r["pool"] for r in mine if r["status"] != "open")), 6)
         in_offers = round(float(sum(r["pool"] for r in mine if r["status"] == "open")), 6)
         held = round(float(sum(st.get("steward_held_usd", 0.0) for st in settled)), 6)
-        matched = round(float(sum(r["rec"]["escrow"] for r in mine if r["rec"]["program"] == "match")), 6)
+        matched = round(float(sum(r["total"] for r in mine if r["rec"]["program"] == "match")), 6)
         escrow = round(income - posted + returned, 6)
         reserve = round(max(0.0, m * income - matched), 6)
         # the links of the program window: (payer's place, hop's place) with the fees they carried
@@ -2163,6 +2310,13 @@ class Steward:
                                            matches=matches, mint_url=self.mint_url(), keep=False)
         t["escrow"] = round(t["escrow"] - escrow, 6)
         t["posted"] = round(t["posted"] + escrow, 6)
+        return rec
+
+    def adjust(self, t, kind, pid, escrow=None):
+        rec, _ = self.node.purchase_adjust(kind, pid, escrow, now=t["now"], post=True, poster_priv=self.priv, mint_url=self.mint_url(), keep=False)
+        if kind == "top-up":
+            t["escrow"] = round(t["escrow"] - escrow, 6)
+            t["posted"] = round(t["posted"] + escrow, 6)
         return rec
 
     def run(self, now=None):
@@ -2212,24 +2366,37 @@ class Steward:
             posted.append(rec)
             log("steward: posted %s for a second path from %s to %s (the sole link carried %s this window, the Steward's take %s), premium %s/GB" % (
                 usd(value), a, b, usd(L["fees"]), usd(L["take"]), premium))
-        # 3. the first link: every mapped place with no settled receipt across a link to it
+        # 3. the first link: one standing offer per mapped place no settled window has an end at, topped up toward its size
         for pid, place in sorted(self.node.map.get("places", {}).items()):
             if not place.get("mapped", True) or pid in t["linked"]:
                 continue
-            standing = [r for r in t["rows"] if r["status"] == "open" and r["rec"]["program"] == "first_link" and r["rec"]["route"]["to"] == pid]
-            open_so_far = round(sum(r["rec"]["escrow"] for r in standing), 6)
+            standing = sorted((r for r in t["rows"] if r["status"] == "open" and r["rec"]["program"] == "first_link" and r["rec"]["route"]["to"] == pid),
+                              key=lambda r: (r["rec"]["posted_at"], r["rec"]["id"]))
+            for extra in standing[1:]:                       # more than one open offer (an older rule posted one per run): keep the oldest
+                self.adjust(t, "close", extra["rec"]["id"])
+                t["escrow"] = round(t["escrow"] + extra["pool"], 6)
+                t["returned"] = round(t["returned"] + extra["pool"], 6)
+                posted.append({"id": extra["rec"]["id"], "kind": "close"})
+                log("steward: closed the extra first-link offer %s for %s; %s returns to the escrow" % (extra["rec"]["id"][:16], pid, usd(extra["pool"])))
+            standing = standing[:1]
+            open_so_far = standing[0]["total"] if standing else 0.0
             value = round(rules.first_link_size(p["first_link_usd"], budget(), open_so_far), 6)
             if value <= 0:
                 skipped.append("first link to %s: %s" % (pid, "the offer stands at its size" if open_so_far >= p["first_link_usd"] else "the escrow is spent"))
                 continue
-            windows = max(1, p["bounty_deadline_s"] // 3600)
-            rec = self.post(t, "first_link", pid, None, [], 0, p["first_link_premium"], windows, value, now + p["bounty_deadline_s"])
-            posted.append(rec)
+            if standing:
+                rec = self.adjust(t, "top-up", standing[0]["rec"]["id"], value)
+                posted.append({"id": rec["id"], "kind": "top-up"})
+            else:
+                windows = max(1, p["bounty_deadline_s"] // 3600)
+                rec = self.post(t, "first_link", pid, None, [], 0, p["first_link_premium"], windows, value, now + p["bounty_deadline_s"])
+                posted.append(rec)
             log("steward: %s the first-link offer for %s by %s (now %s toward %s)" % (
                 "topped up" if standing else "posted", pid, usd(value), usd(open_so_far + value), usd(p["first_link_usd"])))
         run = {"kind": "steward-run", "proto": PROTO, "t": now, "steward": t["nym"], "income_usd": t["income"], "escrow_usd": t["escrow"],
                "posted_usd": t["posted"], "paid_usd": t["paid"], "refunded_usd": t["returned"], "held_by_cap_usd": t["held"],
-               "posted": [r["id"] for r in posted], "skipped": skipped}
+               "posted": [r["id"] for r in posted if r.get("kind", "purchase") == "purchase"],
+               "adjusted": [{"kind": r["kind"], "id": r["id"]} for r in posted if r.get("kind", "purchase") != "purchase"], "skipped": skipped}
         self.node.append("steward.jsonl", run)
         return run
 
@@ -2259,7 +2426,7 @@ class Steward:
                               "route": {"from": name(rec["route"]["from"]), "to": name(rec["route"]["to"]), "not_via": list(rec["route"]["not_via"])},
                               "premium_per_gb": rec["premium_per_gb"], "min_bytes": rec["min_bytes"],
                               "windows": rec["windows"], "windows_left": max(0, rec["windows"] - r["used"]), "deadline": rec["deadline"],
-                              "posted_at": rec["posted_at"], "escrow_usd": rec["escrow"], "paid_usd": r["paid"], "refund_usd": r["refund"],
+                              "posted_at": rec["posted_at"], "escrow_usd": r["total"], "topups_usd": r["topups"], "paid_usd": r["paid"], "refund_usd": r["refund"],
                               "match_usd": r["match"]["escrow"] if r["match"] else None, "status": r["status"]})
         payouts = []
         for st in sorted((st for st in t["settled"] if st.get("purchase")), key=lambda st: (-st["t"], -st["t_last"]))[:24]:
@@ -2294,10 +2461,11 @@ class Steward:
         short = {"payer": "payer", "match": "match", "second_bridge": "bridge", "first_link": "first"}
         for pu in opened:
             route = "%s -> %s%s" % (pu["route"]["from"] or "*", pu["route"]["to"], (" !via " + ",".join(pu["route"]["not_via"])) if pu["route"]["not_via"] else "")
-            out.append("  %s  %-6s %-34s %s  %s/GB  %s  %s%s" % (
+            out.append("  %s  %-6s %-34s %s  %s/GB  %s  %s%s%s" % (
                 pu["id"][:8], short[pu["program"]], route, (">=" + fmt_bytes(pu["min_bytes"])) if pu["min_bytes"] else "standing",
                 pu["premium_per_gb"], ("%d left" % pu["windows_left"]) if pu["program"] != "first_link" else "until %s" % time.strftime("%b %d", time.localtime(pu["deadline"])),
-                usd(pu["escrow_usd"]), (" + %s match" % usd(pu["match_usd"])) if pu["match_usd"] else ""))
+                usd(pu["escrow_usd"]), (" (%s of it top-ups)" % usd(pu["topups_usd"])) if pu["topups_usd"] else "",
+                (" + %s match" % usd(pu["match_usd"])) if pu["match_usd"] else ""))
         for L in fd["links"]:
             out.append("link  %s -> %s (%s -> %s): %d windows, %s, paid %s, the Steward's %s this program window" % (
                 L["from"], L["to"], L["payer"], L["hop"], L["windows"], fmt_bytes(L["bytes"]), usd(L["fees_usd"]), usd(L["take_usd"])))
@@ -2305,8 +2473,9 @@ class Steward:
             out.append("place %-12s %s/%s  %s" % (pl["id"], pl["medium"], pl["range_class"], "linked" if pl["linked"] else "no link yet"))
         last = self.last_run()
         if last:
-            out.append("last run  %s  posted %d, skipped %d%s" % (time.strftime("%Y-%m-%d %H:%M", time.localtime(last["t"])), len(last["posted"]), len(last["skipped"]),
-                                                               (": " + "; ".join(last["skipped"][:3])) if last["skipped"] else ""))
+            out.append("last run  %s  posted %d, adjusted %d, skipped %d%s" % (
+                time.strftime("%Y-%m-%d %H:%M", time.localtime(last["t"])), len(last["posted"]), len(last.get("adjusted", [])), len(last["skipped"]),
+                (": " + "; ".join(last["skipped"][:3])) if last["skipped"] else ""))
         return "\n".join(out)
 
 
@@ -2369,6 +2538,11 @@ def main(argv=None):
     pp.add_argument("--deadline", required=True, help="Unix seconds, or +Nd / +Nh from now")
     pp.add_argument("--print", dest="print_only", action="store_true", help="print the signed record instead of posting it")
     pus.add_parser("list", help="the purchases this node holds (the Mint's registry, or a payer's own postings)")
+    pt2 = pus.add_parser("topup", help="payer: add escrow to a purchase of yours")
+    pt2.add_argument("id")
+    pt2.add_argument("--escrow", type=float, required=True)
+    pc = pus.add_parser("close", help="payer: withdraw a purchase of yours; what it did not spend comes back")
+    pc.add_argument("id")
     lg = sub.add_parser("ledger", help="mint: print the ledger")
     lg.add_argument("--disputes", action="store_true", help="only disputed settlements")
     lg.add_argument("--json", action="store_true")
@@ -2588,6 +2762,11 @@ def main(argv=None):
                 print("posted %s: %s -> %s, >= %d bytes a window, premium %s USD/GB, %d windows, escrow %s USD, until %s" % (
                     pid, rec["route"]["from"], rec["route"]["to"], rec["min_bytes"], rec["premium_per_gb"], rec["windows"], rec["escrow"],
                     time.strftime("%Y-%m-%d %H:%M", time.localtime(rec["deadline"]))))
+        elif args.pucmd in ("topup", "close"):
+            if node.role != "payer":
+                raise SystemExit("only a payer adjusts a purchase from the command line (the Steward adjusts its own)")
+            rec, aid = node.purchase_adjust("top-up" if args.pucmd == "topup" else "close", args.id, getattr(args, "escrow", None))
+            print("posted %s %s on %s" % (rec["kind"], aid, args.id))
         else:
             peers = node.peers()
             if node.role == "mint":
@@ -2595,7 +2774,7 @@ def main(argv=None):
                 book = node.index["book"]
                 recs = [book.purchases[pid] for pid in book.order]
             else:
-                book, recs = None, node.load_purchases()
+                book, recs = None, [r for r in node.load_purchases() if r.get("kind") == "purchase"]
             steward = node.steward_nym() if node.role == "mint" else None
             for rec in recs:
                 u = book.use.get(rec["id"], {}) if book else {}
@@ -2604,9 +2783,9 @@ def main(argv=None):
                     rec["id"][:16], rec["program"], who, rec["route"]["from"] if rec["route"]["from"] and not rec["route"]["from"].startswith("ed25519:") else who,
                     peers.get(rec["route"]["to"], rec["route"]["to"]), (" !via " + ",".join(rec["route"]["not_via"])) if rec["route"]["not_via"] else "",
                     fmt_bytes(rec["min_bytes"]), rec["premium_per_gb"], rec["windows"], "" if rec["windows"] == 1 else "s",
-                    (", %d used" % u["windows"]) if u.get("windows") else "", rec["escrow"],
+                    (", %d used" % u["windows"]) if u.get("windows") else "", book.total_escrow(rec) if book else rec["escrow"],
                     (", %s paid" % round(u.get("own", 0.0) + u.get("steward", 0.0), 6)) if u else "",
-                    time.strftime("%Y-%m-%d %H:%M", time.localtime(rec["deadline"]))))
+                    time.strftime("%Y-%m-%d %H:%M", time.localtime(rec["deadline"])) + (", closed" if book and rec["id"] in book.closed else "")))
     elif args.cmd == "steward":
         st = Steward(node)
         if args.swcmd == "keygen":
@@ -2615,8 +2794,9 @@ def main(argv=None):
             print(st.nym)
         elif args.swcmd == "run":
             run = st.run(args.now)
-            print("steward run at %d: income %s, escrow %s, posted %d (%s), skipped %d" % (
-                run["t"], usd(run["income_usd"]), usd(run["escrow_usd"]), len(run["posted"]), ", ".join(x[:8] for x in run["posted"]), len(run["skipped"])))
+            print("steward run at %d: income %s, escrow %s, posted %d (%s), adjusted %d (%s), skipped %d" % (
+                run["t"], usd(run["income_usd"]), usd(run["escrow_usd"]), len(run["posted"]), ", ".join(x[:8] for x in run["posted"]),
+                len(run["adjusted"]), ", ".join("%s %s" % (a["kind"], a["id"][:8]) for a in run["adjusted"]), len(run["skipped"])))
             for line in run["skipped"]:
                 print("  skipped: " + line)
         elif args.swcmd == "book":

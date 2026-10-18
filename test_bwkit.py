@@ -808,6 +808,13 @@ def hop_env(lab):
     return {"BWKIT_DIR": lab.hop.dir, "BWKIT_CONFIG": cfg}
 
 
+def payer_env(lab):
+    cfg = os.path.join(lab.root, "payer-config.json")
+    with open(cfg, "w") as f:
+        json.dump(lab.payer.config, f)
+    return {"BWKIT_DIR": lab.payer.dir, "BWKIT_CONFIG": cfg}
+
+
 def cli(args, env):
     out = io.StringIO()
     with contextlib.redirect_stdout(out), mock.patch.dict(os.environ, env):
@@ -1407,7 +1414,7 @@ class Purchases(unittest.TestCase):
         status, body = post(resign(lab.payer.priv, route=dict(rec["route"], to=snym), posted_at=lab.t + 2))
         self.assertEqual(status, 403)                                    # an unknown hop
         status, body = post(resign(lab.payer.priv, route=dict(rec["route"], to="nowhere"), posted_at=lab.t + 2))
-        self.assertEqual((status, body["error"].split(":")[0]), (409, "route"))   # a place not on the map
+        self.assertEqual((status, body["error"]), (409, "route"))        # a place not on the map
         status, body = post(resign(lab.payer.priv, posted_at=int(time.time()) - 60))
         self.assertEqual((status, body["error"]), (409, "since"))        # backdated
         status, body = post(resign(lab.payer.priv, program="first_link", route={"from": None, "to": "the-cabin", "not_via": []}, posted_at=lab.t + 2))
@@ -1426,6 +1433,73 @@ class Purchases(unittest.TestCase):
             json.dump(rec, f)
         rc, text = cli(["verify", path], {})
         self.assertEqual((rc, "purchase %s by %s (payer)" % (pid[:16], lab.payer.nym) in text), (0, True))
+
+    def test_a_poster_tops_up_or_closes_its_purchase_and_the_mint_checks_who(self):
+        import time
+        lab = self.lab
+        lab.hour(100_000_000, 100_000_000)
+        rec, pid = lab.payer.purchase_post("bw-forest", 50_000_000, 0.02, 10, 0.001, lab.t + self.WEEK, now=lab.t + 1)   # half a premium's escrow
+        lab.hour(200_000_000, 200_000_000)                        # the pool pays what it has and is spent
+        self.assertEqual(self.settlements()[-1]["premium_usd"], 0.001)
+        lab.hour(300_000_000, 300_000_000)                        # a spent purchase is passed over
+        self.assertNotIn("purchase", self.settlements()[-1])
+        top, tid = lab.payer.purchase_adjust("top-up", pid, 0.5, now=lab.t + 1)
+        self.assertEqual((top["kind"], top["proto"], top["poster"], top["purchase"], top["escrow"], top["posted_at"]), ("top-up", 1, lab.payer.nym, pid, 0.5, lab.t + 1))
+        self.assertEqual(top["id"], bwkit.purchase_id(bwkit.adjust_body(top)))
+        self.assertTrue(bwkit.verify_adjust(top))
+        bwkit.check_adjust(top)
+        book = lab.mint.index["book"]
+        self.assertEqual((book.topups_total(rec), book.total_escrow(rec), book.pool(rec)), (0.5, 0.501, 0.5))
+        self.assertEqual((book.total_escrow(rec, lab.t), book.pool(rec, lab.t)), (0.001, 0.0))   # for a window ending before the top-up
+        lab.hour(400_000_000, 400_000_000)                        # the topped-up pool pays the full premium again
+        self.assertEqual((self.settlements()[-1]["purchase"], self.settlements()[-1]["premium_usd"]), (pid, 0.002))
+        close, cid = lab.payer.purchase_adjust("close", pid, now=lab.t + 1)
+        self.assertEqual((close["kind"], set(close)), ("close", set(bwkit.CLOSE_FIELDS)))
+        self.assertEqual(book.closed[pid], lab.t + 1)
+        lab.hour(500_000_000, 500_000_000)                        # closed before this window ended: not governed
+        self.assertNotIn("purchase", self.settlements()[-1])
+        self.assertEqual([r["kind"] for r in lab.mint.load_purchases()], ["purchase", "top-up", "close"])
+        self.assertEqual([r["kind"] for r in lab.payer.load_purchases()], ["purchase", "top-up", "close"])
+        # the Mint's checks
+        post = lambda r: bwkit.http_post(lab.mint_url + "/purchase", r)   # noqa: E731
+        status, body = post(top)
+        self.assertEqual((status, body["error"]), (409, "duplicate"))
+        rec2, pid2 = lab.payer.purchase_post("bw-forest", 50_000_000, 0.02, 10, 0.01, lab.t + self.WEEK, now=lab.t + 1)
+        stranger = bwkit.Ed25519PrivateKey.generate()
+        other, _ = lab.payer.purchase_adjust("close", pid2, now=lab.t + 2, post=False, poster_priv=stranger)
+        self.assertEqual(post(other)[0], 403)                            # only the poster
+        again, _ = lab.payer.purchase_adjust("top-up", pid, 0.1, now=lab.t + 2, post=False)
+        status, body = post(again)
+        self.assertEqual((status, body["error"]), (409, "route"))        # the purchase is closed
+        self.assertIn("closed", body["detail"])
+        late, _ = lab.payer.purchase_adjust("close", pid2, now=int(time.time()) - 60, post=False)
+        status, body = post(late)
+        self.assertEqual((status, body["error"]), (409, "since"))        # backdated
+        nowhere, _ = lab.payer.purchase_adjust("close", "0" * 64, now=lab.t + 2, post=False)
+        status, body = post(nowhere)
+        self.assertEqual((status, body["error"]), (409, "route"))
+        self.assertEqual(post(dict(top, escrow=0.6))[0], 400)            # the id and the signature no longer fit
+        for bad in (dict(top, escrow=0), dict(top, kind="purchase"), dict(top, proto=2), {k: v for k, v in top.items() if k != "escrow"}):
+            with self.assertRaises(ValueError):
+                bwkit.check_adjust(bad)
+        # the command line, and the rebuild with the records
+        rc, text = cli(["purchase", "close", pid2], payer_env(lab))
+        self.assertEqual((rc, "posted close" in text), (0, True))
+        rc, text = cli(["purchase", "list"], mint_env(lab))
+        self.assertIn("closed", text)
+        rc, text = cli(["purchase", "list"], payer_env(lab))
+        self.assertEqual(text.count("\n"), 2)                              # the two purchases, not the adjustments
+        entries, rep = bwkit.rebuild(bwkit.read_jsonl(lab.payer.path("receipts.jsonl"))[0], bwkit.read_jsonl(lab.hop.path("acks.jsonl"))[0], (),
+                                     purchases=bwkit.read_jsonl(lab.mint.path("purchases.jsonl"))[0], now=lab.t + 9)
+        self.assertEqual((rep["purchases"], rep["bad"]), (2, []))
+        agree, verdict, lines = bwkit.compare(entries, lab.mint.ledger_lines())
+        self.assertTrue(agree, (verdict, lines))
+        # a top-up by a stranger in the file is left out and named
+        rows = bwkit.read_jsonl(lab.mint.path("purchases.jsonl"))[0] + [(99, other)]
+        entries, rep = bwkit.rebuild(bwkit.read_jsonl(lab.payer.path("receipts.jsonl"))[0], bwkit.read_jsonl(lab.hop.path("acks.jsonl"))[0], (),
+                                     purchases=rows, now=lab.t + 9)
+        self.assertEqual(len(rep["bad"]), 1)
+        self.assertIn("posted by another", rep["bad"][0])
 
     def test_the_stewards_match_pays_after_the_poster_under_the_cap(self):
         lab = self.lab
@@ -1592,6 +1666,60 @@ class StewardRole(unittest.TestCase):
         self.assertAlmostEqual(fl[1]["escrow"], round(income - 0.04 * income + 0.00008, 6), places=6)   # all the Steward has, less the match reserve
         self.assertEqual(len(self.recs("second_bridge")), 1)      # no link carried fees in the last program window
         self.assertEqual(run5["posted"], [fl[1]["id"]])
+
+    def test_one_standing_first_link_offer_topped_up_and_duplicates_consolidated(self):
+        lab, st = self.lab, self.st
+        with open(self.map_path) as f:
+            m = json.load(f)
+        m["nodes"]["bw-forest"] = "house"                          # the lab's link runs inside one place: no second bridge, the cabin gets the budget
+        m["places"]["next-door"]["mapped"] = False                 # and no other place wants a first link
+        with open(self.map_path, "w") as f:
+            json.dump(m, f)
+        lab.hour(100_000_000, 100_000_000)                        # income 0.0005
+        run1 = st.run(lab.t + 300)
+        fl = self.recs("first_link")
+        self.assertEqual(len(fl), 1)
+        self.assertAlmostEqual(fl[0]["escrow"], 0.00048, places=6)   # the budget: income less the match reserve
+        self.assertEqual((len(run1["posted"]), run1["adjusted"]), (1, []))
+        lab.hour(200_000_000, 200_000_000)                        # income 0.0010
+        run2 = st.run(lab.t + 300)
+        self.assertEqual(len(self.recs("first_link")), 1)        # the same offer stands, topped up
+        self.assertEqual(run2["posted"], [])
+        self.assertEqual([a["kind"] for a in run2["adjusted"]], ["top-up"])
+        book = lab.mint.index["book"]
+        self.assertAlmostEqual(book.topups_total(fl[0]), 0.00048, places=6)
+        self.assertAlmostEqual(book.total_escrow(fl[0]), 0.00096, places=6)
+        self.assertEqual([r["kind"] for r in lab.mint.load_purchases()], ["purchase", "top-up"])
+        fd = st.feed(lab.t + 301)
+        opened = [p for p in fd["purchases"] if p["program"] == "first_link" and p["status"] == "open"]
+        self.assertEqual(len(opened), 1)
+        self.assertAlmostEqual(opened[0]["escrow_usd"], 0.00096, places=6)
+        self.assertAlmostEqual(opened[0]["topups_usd"], 0.00048, places=6)
+        self.assertAlmostEqual(fd["in_offers_usd"], 0.00096, places=6)
+        self.assertAlmostEqual(fd["posted_usd"], 0.00096, places=6)
+        self.assertIn("of it top-ups", st.book(lab.t + 301))
+        # two more offers posted the old way (one record per run): the next run keeps the oldest and closes the rest
+        for i in range(2):
+            st.node.purchase_post("the-cabin", 0, 0.05, 168, 0.0001, lab.t + self.WEEK, now=lab.t + 400 + i, poster_priv=st.priv,
+                                  program="first_link", route_from=None, mint_url=lab.mint_url, keep=False)
+        self.assertEqual(len([p for p in st.feed(lab.t + 500)["purchases"] if p["program"] == "first_link" and p["status"] == "open"]), 3)
+        lab.hour(300_000_000, 300_000_000)
+        run3 = st.run(lab.t + 300)
+        self.assertEqual([a["kind"] for a in run3["adjusted"]], ["close", "close", "top-up"])
+        fd = st.feed(lab.t + 301)
+        first = [p for p in fd["purchases"] if p["program"] == "first_link"]
+        self.assertEqual(sorted(p["status"] for p in first), ["closed", "closed", "open"])
+        self.assertEqual([p["id"] for p in first if p["status"] == "open"], [fl[0]["id"][:16]])
+        self.assertAlmostEqual(fd["refunded_usd"], 0.0002, places=6)      # the closed offers' escrow came back
+        self.assertEqual(len(self.recs("first_link")), 3)
+        self.assertEqual(len([r for r in lab.mint.load_purchases() if r["kind"] == "close"]), 2)
+        # the book and the rebuild
+        self.assertEqual(st.book(lab.t + 301).count("first  * -> the-cabin"), 1)
+        peers = lab.mint.peers()
+        entries, rep = bwkit.rebuild(bwkit.read_jsonl(lab.payer.path("receipts.jsonl"))[0], bwkit.read_jsonl(lab.hop.path("acks.jsonl"))[0], (),
+                                     purchases=bwkit.read_jsonl(lab.mint.path("purchases.jsonl"))[0], place_of=bwkit.place_lookup(m, peers), now=lab.t + 9)
+        self.assertEqual(rep["bad"], [])
+        self.assertTrue(bwkit.compare(entries, lab.mint.ledger_lines())[0])
 
     def test_the_report_carries_the_mint_and_the_stewards_book_and_refuses_an_address(self):
         lab, st = self.lab, self.st
