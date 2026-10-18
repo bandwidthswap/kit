@@ -18,6 +18,10 @@ window.BW = window.BW || {};
 
   function parseJsonl(text){ var out=[]; String(text||'').split('\n').forEach(function(l){ l=l.trim(); if(!l) return; try{ out.push(JSON.parse(l)); }catch(e){} }); return out; }
   BW.parseJsonl = parseJsonl;
+  // /ledger?since= returns the lines at or after that second, so the last second held comes back again: keep each entry once.
+  function entryKey(e){ return e.kind+'|'+(e.sig||e.receipt_sig||e.signature||JSON.stringify(e)); }
+  function addNew(have, more){ var seen={}; have.forEach(function(e){ seen[entryKey(e)]=1; }); return have.concat(more.filter(function(e){ var k=entryKey(e); if(seen[k]) return false; seen[k]=1; return true; })); }
+  BW.addNew = addNew;
 
   function get(base, path, text){
     return fetch(base+path, {cache:'no-store'}).then(function(r){ if(!r.ok) throw new Error(path+' answered '+r.status); return text ? r.text() : r.json(); });
@@ -49,7 +53,7 @@ window.BW = window.BW || {};
       D.status=st; var role=st.role;
       var jobs=[];
       if(role==='mint'){
-        jobs.push(get(b, '/ledger'+(D.since?'?since='+D.since:''), true).then(function(t){ var more=parseJsonl(t); D.ledger = D.since ? D.ledger.concat(more) : more; D.since = D.ledger.length ? (D.ledger[D.ledger.length-1].received_at||D.ledger[D.ledger.length-1].t||0) : 0; }));
+        jobs.push(get(b, '/ledger'+(D.since?'?since='+D.since:''), true).then(function(t){ var more=parseJsonl(t); D.ledger = D.since ? addNew(D.ledger, more) : more; D.since = D.ledger.length ? (D.ledger[D.ledger.length-1].received_at||D.ledger[D.ledger.length-1].t||0) : 0; }));
         jobs.push(opt(b, '/commitments', false, []).then(function(v){ D.commitments=v||[]; }));
         jobs.push(opt(b, '/purchases', true, '').then(function(v){ D.purchases=typeof v==='string'?parseJsonl(v):(v||[]); }));
         jobs.push(opt(b, '/steward', false, null).then(function(v){ D.steward=v; }));

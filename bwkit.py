@@ -1286,6 +1286,14 @@ class Node:
         with open(self.path(name), "a") as f:
             f.write(json.dumps(obj, sort_keys=True) + "\n")
 
+    def file_bytes(self, name):
+        """One of this node's files as served: its bytes, or none when it does not exist yet."""
+        p = self.path(name)
+        if not os.path.exists(p):
+            return b""
+        with open(p, "rb") as f:
+            return f.read()
+
     def read_lines(self, name, skip_partial=False):
         """The records of one of this node's .jsonl files; with skip_partial, a half-written last line is skipped."""
         p = self.path(name)
@@ -1943,6 +1951,33 @@ class Node:
     def ledger_lines(self):
         return self.read_lines("ledger.jsonl")
 
+    def ledger_text(self, since=None):
+        """The ledger as the file holds it (JSONL bytes); with `since`, only the lines received at or after that second.
+
+        A receipt or ack is placed by `received_at`, a settlement or
+        commitment by its `t`. The page keeps what it has and asks for the
+        rest; the same second can come back twice, and the page drops the
+        copy.
+        """
+        p = self.path("ledger.jsonl")
+        if not os.path.exists(p):
+            return b""
+        with open(p, "rb") as f:
+            data = f.read()
+        if not since:
+            return data
+        out = []
+        for line in data.split(b"\n"):
+            if not line.strip():
+                continue
+            try:
+                e = json.loads(line)
+            except ValueError:
+                continue                                     # a half-written last line; the next request has it whole
+            if (e.get("received_at") or e.get("t") or 0) >= since:
+                out.append(line)
+        return b"\n".join(out) + (b"\n" if out else b"")
+
     def pending(self):
         """Receipts with no ack yet, and acks with no receipt."""
         if self.index is None:
@@ -2440,11 +2475,12 @@ class Node:
                     with node.lock:
                         return self.reply(200, node.status_dict())
                 if url.path == "/ledger" and node.role == "mint":
-                    p = node.path("ledger.jsonl")
-                    return self.raw(open(p, "rb").read() if os.path.exists(p) else b"", "application/x-ndjson")
+                    since = urlparse.parse_qs(url.query).get("since", [""])[0]
+                    if since and not since.isdigit():
+                        return self.reply(400, {"error": "since must be Unix seconds"})
+                    return self.raw(node.ledger_text(int(since) if since else None), "application/x-ndjson")
                 if url.path == "/purchases":
-                    p = node.path("purchases.jsonl")
-                    return self.raw(open(p, "rb").read() if os.path.exists(p) else b"", "application/x-ndjson")
+                    return self.raw(node.file_bytes("purchases.jsonl"), "application/x-ndjson")
                 if url.path == "/commitments" and node.role == "mint":
                     return self.reply(200, node.commitments())
                 if url.path == "/links" and node.role == "mint":

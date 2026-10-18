@@ -20,6 +20,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -1770,6 +1771,39 @@ def get_raw(url, method="GET"):
             return resp.status, dict(resp.headers), resp.read().decode()
     except bwkit.urlerror.HTTPError as e:
         return e.code, dict(e.headers), e.read().decode()
+
+
+class LedgerSince(unittest.TestCase):
+    """GET /ledger?since=<unix> on the Mint: the lines received at or after that second, as the file holds them."""
+
+    def setUp(self):
+        self.lab = Lab()
+
+    def tearDown(self):
+        self.lab.close()
+
+    def test_the_lines_at_or_after_since(self):
+        lab = self.lab
+        lab.hour(100_000_000, 100_000_000)
+        first = [json.loads(line) for line in bwkit.http_get(lab.mint_url + "/ledger")[1].splitlines()]
+        self.assertEqual([e["kind"] for e in first], ["receipt", "ack", "settlement", "commitment"])
+        t1 = first[-1]["t"]
+        time.sleep(1.1)                                                                   # the next hour lands in a later second of the Mint's clock
+        lab.hour(200_000_000, 200_000_000)
+        whole = bwkit.http_get(lab.mint_url + "/ledger")[1]
+        self.assertEqual(len(whole.splitlines()), 8)
+        self.assertEqual(bwkit.http_get(lab.mint_url + "/ledger?since=0")[1], whole)
+        self.assertEqual(bwkit.http_get(lab.mint_url + "/ledger?since=1")[1], whole)
+        later = bwkit.http_get(lab.mint_url + "/ledger?since=%d" % (t1 + 1))[1]
+        self.assertEqual([json.loads(line)["kind"] for line in later.splitlines()], ["receipt", "ack", "settlement", "commitment"])
+        self.assertTrue(whole.endswith(later))                                            # the file's own bytes, not re-serialised
+        at = bwkit.http_get(lab.mint_url + "/ledger?since=%d" % t1)[1]                   # at or after: the first hour's second comes back too
+        self.assertGreaterEqual(len(at.splitlines()), 5)
+        self.assertEqual(bwkit.http_get(lab.mint_url + "/ledger?since=%d" % (int(time.time()) + 86400))[1], "")
+        with self.assertRaises(bwkit.urlerror.HTTPError) as cm:
+            bwkit.http_get(lab.mint_url + "/ledger?since=yesterday")
+        self.assertEqual(cm.exception.code, 400)
+        self.assertEqual(lab.mint.ledger_text(since=None), whole.encode())
 
 
 class Served(unittest.TestCase):
