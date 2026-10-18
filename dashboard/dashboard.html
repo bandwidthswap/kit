@@ -298,7 +298,7 @@ svg .seg.relay{fill:var(--accent)} svg .seg.fee{fill:var(--warn)} svg .seg.premi
   function mapCard(){
     var m=D.map; if(!m||!m.places) return '';
     var byPlace={}; for(var n in (m.nodes||{})) (byPlace[m.nodes[n]]=byPlace[m.nodes[n]]||[]).push(n);
-    var rows=Object.keys(m.places).map(function(id){ var p=m.places[id]; return '<tr><td>'+esc(p.name||id)+((p.name&&p.name!==id)?' <span class="m">'+esc(id)+'</span>':'')+'</td>'<td>'+esc(p.domain)+'</td><td>'+esc(p.medium)+' · '+esc(p.range_class)+'</td><td>'+(p.mapped?'mapped':'proposed')+'</td><td>'+esc((byPlace[id]||[]).join(', ')||'none')+'</td></tr>'; });
+    var rows=Object.keys(m.places).map(function(id){ var p=m.places[id]; return '<tr><td>'+esc(p.name||id)+((p.name&&p.name!==id)?' <span class="m">'+esc(id)+'</span>':'')+'</td><td>'+esc(p.domain)+'</td><td>'+esc(p.medium)+' · '+esc(p.range_class)+'</td><td>'+(p.mapped?'mapped':'proposed')+'</td><td>'+esc((byPlace[id]||[]).join(', ')||'none')+'</td></tr>'; });
     return '<h2>The map <small>places by Mint consensus; here, the membership\'s file</small></h2><div class="tbl"><table><thead><tr><th>place</th><th>domain</th><th>medium</th><th></th><th>nodes</th></tr></thead><tbody>'+rows.join('')+'</tbody></table></div>';
   }
 
