@@ -1,35 +1,44 @@
 #!/usr/bin/env python3
-"""bwkit: the Bandwidth Swap Phase 0 receipt daemon and Mint, in one file.
+"""bwkit: the Bandwidth Swap pilot receipt daemon and Mint, in one file.
 
-Needs Python 3.9+ and the `cryptography` package (Debian: python3-cryptography).
+The reference implementation of the Bandwidth Swap Protocol, pilot profile 1
+(spec/PROTOCOL.md, `bsp/1`). Needs Python 3.9+ and the `cryptography`
+package (Debian: python3-cryptography).
 
 Three roles, chosen by "role" in the config file:
 
   payer  (bw-house)  Every hour: read the tunnel's byte counters, build the
                      Figure 2 receipt for the window, sign it, ask the hop
                      to acknowledge it, send receipt and ack to the Mint.
-  hop    (bw-forest) Serve /ack: check the payer's signature and clock,
-                     read its own counters for the same window, sign its own
-                     count with prev_sig = the payer's signature, send that
-                     ack to the Mint too, and return it.
-  mint   (bw-mint)   Serve /receipt: verify every signature, append each
-                     receipt and ack to an append-only ledger, and settle a
-                     window once both are there, at the smaller of the two
-                     signed counts.
+  hop    (bw-forest, bw-neighbor)
+                     Serve /ack: check the payer's signature, its clock and
+                     the hop's patience with it, read its own counters for
+                     the same window, sign its own count with prev_sig = the
+                     payer's signature, send that ack to the Mint too, and
+                     return it. `bwkit announce` signs the link's parameters
+                     (price, margin, patience, ...) and registers them with
+                     the Mint.
+  mint   (bw-mint)   Serve /receipt and /link: verify every signature,
+                     append each receipt and ack to an append-only ledger,
+                     keep the link announcements, and settle a window once
+                     both halves are there, at the smaller of the two signed
+                     counts, under the announcement in force at the window's
+                     start, with the Steward's fee on every settlement.
 
 The Mint also commits: after every settlement it signs the Merkle root over
 that hour's settlements (paper, Section 4) and appends the commitment to the
-ledger; GET /commitments lists the current one for every hour, `bwkit prove`
-prints the inclusion proofs for an hour and `bwkit verify-proof` checks them
-with no node state. `bwkit rebuild` makes the ledger again from the payer's
-receipts.jsonl and the hop's acks.jsonl alone and, with --compare, says
-whether the Mint's ledger and its commitments agree with it.
+ledger; GET /commitments lists the current one for every hour, GET /proof
+and `bwkit prove` give the inclusion proofs for an hour and `bwkit
+verify-proof` checks them with no node state. `bwkit rebuild` makes the
+ledger again from the payer's receipts.jsonl, the hop's acks.jsonl and the
+announcements alone and, with --compare, says whether the Mint's ledger and
+its commitments agree with it.
 
 The Mint also reports: `bwkit report` (the bwkit-status timer, every two
-minutes) summarises the ledger per node, names and roles only, with the
-latest commitment's hour and root, and posts it to the status page's Worker,
-so bandwidthswap.com can say which nodes are up while nothing reaches the
-LAN.
+minutes) summarises the ledger per node, names and roles, with the latest
+commitment, the Mint's NYM and the proofs of that hour, and posts it to the
+status page's Worker, so bandwidthswap.com can say which nodes are up and a
+browser can check the commitment while nothing reaches the LAN.
 
 The receipt is the paper's Figure 2:
 
@@ -47,10 +56,10 @@ the window (a SHA-256 over them) until a chunked data plane exists.
 
 Files: config in /etc/bwkit/config.json (BWKIT_CONFIG), everything else in
 /var/lib/bwkit (BWKIT_DIR): key.priv, peers.json, state.json, ledger.jsonl,
-outbox/, sent/. Every node keeps its own signed copies: the payer appends
-receipts.jsonl and acks.jsonl, the hop acks.jsonl, and both append sent.jsonl
-with the Mint's answer to each envelope, which carries the Mint's signed
-commitment when one was made.
+links.jsonl, outbox/, sent/. Every node keeps its own signed copies: the
+payer appends receipts.jsonl and acks.jsonl, the hop acks.jsonl and
+links.jsonl, and both append sent.jsonl with the Mint's answer to each
+envelope, which carries the Mint's signed commitment when one was made.
 """
 
 import argparse
@@ -59,29 +68,50 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import socket
+import subprocess
 import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib import error as urlerror
+from urllib import parse as urlparse
 from urllib import request as urlrequest
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
+IMPL = "bwkit/" + VERSION               # `impl` in every envelope: informational, never the profile
+PROTO = 1                               # the profile every record this kit writes carries (spec, Section 14)
+PROTOS = (1,)                           # the profiles it accepts; a record without `proto` is profile 1
 FIELDS = ("payer", "hop", "hop_index", "merkle_root", "bytes", "t_first", "t_last", "prev_sig")
-DOMAIN = b"bandwidthswap/receipt/v1\n"   # prefixed to every signed message
+DOMAIN = b"bandwidthswap/receipt/v1\n"   # prefixed to every signed receipt and ack
 COMMIT_DOMAIN = b"bandwidthswap/commitment/v1\n"   # prefixed to every signed commitment
+LINK_DOMAIN = b"bandwidthswap/link/v1\n"           # prefixed to every signed link announcement
 LEAF_PREFIX, NODE_PREFIX = b"\x00", b"\x01"       # RFC 6962: a leaf and an inner node hash differently
 LEAF_SKIP = ("t",)                      # the settlement's own clock stays out of its leaf (see leaf_of)
-CLOCK_TOLERANCE_S = 5                   # OPEN-QUESTIONS B9 default: 5 seconds, decline
-AGREE_PCT = 1.0                         # two honest meters of one window differ by less than this
+CLOCK_TOLERANCE_S = 5                   # the pilot's clock rule: 5 seconds, decline; also the Mint's slack on `since`
+AGREE_PCT = 1.0                         # the pilot's agreement margin: two honest meters of one wired window differ by less
 AGREE_MIN_BYTES = 65536                 # or by less than this, whichever is larger
 DEFAULT_PORT = 8710
 DEFAULT_PRICE_USD_PER_GB = 0.10         # the lab's posted price; dollars, no token
+DEFAULT_STEWARD_FEE = 0.05              # f: the fraction of every fee that is the Network Steward's (paper, 3.3)
+PILOT_LINK = {                          # what governs a window with no announcement in force (spec, Appendix B)
+    "price": DEFAULT_PRICE_USD_PER_GB, "unit": "USD/GB", "carry": 0, "clock_tolerance_s": CLOCK_TOLERANCE_S,
+    "margin": AGREE_PCT / 100.0, "min_bytes": AGREE_MIN_BYTES, "patience_windows": 0, "window": "hour",
+    "medium": "wire", "range_class": "room", "sig_scheme": "ed25519", "receipt_lifetime_s": None,
+    "light_time_s": 0, "contact_plan": None,
+}
+LINK_PARAMS = tuple(PILOT_LINK)         # the parameters a hop's config may set under "link"
+LINK_FIELDS = ("kind", "proto", "relay", "payer") + LINK_PARAMS + ("domain", "since", "sig")
+PROFILE_1_CONSTANTS = {"unit": "USD/GB", "carry": 0, "window": "hour", "sig_scheme": "ed25519",
+                       "light_time_s": 0, "contact_plan": None}   # what profile 1 fixes; the paper has the rest
+SETTLEMENT_PROFILE_KEYS = ("proto", "steward_fee", "fee_usd", "margin", "min_bytes", "link")   # what 0.2.0 settlements lack
+DECLINE_WORDS = ("clock", "patience", "since", "domain", "profile", "replay")   # 409 reasons, the word before the colon
+TOKEN_RE = re.compile(r"^[a-z0-9-]{1,32}$")   # a medium or range class
 HTTP_TIMEOUT_S = 10
 HOP_FLUSH_DELAY_S = 5                   # the hop sends its own copy of an ack this long after answering the payer
 FLUSH_EVERY_S = 300                     # and retries whatever is left in its outbox this often
@@ -108,6 +138,11 @@ def b64u_dec(s):
     return base64.urlsafe_b64decode(s + pad)
 
 
+def canon_json(obj):
+    """Canonical JSON (spec, Section 3): sorted keys, no whitespace, ASCII only."""
+    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+
+
 def nym_of_pub(pub):
     raw = pub.public_bytes(serialization.Encoding.Raw, serialization.PublicFormat.Raw)
     return "ed25519:" + b64u(raw)
@@ -120,6 +155,17 @@ def pub_of_nym(nym):
     if len(raw) != 32:
         raise ValueError("NYM is not 32 bytes")
     return Ed25519PublicKey.from_public_bytes(raw)
+
+
+def is_int(v):
+    return isinstance(v, int) and not isinstance(v, bool)
+
+
+def check_proto(rec):
+    """Raise ValueError when rec names a profile this kit does not accept. No `proto` is profile 1."""
+    p = rec.get("proto")
+    if p is not None and (not is_int(p) or p not in PROTOS):
+        raise ValueError("profile %r is not accepted (this implementation accepts %s)" % (p, ", ".join(str(x) for x in PROTOS)))
 
 
 def canon(receipt):
@@ -147,7 +193,7 @@ def check_receipt(r):
     pub_of_nym(r["payer"])
     pub_of_nym(r["hop"])
     for k in ("hop_index", "bytes", "t_first", "t_last"):
-        if not isinstance(r[k], int) or isinstance(r[k], bool) or r[k] < 0:
+        if not is_int(r[k]) or r[k] < 0:
             raise ValueError("%s must be a non-negative integer" % k)
     if r["hop_index"] < 1:
         raise ValueError("hop_index starts at 1")
@@ -170,6 +216,7 @@ def check_envelope(env):
     kind = env.get("kind")
     if kind not in ("receipt", "ack"):
         raise ValueError("kind must be receipt or ack")
+    check_proto(env)
     r = env.get("receipt")
     check_receipt(r)
     signer = r["payer"] if kind == "receipt" else r["hop"]
@@ -195,16 +242,113 @@ def meter_root(payer_nym, meter):
 
 
 def assert_public(text):
-    """Raise ValueError when text carries an address. A status report is names and roles only."""
+    """Raise ValueError when text carries an address. A status report is names, roles and signed records only."""
     for pat in PRIVATE_PATTERNS:
         m = pat.search(text)
         if m:
             raise ValueError("a status report may not carry an address (%s)" % m.group(0))
 
 
-def resolve(receipt_env, ack_env, price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB, now=None):
-    """Settle one window from a payer's receipt and a hop's ack. Pure: needs nothing else.
+# ---------------------------------------------------------------- link announcements (spec, Section 7)
 
+def link_body(rec):
+    return {k: v for k, v in rec.items() if k != "sig"}
+
+
+def link_canon(rec):
+    """The signed bytes of an announcement: the domain string and the canonical JSON of the record without sig."""
+    return LINK_DOMAIN + canon_json(link_body(rec)).encode()
+
+
+def sign_link(priv, body):
+    return b64u(priv.sign(LINK_DOMAIN + canon_json(body).encode()))
+
+
+def verify_link(rec):
+    """True when rec carries its relay's signature."""
+    try:
+        pub_of_nym(rec["relay"]).verify(b64u_dec(rec["sig"]), link_canon(rec))
+        return True
+    except (InvalidSignature, ValueError, KeyError, TypeError):
+        return False
+
+
+def link_hash(rec):
+    """An announcement's name: the SHA-256 of its canonical JSON, signature included."""
+    return hashlib.sha256(canon_json(rec).encode()).hexdigest()
+
+
+def check_link(rec):
+    """Raise ValueError unless rec has exactly an announcement's fields with sane types. Signature not checked here."""
+    if not isinstance(rec, dict) or set(rec) != set(LINK_FIELDS):
+        raise ValueError("an announcement has exactly the fields %s" % ", ".join(LINK_FIELDS))
+    if rec["kind"] != "link":
+        raise ValueError("kind must be link")
+    check_proto(rec)
+    pub_of_nym(rec["relay"])
+    pub_of_nym(rec["domain"])
+    if rec["payer"] != "*":
+        pub_of_nym(rec["payer"])
+    for k in ("price", "margin", "carry"):
+        v = rec[k]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v or v < 0 or v in (float("inf"),):
+            raise ValueError("%s must be a non-negative number" % k)
+    if rec["margin"] > 1:
+        raise ValueError("margin is a fraction, at most 1")
+    for k in ("min_bytes", "clock_tolerance_s", "patience_windows", "light_time_s", "since"):
+        if not is_int(rec[k]) or rec[k] < 0:
+            raise ValueError("%s must be a non-negative integer" % k)
+    if rec["receipt_lifetime_s"] is not None and (not is_int(rec["receipt_lifetime_s"]) or rec["receipt_lifetime_s"] < 0):
+        raise ValueError("receipt_lifetime_s must be null or a non-negative integer")
+    for k in ("unit", "window", "sig_scheme"):
+        if not isinstance(rec[k], str):
+            raise ValueError("%s must be a string" % k)
+    for k in ("medium", "range_class"):
+        if not isinstance(rec[k], str) or not TOKEN_RE.match(rec[k]):
+            raise ValueError("%s is 1 to 32 characters of a-z, 0-9 and -" % k)
+    if not isinstance(rec["sig"], str) or len(b64u_dec(rec["sig"])) != 64:
+        raise ValueError("sig is not an ed25519 signature")
+
+
+def profile_1_link(rec):
+    """Why rec is not a profile-1 announcement, or None. Carry, light time, contact plans and other units are the paper's."""
+    for k, v in PROFILE_1_CONSTANTS.items():
+        if rec[k] != v:
+            return "%s must be %s in profile 1, not %s" % (k, json.dumps(v), json.dumps(rec[k]))
+    return None
+
+
+def link_params(link):
+    """The parameters that govern a window: the pilot's defaults, or the announcement's."""
+    p = dict(PILOT_LINK)
+    if link:
+        for k in LINK_PARAMS:
+            p[k] = link[k]
+    return p
+
+
+def link_in_force(links, payer, hop, t_first):
+    """The announcement in force for a window (spec, Section 7), or None for the pilot defaults.
+
+    Of the hop's announcements for this payer or for `*` with since at or
+    before t_first: the newest since; of two with the same since, the one
+    for this payer; of two still tied, the lexically greater hash.
+    """
+    best = None
+    for rec in links:
+        if rec["relay"] != hop or rec["payer"] not in (payer, "*") or rec["since"] > t_first:
+            continue
+        key = (rec["since"], 1 if rec["payer"] == payer else 0, link_hash(rec))
+        if best is None or key > best[0]:
+            best = (key, rec)
+    return best[1] if best else None
+
+
+def resolve(receipt_env, ack_env, price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB, now=None, link=None, fee=DEFAULT_STEWARD_FEE):
+    """Settle one window from a payer's receipt and a hop's ack (spec, Section 8). Pure: needs nothing else.
+
+    link is the announcement in force at the window's start, or None for the
+    pilot defaults with price_usd_per_gb; fee is the Steward's fraction f.
     Raises ValueError when the two don't describe the same window or a
     signature fails. Returns the settlement record.
     """
@@ -218,11 +362,14 @@ def resolve(receipt_env, ack_env, price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB, now
     for f in FIELDS:
         if f not in ("bytes", "prev_sig") and a[f] != r[f]:
             raise ValueError("the ack changed %s" % f)
+    p = link_params(link)
+    price = p["price"] if link else price_usd_per_gb
     x, y = r["bytes"], a["bytes"]
     settled = min(x, y)
-    agree = abs(x - y) <= max(AGREE_MIN_BYTES, AGREE_PCT / 100.0 * max(x, y))
+    agree = abs(x - y) <= max(p["min_bytes"], p["margin"] * max(x, y))
+    amount = round(settled / 1e9 * price, 6)
     return {
-        "kind": "settlement",
+        "kind": "settlement", "proto": PROTO,
         "t": int(now if now is not None else time.time()),
         "payer": r["payer"], "hop": r["hop"], "hop_index": r["hop_index"],
         "t_first": r["t_first"], "t_last": r["t_last"],
@@ -230,9 +377,17 @@ def resolve(receipt_env, ack_env, price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB, now
         "status": "settled" if agree else "disputed",
         "rule": "the smaller of the two signed counts; neither party is bound beyond what it signed",
         "receipt_sig": receipt_env["sig"], "ack_sig": ack_env["sig"],
-        "price_usd_per_gb": price_usd_per_gb,
-        "amount_usd": round(settled / 1e9 * price_usd_per_gb, 6),
+        "price_usd_per_gb": price,
+        "amount_usd": amount,
+        "steward_fee": fee, "fee_usd": round(amount * fee, 6),
+        "margin": p["margin"], "min_bytes": p["min_bytes"],
+        "link": link_hash(link) if link else None,
     }
+
+
+def legacy_shape(s):
+    """A settlement as 0.2.0 wrote it: without the profile-1 members. Such a record is profile 1 under the pilot defaults."""
+    return {k: v for k, v in s.items() if k not in SETTLEMENT_PROFILE_KEYS}
 
 
 # ---------------------------------------------------------------- commitments
@@ -246,12 +401,11 @@ def leaf_of(settlement):
     """A leaf: SHA-256 over the canonical JSON of the settlement entry, without `t`.
 
     `t` is the Mint's own clock, which nobody else can know. Everything else
-    in the entry follows from the two signed receipts and the posted price,
+    in the entry follows from the two signed receipts and the announcement,
     so a ledger rebuilt from the parties' copies makes the same leaf.
     """
     body = {k: v for k, v in settlement.items() if k not in LEAF_SKIP}
-    data = json.dumps(body, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
-    return hashlib.sha256(LEAF_PREFIX + data).digest()
+    return hashlib.sha256(LEAF_PREFIX + canon_json(body).encode()).digest()
 
 
 def node_of(left, right):
@@ -333,8 +487,8 @@ def make_commitment(priv, settlements, window, now):
     ss, leaves = hour_leaves(settlements)
     root = merkle_root(leaves).hex()
     mint = nym_of_pub(priv.public_key()) if priv else None
-    return {"kind": "commitment", "t": int(now), "mint": mint, "window": window, "root": root, "count": len(ss),
-            "signature": b64u(priv.sign(commitment_canon(mint, window, root, len(ss)))) if priv else None}
+    return {"kind": "commitment", "proto": PROTO, "t": int(now), "mint": mint, "window": window, "root": root,
+            "count": len(ss), "signature": b64u(priv.sign(commitment_canon(mint, window, root, len(ss)))) if priv else None}
 
 
 def make_proof(commitment, settlements):
@@ -344,7 +498,7 @@ def make_proof(commitment, settlements):
     if root != commitment["root"] or len(ss) != commitment["count"]:
         raise ValueError("the hour's %d settlements give root %s; the commitment is over %d with root %s" % (
             len(ss), root, commitment["count"], commitment["root"]))
-    return {"kind": "proof", "bwkit": VERSION, "mint": commitment["mint"], "window": commitment["window"],
+    return {"kind": "proof", "proto": PROTO, "impl": IMPL, "mint": commitment["mint"], "window": commitment["window"],
             "root": root, "count": len(ss), "signature": commitment["signature"],
             "settlements": [{"index": i, "leaf": leaves[i].hex(), "path": merkle_path(leaves, i), "settlement": s}
                             for i, s in enumerate(ss)]}
@@ -358,6 +512,7 @@ def check_proof(doc, mint=None):
     try:
         if doc.get("kind") != "proof":
             raise ValueError("not a proof")
+        check_proto(doc)
         c = {k: doc[k] for k in ("mint", "window", "root", "count", "signature")}
         items = doc["settlements"]
         if not isinstance(items, list):
@@ -380,7 +535,7 @@ def check_proof(doc, mint=None):
             where = "window %d..%d, %d bytes %s" % (s["t_first"], s["t_last"], s["settled_bytes"], s["status"])
             if commit_hour(s) != c["window"]:
                 raise ValueError("%s: belongs to hour %d, not %s" % (where, commit_hour(s), c["window"]))
-            if not isinstance(item["index"], int) or not 0 <= item["index"] < c["count"]:
+            if not is_int(item["index"]) or not 0 <= item["index"] < c["count"]:
                 raise ValueError("%s: index %r is outside the commitment's %s leaves" % (where, item.get("index"), c["count"]))
             if not merkle_check(leaf_of(s), item["path"], c["root"]):
                 raise ValueError("%s: NOT in the commitment (its leaf does not reach the root)" % where)
@@ -424,21 +579,39 @@ def read_jsonl(path):
     return entries, bad
 
 
-def rebuild(receipts, acks, price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB, now=None, names=("receipts.jsonl", "acks.jsonl")):
-    """A Mint's ledger from the payer's receipts and the hop's acks alone.
+def rebuild(receipts, acks, links=(), price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB, fee=DEFAULT_STEWARD_FEE, now=None,
+            names=("receipts.jsonl", "acks.jsonl", "links.jsonl")):
+    """A Mint's ledger from the payer's receipts, the hop's acks and the announcements alone (spec, Section 11).
 
-    receipts and acks are lists of (line number, envelope), as read_jsonl
-    gives them. Every signature is checked; what fails is left out and named
-    in the report. Each receipt is paired with the ack that chains to it
-    (prev_sig = the receipt's signature) and settled by resolve(), the Mint's
-    own rule, so a receipt the hop declined stays without an ack. Each hour's
-    settlements get a commitment, unsigned, since only the Mint holds its key.
+    receipts, acks and links are lists of (line number, record), as
+    read_jsonl gives them. Every signature is checked; what fails is left
+    out and named in the report. Each receipt is paired with the ack that
+    chains to it (prev_sig = the receipt's signature) and settled by
+    resolve(), the Mint's own rule, under the announcement in force at the
+    window's start, so a receipt the hop declined stays without an ack.
+    Each hour's settlements get a commitment, unsigned, since only the Mint
+    holds its key.
 
     Returns (entries, report): the ledger lines in the order a Mint would
     have written them, and the counts, with `bad` naming what was left out.
     """
     now = int(now if now is not None else time.time())
-    bad, seen, good = [], set(), {"receipt": [], "ack": []}
+    bad, seen, good = [], set(), {"receipt": [], "ack": [], "link": []}
+    for i, rec in links:
+        try:
+            check_link(rec)
+            if not verify_link(rec):
+                raise ValueError("bad signature")
+            why = profile_1_link(rec)
+            if why:
+                raise ValueError(why)
+        except ValueError as e:
+            bad.append("%s line %d: %s" % (names[2], i, e))
+            continue
+        if rec["sig"] not in seen:
+            seen.add(rec["sig"])
+            good["link"].append(rec)
+    keys, acks_by_prev = {}, {}
     for name, rows, kind in ((names[0], receipts, "receipt"), (names[1], acks, "ack")):
         for i, env in rows:
             try:
@@ -448,12 +621,25 @@ def rebuild(receipts, acks, price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB, now=None,
             except ValueError as e:
                 bad.append("%s line %d: %s" % (name, i, e))
                 continue
-            if env["sig"] not in seen:
-                seen.add(env["sig"])
-                good[kind].append(env)
-    acks_by_prev = {a["receipt"]["prev_sig"]: a for a in good["ack"]}
-    rep = {"receipts": len(good["receipt"]), "acks": len(good["ack"]), "settlements": 0, "disputed": 0, "hours": 0,
-           "receipts_without_ack": 0, "acks_without_receipt": 0, "bad": bad}
+            if env["sig"] in seen:
+                continue
+            if kind == "receipt":
+                k = window_key(env["receipt"])
+                if k in keys:
+                    bad.append("%s line %d: a second receipt for window %d..%d (replay); the first is kept" % (
+                        name, i, env["receipt"]["t_first"], env["receipt"]["t_last"]))
+                    continue
+                keys[k] = env
+            else:
+                if env["receipt"]["prev_sig"] in acks_by_prev:
+                    bad.append("%s line %d: a second ack for receipt %s (replay); the first is kept" % (
+                        name, i, env["receipt"]["prev_sig"][:12]))
+                    continue
+                acks_by_prev[env["receipt"]["prev_sig"]] = env
+            seen.add(env["sig"])
+            good[kind].append(env)
+    rep = {"receipts": len(good["receipt"]), "acks": len(good["ack"]), "links": len(good["link"]), "settlements": 0,
+           "disputed": 0, "hours": 0, "receipts_without_ack": 0, "acks_without_receipt": 0, "bad": bad}
 
     def entry(env):
         return {"kind": env["kind"], "received_at": now, "from": env.get("from") or env["kind"],
@@ -467,8 +653,9 @@ def rebuild(receipts, acks, price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB, now=None,
             rep["receipts_without_ack"] += 1
             continue
         entries.append(entry(ack))
+        r = env["receipt"]
         try:
-            s = resolve(env, ack, price_usd_per_gb, now)
+            s = resolve(env, ack, price_usd_per_gb, now, link_in_force(good["link"], r["payer"], r["hop"], r["t_first"]), fee)
         except ValueError as e:
             bad.append("%s %s does not settle receipt %s: %s" % (names[1], ack["sig"][:12], env["sig"][:12], e))
             continue
@@ -501,7 +688,10 @@ def compare(rebuilt, mint_entries):
 
     The verdict is one line: AGREE, or DIFFER with the windows and hours that
     do. The lines say how, one each, and note the hours the Mint has not
-    committed to, which is not a difference.
+    committed to, which is not a difference. A settlement the Mint wrote
+    before profile 1 (no `proto`) is compared in that form: the rebuilt one
+    must then carry the pilot defaults and no announcement, and its leaf
+    for the hour's root is taken over the pre-profile members.
     """
     def settlements(entries):
         return {e["receipt_sig"]: e for e in entries if e.get("kind") == "settlement"}
@@ -517,49 +707,66 @@ def compare(rebuilt, mint_entries):
         return "%d..%d" % (s["t_first"], s["t_last"])
 
     mine, theirs = settlements(rebuilt), settlements(mint_entries)
-    my_c, their_c = commitments(rebuilt), commitments(mint_entries)
-    windows, hours, lines, notes = [], set(), [], []
+    their_c = commitments(mint_entries)
+    windows, hours, lines, notes, pre, my_leaf = [], set(), [], [], 0, {}
     for sig, s in sorted(mine.items(), key=lambda kv: settlement_order(kv[1])):
         t = theirs.get(sig)
         if t is None:
             windows.append(where(s))
             lines.append("window %s: settled from the parties' copies, not on the Mint's ledger" % where(s))
-        elif leaf_of(t) != leaf_of(s):
+            my_leaf[sig] = leaf_of(s)
+            continue
+        a = s
+        if "proto" not in t:                   # written before profile 1: profile 1 under the defaults, no fee
+            pre += 1
+            a = legacy_shape(s)
+            if s.get("link") is not None or s.get("margin") != PILOT_LINK["margin"] or s.get("min_bytes") != PILOT_LINK["min_bytes"]:
+                windows.append(where(s))
+                lines.append("window %s: settled under announcement %s here; the Mint settled it before profile 1, under the defaults" % (
+                    where(s), (s.get("link") or "?")[:16]))
+        my_leaf[sig] = leaf_of(a)
+        if leaf_of(a) != leaf_of(t):
             windows.append(where(s))
-            diffs = ["%s %r here, %r on the Mint" % (k, s.get(k), t.get(k))
-                     for k in sorted(set(s) | set(t)) if k not in LEAF_SKIP and s.get(k) != t.get(k)]
+            diffs = ["%s %r here, %r on the Mint" % (k, a.get(k), t.get(k))
+                     for k in sorted(set(a) | set(t)) if k not in LEAF_SKIP and a.get(k) != t.get(k)]
             lines.append("window %s: %s" % (where(s), "; ".join(diffs)))
     for sig, t in sorted(theirs.items(), key=lambda kv: settlement_order(kv[1])):
         if sig not in mine:
             windows.append(where(t))
             lines.append("window %s: on the Mint's ledger, not in the parties' copies" % where(t))
-    their_hours = {}
+    my_hours, their_hours = {}, {}
+    for s in mine.values():
+        my_hours.setdefault(commit_hour(s), []).append(s)
     for t in theirs.values():
         their_hours.setdefault(commit_hour(t), []).append(t)
-    for h in sorted(set(my_c) | set(their_c)):
-        m, c = my_c.get(h), their_c.get(h)
+    committed = 0
+    for h in sorted(set(my_hours) | set(their_c)):
+        ss = sorted(my_hours.get(h, []), key=settlement_order)
+        m = (merkle_root([my_leaf[s["receipt_sig"]] for s in ss]).hex(), len(ss)) if ss else None
+        c = their_c.get(h)
         if c is None:
-            notes.append("hour %d: no commitment on the Mint's ledger (%s rebuilt)" % (h, plural(m["count"], "settlement")))
+            notes.append("hour %d: no commitment on the Mint's ledger (%s rebuilt)" % (h, plural(m[1], "settlement")))
             continue
+        committed += 1 if m else 0
         if not verify_commitment(c):
             hours.add(h)
             lines.append("hour %d: the Mint's commitment is not signed by %s" % (h, c.get("mint")))
         if m is None:
             hours.add(h)
             lines.append("hour %d: the Mint committed to %s; the parties' copies have none in that hour" % (h, plural(c["count"], "settlement")))
-        elif (m["root"], m["count"]) != (c["root"], c["count"]):
+        elif m != (c["root"], c["count"]):
             hours.add(h)
-            lines.append("hour %d: root %s over %d here, %s over %d on the Mint" % (
-                h, m["root"][:16], m["count"], c["root"][:16], c["count"]))
+            lines.append("hour %d: root %s over %d here, %s over %d on the Mint" % (h, m[0][:16], m[1], c["root"][:16], c["count"]))
         own = their_hours.get(h, [])
         if not own or merkle_root(hour_leaves(own)[1]).hex() != c["root"] or len(own) != c["count"]:
             hours.add(h)
             lines.append("hour %d: the Mint's own ledger no longer matches the commitment it signed" % h)
     agree = not windows and not hours
-    committed = sum(1 for h in my_c if h in their_c)
     if agree:
         verdict = "AGREE: %d settlements in %d hours rebuilt from the parties' copies match the Mint's ledger and its %d commitments" % (
-            len(mine), len(my_c), committed)
+            len(mine), len(my_hours), committed)
+        if pre:
+            verdict += " (%d settled before profile 1, compared in that form)" % pre
         if notes:
             verdict += " (%d hours have no commitment yet)" % len(notes)
     else:
@@ -574,7 +781,7 @@ def compare(rebuilt, mint_entries):
 
 # ---------------------------------------------------------------- http
 
-USER_AGENT = "bwkit/" + VERSION   # Cloudflare's edge in front of the status page refuses Python's default (error 1010)
+USER_AGENT = IMPL   # Cloudflare's edge in front of the status page refuses Python's default (error 1010)
 
 
 def http_post(url, body, timeout=HTTP_TIMEOUT_S, headers=None):
@@ -599,7 +806,7 @@ def http_get(url, timeout=HTTP_TIMEOUT_S):
 
 
 class Decline(Exception):
-    """A request refused for a protocol reason (HTTP 409)."""
+    """A request refused for a protocol reason (HTTP 409; 403 when the message starts with `unknown`)."""
 
 
 def log(msg):
@@ -699,6 +906,26 @@ class Node:
     def append(self, name, obj):
         with open(self.path(name), "a") as f:
             f.write(json.dumps(obj, sort_keys=True) + "\n")
+
+    def read_lines(self, name, skip_partial=False):
+        """The records of one of this node's .jsonl files; with skip_partial, a half-written last line is skipped."""
+        p = self.path(name)
+        if not os.path.exists(p):
+            return []
+        with open(p) as f:
+            lines = f.read().split("\n")
+        out = []
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except ValueError:
+                if skip_partial and i == len(lines) - 1:
+                    break
+                raise
+        return out
 
     # the meter
 
@@ -810,7 +1037,7 @@ class Node:
         r = {"payer": self.nym, "hop": hop_nym, "hop_index": 1,
              "merkle_root": meter_root(self.nym, meter), "bytes": nbytes,
              "t_first": t_first, "t_last": now, "prev_sig": ""}
-        return {"kind": "receipt", "from": self.name, "bwkit": VERSION,
+        return {"kind": "receipt", "proto": PROTO, "from": self.name, "impl": IMPL,
                 "receipt": r, "sig": sign_receipt(self.priv, r), "meter": meter}
 
     def receipt_run(self, now=None):
@@ -856,8 +1083,51 @@ class Node:
 
     # hop
 
+    def my_link(self):
+        """The link parameters this hop runs with: the pilot defaults under its config's `link` object."""
+        p = dict(PILOT_LINK)
+        cfg = self.config.get("link") or {}
+        for k in LINK_PARAMS:
+            if k in cfg:
+                p[k] = cfg[k]
+        return p
+
+    def patience_state(self):
+        """Per payer: how many windows fell short of our count beyond the margin, and whether we have stopped serving it."""
+        return self.state().get("patience", {})
+
+    def note_short(self, payer, short, now):
+        """Count a window where the payer's count fell short beyond the margin (spec, Section 12)."""
+        st = self.state()
+        ps = st.setdefault("patience", {}).setdefault(payer, {"short": 0, "declined": False, "declined_at": None})
+        if short:
+            ps["short"] += 1
+        self.write_json("state.json", st)
+        return ps
+
+    def decline_payer(self, payer, now):
+        """Mark a payer declined and run the on_decline hook once, with the payer's NYM as its argument."""
+        st = self.state()
+        ps = st.setdefault("patience", {}).setdefault(payer, {"short": 0, "declined": False, "declined_at": None})
+        if ps["declined"]:
+            return
+        ps["declined"], ps["declined_at"] = True, int(now)
+        self.write_json("state.json", st)
+        cmd = self.config.get("on_decline")
+        if cmd:
+            try:
+                subprocess.Popen(shlex.split(cmd) + [payer], stdin=subprocess.DEVNULL)
+                log("on_decline: ran %s for %s" % (cmd, payer))
+            except OSError as e:
+                log("on_decline: could not run %s: %s" % (cmd, e))
+
+    def patience_reset(self, payer):
+        st = self.state()
+        st.get("patience", {}).pop(payer, None)
+        self.write_json("state.json", st)
+
     def ack(self, env, now=None):
-        """Acknowledge a payer's receipt with our own count. Raises Decline or ValueError."""
+        """Acknowledge a payer's receipt with our own count (spec, Section 5). Raises Decline or ValueError."""
         now = int(now if now is not None else time.time())
         signer = check_envelope(env)
         if env["kind"] != "receipt":
@@ -867,8 +1137,15 @@ class Node:
             raise ValueError("this receipt names another hop")
         if signer not in self.peers():
             raise Decline("unknown payer %s" % signer)
-        if abs(now - r["t_last"]) > CLOCK_TOLERANCE_S:
-            raise Decline("clock: payer's t_last is %d s from ours (tolerance %d s)" % (now - r["t_last"], CLOCK_TOLERANCE_S))
+        link = self.my_link()
+        tol = link["clock_tolerance_s"]
+        if abs(now - r["t_last"]) > tol:
+            raise Decline("clock: payer's t_last is %d s from ours (tolerance %d s)" % (now - r["t_last"], tol))
+        ps = self.patience_state().get(signer)
+        if link["patience_windows"] > 0 and ps and ps["short"] >= link["patience_windows"]:
+            self.decline_payer(signer, now)
+            raise Decline("patience: payer %s fell short of our count beyond the margin in %d windows (patience %d); declined" % (
+                signer, ps["short"], link["patience_windows"]))
         try:
             _, nbytes, meter = self.window(now)
         except NoBaseline:
@@ -877,42 +1154,74 @@ class Node:
         a = dict(r)
         a["bytes"] = nbytes
         a["prev_sig"] = env["sig"]
-        ack = {"kind": "ack", "from": self.name, "bwkit": VERSION,
+        ack = {"kind": "ack", "proto": PROTO, "from": self.name, "impl": IMPL,
                "receipt": a, "sig": sign_receipt(self.priv, a), "meter": meter}
+        short = nbytes - r["bytes"] > max(link["min_bytes"], link["margin"] * nbytes)
         with self.lock:
             self.commit_sample(r["t_last"], meter)
             self.append("acks.jsonl", ack)
             self.outbox_put(ack)
-        log("ack for %s %d..%d: payer says %d, we say %d" % (env.get("from"), r["t_first"], r["t_last"], r["bytes"], nbytes))
+            ps = self.note_short(signer, short, now)
+        log("ack for %s %d..%d: payer says %d, we say %d%s" % (env.get("from"), r["t_first"], r["t_last"], r["bytes"], nbytes,
+            " (short beyond the margin, %d so far)" % ps["short"] if short else ""))
         if self.config.get("mint"):
             self.flush_later(HOP_FLUSH_DELAY_S)   # our own copy, in case the payer drops an ack it dislikes
         return ack
 
+    def announce(self, now=None, since=None, post=True):
+        """Hop: sign this link's parameters and register them with the Mint (spec, Section 7). Returns (record, hash)."""
+        if self.role != "hop":
+            raise SystemExit("only a hop announces a link")
+        now = int(now if now is not None else time.time())
+        mint = (self.config.get("mint") or "").rstrip("/")
+        domain = self.config.get("mint_nym")
+        if not domain:
+            if not mint:
+                raise SystemExit("config has no mint URL (or mint_nym)")
+            try:
+                status, text = http_get(mint + "/status")
+                domain = json.loads(text)["nym"]
+            except (urlerror.URLError, socket.timeout, OSError, ValueError, KeyError) as e:
+                raise SystemExit("could not read the Mint's NYM from %s/status: %s" % (mint, e))
+        cfg = self.config.get("link") or {}
+        body = {"kind": "link", "proto": PROTO, "relay": self.nym, "payer": cfg.get("payer", "*"),
+                "domain": domain, "since": int(since if since is not None else now)}
+        body.update({k: v for k, v in self.my_link().items()})
+        rec = dict(body, sig=sign_link(self.priv, body))
+        check_link(rec)
+        why = profile_1_link(rec)
+        if why:
+            raise SystemExit("the link's config is outside profile 1: %s" % why)
+        h = link_hash(rec)
+        if post:
+            if not mint:
+                raise SystemExit("config has no mint URL")
+            try:
+                status, ans = http_post(mint + "/link", rec)
+            except (urlerror.URLError, socket.timeout, OSError) as e:
+                raise SystemExit("mint unreachable: %s" % e)
+            if not 200 <= status < 300:
+                raise SystemExit("the Mint refused the announcement: %s %s" % (status, json.dumps(ans)))
+            self.append("links.jsonl", rec)
+            log("announced link %s to the Mint: price %s %s, margin %s, min_bytes %d, patience %d, since %d" % (
+                h[:16], rec["price"], rec["unit"], rec["margin"], rec["min_bytes"], rec["patience_windows"], rec["since"]))
+        return rec, h
+
     # mint
 
+    def load_links(self, skip_partial=False):
+        return self.read_lines("links.jsonl", skip_partial)
+
     def load_index(self, skip_partial=False):
-        """Rebuild the Mint's view from the ledger.
+        """Rebuild the Mint's view from the ledger and the announcements.
 
         skip_partial: a reader beside the running Mint (the status reporter)
         may catch the last line half written; skip it rather than fail.
         """
         ix = {"by_sig": {}, "receipt_by_window": {}, "acks_by_prev": {}, "settled": {},
-              "commitments": {}, "last_commitment": None, "lines": 0}
-        p = self.path("ledger.jsonl")
-        if os.path.exists(p):
-            with open(p) as f:
-                lines = f.read().split("\n")
-            for i, line in enumerate(lines):
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    entry = json.loads(line)
-                except ValueError:
-                    if skip_partial and i == len(lines) - 1:
-                        break
-                    raise
-                self._index_line(ix, entry)
+              "commitments": {}, "last_commitment": None, "lines": 0, "links": self.load_links(skip_partial)}
+        for entry in self.read_lines("ledger.jsonl", skip_partial):
+            self._index_line(ix, entry)
         self.index = ix
         return ix
 
@@ -956,6 +1265,17 @@ class Node:
                 if env["sig"] in self.index["by_sig"]:
                     duplicates.append(env["sig"])
                     continue
+                r = env["receipt"]
+                if env["kind"] == "receipt":
+                    held = self.index["receipt_by_window"].get(window_key(r))
+                    if held is not None:
+                        raise Decline("replay: another receipt for window %d..%d is already held (sig %s)" % (
+                            r["t_first"], r["t_last"], held["sig"][:12]))
+                else:
+                    held = self.index["acks_by_prev"].get(r["prev_sig"])
+                    if held is not None:
+                        raise Decline("replay: another ack for receipt %s is already held (sig %s)" % (
+                            r["prev_sig"][:12], held["sig"][:12]))
                 entry = {"kind": env["kind"], "received_at": now, "from": peers[signer],
                          "receipt": env["receipt"], "sig": env["sig"], "meter": env.get("meter")}
                 self.ledger_append(entry)
@@ -971,6 +1291,41 @@ class Node:
             raise Decline("duplicate")
         return {"stored": stored, "duplicates": duplicates, "settlements": settlements, "commitments": commitments}
 
+    def register_link(self, rec, now=None):
+        """The Mint's /link (spec, Section 7). Checks the announcement, appends it to links.jsonl, returns its hash."""
+        now = int(now if now is not None else time.time())
+        if self.index is None:
+            self.load_index()
+        check_link(rec)
+        if not verify_link(rec):
+            raise ValueError("bad signature")
+        peers = self.peers()
+        if rec["relay"] not in peers:
+            raise Decline("unknown relay %s" % rec["relay"])
+        if rec["payer"] != "*" and rec["payer"] not in peers:
+            raise Decline("unknown payer %s" % rec["payer"])
+        if rec["domain"] != self.nym:
+            raise Decline("domain: the announcement names Mint %s, not this one" % rec["domain"])
+        why = profile_1_link(rec)
+        if why:
+            raise Decline("profile: " + why)
+        h = link_hash(rec)
+        with self.lock:
+            if any(link_hash(l) == h for l in self.index["links"]):
+                raise Decline("duplicate")
+            if rec["since"] < now - CLOCK_TOLERANCE_S:
+                raise Decline("since: %d is in the past (the Mint's clock is %d); an announcement cannot be backdated" % (rec["since"], now))
+            for e in self.index["by_sig"].values():
+                r = e["receipt"]
+                if r["hop"] == rec["relay"] and rec["payer"] in ("*", r["payer"]) and r["t_first"] >= rec["since"]:
+                    raise Decline("since: a window from %d is already held; an announcement cannot change it" % r["t_first"])
+            self.append("links.jsonl", rec)
+            self.index["links"].append(rec)
+        log("link %s registered by %s for %s: price %s %s, margin %s, min_bytes %d, patience %d, since %d" % (
+            h[:16], peers[rec["relay"]], rec["payer"] if rec["payer"] == "*" else peers.get(rec["payer"], rec["payer"]),
+            rec["price"], rec["unit"], rec["margin"], rec["min_bytes"], rec["patience_windows"], rec["since"]))
+        return h
+
     def try_settle(self, env, now):
         ix = self.index
         if env["kind"] == "receipt":
@@ -981,14 +1336,18 @@ class Node:
             ack = ix["by_sig"].get(env["sig"])
         if not rec or not ack or rec["sig"] in ix["settled"]:
             return None
+        r = rec["receipt"]
+        link = link_in_force(ix["links"], r["payer"], r["hop"], r["t_first"])
         try:
-            s = resolve(rec, ack, self.config.get("price_usd_per_gb", DEFAULT_PRICE_USD_PER_GB), now)
+            s = resolve(rec, ack, self.config.get("price_usd_per_gb", DEFAULT_PRICE_USD_PER_GB), now, link,
+                        self.config.get("steward_fee", DEFAULT_STEWARD_FEE))
         except ValueError as e:
             log("receipt %s and ack %s do not settle: %s" % (rec["sig"][:12], ack["sig"][:12], e))
             return None
         self.ledger_append(s)
-        log("%s %s..%d: payer %d, hop %d, settled %d bytes ($%.6f)" % (
-            s["status"], s["t_first"], s["t_last"], s["payer_bytes"], s["hop_bytes"], s["settled_bytes"], s["amount_usd"]))
+        log("%s %s..%d: payer %d, hop %d, settled %d bytes ($%.6f, fee $%.6f, margin %s%s)" % (
+            s["status"], s["t_first"], s["t_last"], s["payer_bytes"], s["hop_bytes"], s["settled_bytes"], s["amount_usd"],
+            s["fee_usd"], s["margin"], " from link %s" % s["link"][:16] if s["link"] else ", the default"))
         return s
 
     def commit(self, window, now):
@@ -1014,9 +1373,10 @@ class Node:
             self.load_index()
         return sorted(self.index["commitments"].values(), key=lambda c: c["window"])
 
-    def proof(self, window):
+    def proof(self, window, reload=True):
         """Mint: the inclusion proofs for an hour's settlements, against its current commitment."""
-        self.load_index(skip_partial=True)
+        if reload or self.index is None:
+            self.load_index(skip_partial=True)
         ss = [s for s in self.index["settled"].values() if commit_hour(s) == window]
         c = self.index["commitments"].get(window)
         if c is None:
@@ -1027,11 +1387,7 @@ class Node:
         return make_proof(c, ss)
 
     def ledger_lines(self):
-        p = self.path("ledger.jsonl")
-        if not os.path.exists(p):
-            return []
-        with open(p) as f:
-            return [json.loads(l) for l in f if l.strip()]
+        return self.read_lines("ledger.jsonl")
 
     def pending(self):
         """Receipts with no ack yet, and acks with no receipt."""
@@ -1043,7 +1399,10 @@ class Node:
         return no_ack, no_receipt
 
     def invoice(self, month):
-        """Sum the settlements of a month (YYYY-MM) per payer and hop, in local time."""
+        """Sum the settlements of a month (YYYY-MM) per payer and hop, in local time, with the Steward's share apart.
+
+        A settlement from before profile 1 carries no fee, so none is taken from it.
+        """
         out = {}
         for e in self.ledger_lines():
             if e.get("kind") != "settlement":
@@ -1051,11 +1410,14 @@ class Node:
             if time.strftime("%Y-%m", time.localtime(e["t_last"])) != month:
                 continue
             k = (e["payer"], e["hop"])
-            o = out.setdefault(k, {"windows": 0, "disputed": 0, "settled_bytes": 0, "amount_usd": 0.0})
+            o = out.setdefault(k, {"windows": 0, "disputed": 0, "settled_bytes": 0, "amount_usd": 0.0, "fee_usd": 0.0, "relay_usd": 0.0})
             o["windows"] += 1
             o["disputed"] += 1 if e["status"] == "disputed" else 0
             o["settled_bytes"] += e["settled_bytes"]
+            fee = e.get("fee_usd", 0.0)
             o["amount_usd"] = round(o["amount_usd"] + e["amount_usd"], 6)
+            o["fee_usd"] = round(o["fee_usd"] + fee, 6)
+            o["relay_usd"] = round(o["amount_usd"] - o["fee_usd"], 6)
         return out
 
     # the status page
@@ -1074,9 +1436,9 @@ class Node:
     def status_report(self, now=None, service=None):
         """Mint: the lab's public summary for the status page, from the ledger alone.
 
-        Names and roles only: never a NYM, an address or a hostname beyond the
-        nodes' names. Per node: when its last receipt (for the hop, its last
-        ack) reached the Mint, the bytes it signed for its latest window, how
+        Names and roles, never an address or a hostname beyond the nodes'
+        names. Per node: when its last receipt (for the hop, its last ack)
+        reached the Mint, the bytes it signed for its latest window, how
         many it has signed, how many of its windows settled and how many of
         those were disputed, its running total of bytes (signed, counted, or
         settled for the Mint), and `history`: its windows of the last twelve
@@ -1086,9 +1448,11 @@ class Node:
         when the first entry reached the ledger. `service` is whether the
         Mint's server answered (service_up), None when not checked.
         `commitment` is the Mint's latest: the hour, the Merkle root over
-        that hour's settlements, how many, and the Mint's signature over them
-        (None until the first). The root is a hash and the signature is over
-        it; the Mint's NYM stays out.
+        that hour's settlements, how many, the Mint's signature over them and
+        the Mint's NYM (None until the first); `proof` is the proof document
+        for that hour, so a browser can check the commitment against the
+        Mint's key with nothing else. NYMs are public keys and may appear;
+        addresses may not (assert_public).
         """
         now = int(now if now is not None else time.time())
         self.load_index(skip_partial=True)
@@ -1150,11 +1514,18 @@ class Node:
             del n["history"][:-HISTORY_MAX]
         no_ack, no_receipt = self.pending()
         last = ix["last_commitment"]
+        proof = None
+        if last:
+            try:
+                proof = make_proof(last, [s for s in ix["settled"].values() if commit_hour(s) == last["window"]])
+            except ValueError:
+                proof = None                         # a settlement landed after this commitment; the next report has both
         return {
-            "v": 1, "generated_at": now, "bwkit": VERSION, "phase": 0, "window_s": 3600,
+            "v": 1, "generated_at": now, "bwkit": VERSION, "proto": PROTO, "phase": 0, "window_s": 3600,
             "since": min((e["received_at"] for e in entries), default=None),
             "service": service,
-            "commitment": {k: last[k] for k in ("t", "window", "root", "count", "signature")} if last else None,
+            "commitment": {k: last[k] for k in ("t", "window", "root", "count", "signature", "mint")} if last else None,
+            "proof": proof,
             "ledger": {"receipts": sum(1 for e in entries if e["kind"] == "receipt"),
                        "acks": sum(1 for e in entries if e["kind"] == "ack"),
                        "settlements": len(ix["settled"]), "disputed": me["disputed"],
@@ -1193,7 +1564,7 @@ class Node:
         port = port if port is not None else int(self.config.get("port", DEFAULT_PORT))
 
         class Handler(BaseHTTPRequestHandler):
-            server_version = "bwkit/" + VERSION
+            server_version = IMPL
 
             def log_message(self, fmt, *args):
                 pass
@@ -1207,9 +1578,10 @@ class Node:
                 self.wfile.write(data)
 
             def do_GET(self):
-                if self.path == "/status":
-                    st = {"name": node.name, "role": node.role, "nym": node.nym, "bwkit": VERSION,
-                          "time": int(time.time())}
+                url = urlparse.urlsplit(self.path)
+                if url.path == "/status":
+                    st = {"name": node.name, "role": node.role, "nym": node.nym, "bwkit": VERSION, "impl": IMPL,
+                          "proto": list(PROTOS), "time": int(time.time())}
                     if node.role == "mint":
                         no_ack, no_receipt = node.pending()
                         st["ledger_lines"] = node.index["lines"]
@@ -1217,11 +1589,14 @@ class Node:
                         st["commitments"] = len(node.index["commitments"])
                         st["disputed"] = sum(1 for s in node.index["settled"].values() if s["status"] == "disputed")
                         st["pending"] = {"receipts_without_ack": len(no_ack), "acks_without_receipt": len(no_receipt)}
+                        st["links"] = node.index["links"]
                     else:
                         st["sample"] = node.state().get("sample")
                         st["outbox"] = len(os.listdir(node.path("outbox")))
+                        st["link"] = node.my_link()
+                        st["patience"] = node.patience_state()
                     return self.reply(200, st)
-                if self.path == "/ledger" and node.role == "mint":
+                if url.path == "/ledger" and node.role == "mint":
                     p = node.path("ledger.jsonl")
                     data = open(p, "rb").read() if os.path.exists(p) else b""
                     self.send_response(200)
@@ -1230,8 +1605,19 @@ class Node:
                     self.end_headers()
                     self.wfile.write(data)
                     return
-                if self.path == "/commitments" and node.role == "mint":
+                if url.path == "/commitments" and node.role == "mint":
                     return self.reply(200, node.commitments())
+                if url.path == "/links" and node.role == "mint":
+                    return self.reply(200, node.index["links"])
+                if url.path == "/proof" and node.role == "mint":
+                    q = urlparse.parse_qs(url.query).get("window", [""])[0]
+                    if not q.isdigit():
+                        return self.reply(400, {"error": "window must be Unix seconds"})
+                    try:
+                        with node.lock:
+                            return self.reply(200, node.proof(int(q) - int(q) % 3600, reload=False))
+                    except SystemExit as e:
+                        return self.reply(404, {"error": str(e)})
                 self.reply(404, {"error": "no such path"})
 
             def do_POST(self):
@@ -1247,14 +1633,17 @@ class Node:
                         return self.reply(200, node.ack(body))
                     if self.path == "/receipt" and node.role == "mint":
                         return self.reply(200, node.receive(body))
+                    if self.path == "/link" and node.role == "mint":
+                        return self.reply(200, {"stored": node.register_link(body)})
                     return self.reply(404, {"error": "no such path"})
                 except Decline as e:
                     code = 409
                     msg = str(e)
                     if msg.startswith("unknown"):
                         code = 403
+                    word = msg.split(":")[0]
                     log("declined %s from %s: %s" % (self.path, self.client_address[0], msg))
-                    return self.reply(code, {"error": msg.split(":")[0] if msg.startswith("clock") else msg, "detail": msg})
+                    return self.reply(code, {"error": word if word in DECLINE_WORDS else msg, "detail": msg})
                 except ValueError as e:
                     log("refused %s from %s: %s" % (self.path, self.client_address[0], e))
                     return self.reply(400, {"error": str(e)})
@@ -1290,7 +1679,7 @@ def fmt_bytes(n):
 
 
 def main(argv=None):
-    ap = argparse.ArgumentParser(prog="bwkit", description="Bandwidth Swap Phase 0 receipt daemon and Mint")
+    ap = argparse.ArgumentParser(prog="bwkit", description="Bandwidth Swap pilot receipt daemon and Mint (bsp/1)")
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("keygen", help="make this node's ed25519 key (once) and print its NYM")
     sub.add_parser("nym", help="print this node's NYM")
@@ -1303,21 +1692,29 @@ def main(argv=None):
     sub.add_parser("sample", help="take the baseline counter sample; the first window starts now")
     sub.add_parser("receipt", help="payer: make this hour's receipt, get the ack, send both to the Mint")
     sub.add_parser("flush", help="send what is waiting in the outbox to the Mint")
+    an = sub.add_parser("announce", help="hop: sign this link's parameters (the config's `link` object) and register them with the Mint")
+    an.add_argument("--since", type=int, help="the first window start the announcement governs (Unix seconds; default now)")
+    an.add_argument("--print", dest="print_only", action="store_true", help="print the signed announcement instead of posting it")
+    pt = sub.add_parser("patience", help="hop: the payers it has counted short, and whether it has stopped serving one")
+    pt.add_argument("--reset", metavar="NYM", help="clear the count for this payer and serve it again")
     sv = sub.add_parser("serve", help="hop or mint: serve HTTP")
     sv.add_argument("--host", default="0.0.0.0")
     sv.add_argument("--port", type=int, default=None)
     sub.add_parser("status", help="what this node knows")
+    sub.add_parser("links", help="mint: the link announcements it holds")
     lg = sub.add_parser("ledger", help="mint: print the ledger")
     lg.add_argument("--disputes", action="store_true", help="only disputed settlements")
     lg.add_argument("--json", action="store_true")
-    iv = sub.add_parser("invoice", help="mint: sum a month's settlements (YYYY-MM)")
+    iv = sub.add_parser("invoice", help="mint: sum a month's settlements (YYYY-MM), with the Steward's share apart")
     iv.add_argument("month")
     vf = sub.add_parser("verify", help="check the signature on receipt files (no node state needed)")
     vf.add_argument("files", nargs="+")
     st = sub.add_parser("settle", help="resolve one window offline from a receipt file and an ack file")
     st.add_argument("receipt")
     st.add_argument("ack")
-    st.add_argument("--price", type=float, default=DEFAULT_PRICE_USD_PER_GB)
+    st.add_argument("--link", help="the announcement in force (a JSON file); without it, the pilot defaults")
+    st.add_argument("--price", type=float, default=DEFAULT_PRICE_USD_PER_GB, help="the default price when there is no announcement")
+    st.add_argument("--fee", type=float, default=DEFAULT_STEWARD_FEE, help="the Steward's fraction f")
     rp = sub.add_parser("report", help="mint: post the ledger's public summary to the status page "
                                        "(BWKIT_STATUS_URL and BWKIT_STATUS_TOKEN, from /etc/bwkit/status.env)")
     rp.add_argument("--print", dest="print_only", action="store_true", help="print the report instead of posting it")
@@ -1326,13 +1723,15 @@ def main(argv=None):
     vp = sub.add_parser("verify-proof", help="check a proof file against the commitment it carries (no node state needed)")
     vp.add_argument("file")
     vp.add_argument("--mint", help="the Mint's NYM, when you know it: refuse a proof signed by any other key")
-    rb = sub.add_parser("rebuild", help="rebuild a Mint's ledger from the payer's receipts.jsonl and the hop's acks.jsonl alone "
-                                        "(no node state needed)")
+    rb = sub.add_parser("rebuild", help="rebuild a Mint's ledger from the payer's receipts.jsonl, the hop's acks.jsonl and the "
+                                        "announcements alone (no node state needed)")
     rb.add_argument("receipts", help="the payer's receipts.jsonl")
     rb.add_argument("acks", help="the hop's acks.jsonl")
+    rb.add_argument("links", nargs="?", help="links.jsonl, the announcements (the Mint's or the hop's copy); none means the pilot defaults")
     rb.add_argument("--ledger", help="write the rebuilt ledger here instead of printing it")
     rb.add_argument("--compare", metavar="MINT_LEDGER", help="diff the rebuilt settlements and commitments against this ledger.jsonl")
-    rb.add_argument("--price", type=float, default=DEFAULT_PRICE_USD_PER_GB)
+    rb.add_argument("--price", type=float, default=DEFAULT_PRICE_USD_PER_GB, help="the default price when no announcement is in force")
+    rb.add_argument("--fee", type=float, default=DEFAULT_STEWARD_FEE, help="the Steward's fraction f")
     args = ap.parse_args(argv)
 
     if args.cmd == "verify":
@@ -1341,6 +1740,13 @@ def main(argv=None):
             with open(fn) as f:
                 env = json.load(f)
             try:
+                if isinstance(env, dict) and env.get("kind") == "link":
+                    check_link(env)
+                    if not verify_link(env):
+                        raise ValueError("bad signature")
+                    print("%s: link by %s, %s %s, margin %s, since %d, hash %s, ok" % (
+                        fn, env["relay"], env["price"], env["unit"], env["margin"], env["since"], link_hash(env)[:16]))
+                    continue
                 signer = check_envelope(env)
                 r = env["receipt"]
                 print("%s: %s by %s, %d bytes, %d..%d, ok" % (fn, env["kind"], signer, r["bytes"], r["t_first"], r["t_last"]))
@@ -1353,7 +1759,14 @@ def main(argv=None):
             rec = json.load(f)
         with open(args.ack) as f:
             ack = json.load(f)
-        s = resolve(rec, ack, args.price)
+        link = None
+        if args.link:
+            with open(args.link) as f:
+                link = json.load(f)
+            check_link(link)
+            if not verify_link(link):
+                raise SystemExit("%s: bad signature" % args.link)
+        s = resolve(rec, ack, args.price, link=link, fee=args.fee)
         print(json.dumps(s, indent=1, sort_keys=True))
         return 0
     if args.cmd == "verify-proof":
@@ -1366,13 +1779,15 @@ def main(argv=None):
     if args.cmd == "rebuild":
         receipts, bad_r = read_jsonl(args.receipts)
         acks, bad_a = read_jsonl(args.acks)
-        entries, rep = rebuild(receipts, acks, args.price, names=(os.path.basename(args.receipts), os.path.basename(args.acks)))
-        rep["bad"] = bad_r + bad_a + rep["bad"]
+        links, bad_l = read_jsonl(args.links) if args.links else ([], [])
+        names = (os.path.basename(args.receipts), os.path.basename(args.acks), os.path.basename(args.links or "links.jsonl"))
+        entries, rep = rebuild(receipts, acks, links, args.price, args.fee, names=names)
+        rep["bad"] = bad_r + bad_a + bad_l + rep["bad"]
         for line in rep["bad"]:
             print("left out: " + line, file=sys.stderr)
-        summary = ("rebuilt %d receipts and %d acks into %d settlements (%d disputed) in %d hours; "
+        summary = ("rebuilt %d receipts and %d acks under %d announcements into %d settlements (%d disputed) in %d hours; "
                    "%d receipts without ack, %d acks without receipt, %d lines left out" % (
-                       rep["receipts"], rep["acks"], rep["settlements"], rep["disputed"], rep["hours"],
+                       rep["receipts"], rep["acks"], rep["links"], rep["settlements"], rep["disputed"], rep["hours"],
                        rep["receipts_without_ack"], rep["acks_without_receipt"], len(rep["bad"])))
         if args.ledger:
             with open(args.ledger, "w") as f:
@@ -1415,10 +1830,31 @@ def main(argv=None):
     elif args.cmd == "flush":
         sent, left = node.flush()
         print("sent %d, %d left" % (sent, left))
+    elif args.cmd == "announce":
+        rec, h = node.announce(since=args.since, post=not args.print_only)
+        if args.print_only:
+            print(json.dumps(rec, indent=1, sort_keys=True))
+        else:
+            print("announced %s: %s %s, margin %s, min_bytes %d, patience %d, since %d" % (
+                h, rec["price"], rec["unit"], rec["margin"], rec["min_bytes"], rec["patience_windows"], rec["since"]))
+    elif args.cmd == "patience":
+        if node.role != "hop":
+            raise SystemExit("only a hop keeps patience")
+        if args.reset:
+            node.patience_reset(args.reset)
+            print("cleared %s" % args.reset)
+        link = node.my_link()
+        peers = node.peers()
+        pat = node.patience_state()
+        print("patience %d window%s (0 never declines), margin %s, min_bytes %d" % (
+            link["patience_windows"], "" if link["patience_windows"] == 1 else "s", link["margin"], link["min_bytes"]))
+        for nym, ps in sorted(pat.items()):
+            print("%s (%s): %d short%s" % (peers.get(nym, "?"), nym, ps["short"],
+                                           ", declined since %d" % ps["declined_at"] if ps.get("declined") else ""))
     elif args.cmd == "serve":
         node.serve(args.host, args.port)
     elif args.cmd == "status":
-        print("%s (%s) %s" % (node.name, node.role, node.nym if node.priv else "no key"))
+        print("%s (%s) %s, bwkit %s, profile %d" % (node.name, node.role, node.nym if node.priv else "no key", VERSION, PROTO))
         if node.role == "mint":
             node.load_index()
             no_ack, no_receipt = node.pending()
@@ -1428,10 +1864,29 @@ def main(argv=None):
             last = node.index["last_commitment"]
             print("commitments: %d hours%s" % (len(node.index["commitments"]),
                   (", latest for hour %d: root %s over %d" % (last["window"], last["root"][:16], last["count"])) if last else ""))
+            print("links: %d announcement%s, fee %s" % (len(node.index["links"]), "" if len(node.index["links"]) == 1 else "s",
+                                                        node.config.get("steward_fee", DEFAULT_STEWARD_FEE)))
         else:
             s = node.state().get("sample")
             print("sample: %s" % (("t %d, rx %d, tx %d" % (s["t"], s["rx"], s["tx"])) if s else "none (run `bwkit sample`)"))
             print("outbox: %d waiting" % len(os.listdir(node.path("outbox"))))
+            if node.role == "hop":
+                link = node.my_link()
+                print("link: %s %s, margin %s, min_bytes %d, patience %d, clock tolerance %d s, %s/%s" % (
+                    link["price"], link["unit"], link["margin"], link["min_bytes"], link["patience_windows"],
+                    link["clock_tolerance_s"], link["medium"], link["range_class"]))
+                declined = [n for n, ps in node.patience_state().items() if ps.get("declined")]
+                if declined:
+                    print("declined payers: %s" % ", ".join(declined))
+    elif args.cmd == "links":
+        if node.role != "mint":
+            raise SystemExit("only the Mint holds announcements")
+        peers = node.peers()
+        for rec in node.load_links():
+            print("%s  %s for %s: %s %s, margin %s, min_bytes %d, patience %d, %s/%s, since %s, hash %s" % (
+                time.strftime("%Y-%m-%d %H:%M", time.localtime(rec["since"])), peers.get(rec["relay"], rec["relay"]),
+                "any payer" if rec["payer"] == "*" else peers.get(rec["payer"], rec["payer"]), rec["price"], rec["unit"],
+                rec["margin"], rec["min_bytes"], rec["patience_windows"], rec["medium"], rec["range_class"], rec["since"], link_hash(rec)[:16]))
     elif args.cmd == "ledger":
         for e in node.ledger_lines():
             if args.disputes and not (e["kind"] == "settlement" and e["status"] == "disputed"):
@@ -1444,10 +1899,11 @@ def main(argv=None):
                     time.strftime("%Y-%m-%d %H:00", time.localtime(e["window"])), e["root"][:16],
                     e["count"], "" if e["count"] == 1 else "s", "signed" if e.get("signature") else "unsigned"))
             elif e["kind"] == "settlement":
-                print("%s  %s  %d..%d  payer %s  hop %s  settled %s  $%.6f" % (
+                print("%s  %s  %d..%d  payer %s  hop %s  settled %s  $%.6f%s" % (
                     time.strftime("%Y-%m-%d %H:%M", time.localtime(e["t_last"])), e["status"].upper(),
                     e["t_first"], e["t_last"], fmt_bytes(e["payer_bytes"]), fmt_bytes(e["hop_bytes"]),
-                    fmt_bytes(e["settled_bytes"]), e["amount_usd"]))
+                    fmt_bytes(e["settled_bytes"]), e["amount_usd"],
+                    "  fee $%.6f  margin %s%s" % (e["fee_usd"], e["margin"], "" if e.get("link") else " (default)") if "fee_usd" in e else ""))
             else:
                 r = e["receipt"]
                 print("%s  %-7s from %s  %d..%d  %s  sig %s" % (
@@ -1458,10 +1914,15 @@ def main(argv=None):
         tot = node.invoice(args.month)
         if not tot:
             print("no settlements in %s" % args.month)
+        fees = 0.0
         for (payer, hop), o in sorted(tot.items()):
-            print("%s  %s pays %s: %d windows (%d disputed), %s, $%.4f" % (
+            fees = round(fees + o["fee_usd"], 6)
+            print("%s  %s pays %s: %d windows (%d disputed), %s, $%.4f: the relay's $%.4f, the Steward's $%.4f" % (
                 args.month, peers.get(payer, payer), peers.get(hop, hop), o["windows"], o["disputed"],
-                fmt_bytes(o["settled_bytes"]), o["amount_usd"]))
+                fmt_bytes(o["settled_bytes"]), o["amount_usd"], o["relay_usd"], o["fee_usd"]))
+        if tot:
+            print("%s  the Network Steward's share: $%.4f (f = %s of every settlement since 0.3.0; none before)" % (
+                args.month, fees, node.config.get("steward_fee", DEFAULT_STEWARD_FEE)))
     elif args.cmd == "prove":
         if node.role != "mint":
             raise SystemExit("only the Mint proves")

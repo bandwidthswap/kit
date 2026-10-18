@@ -8,7 +8,9 @@ disagreement and the rule that settles them, the clock rule, unknown and
 badly signed senders, the outbox when the Mint is down, offline resolution
 with `settle`, the monthly invoice, the status report, the hourly commitment
 (the Merkle root, the ledger entry, /commitments, the report, `prove` and
-`verify-proof`) and the rebuild of the ledger from the parties' copies.
+`verify-proof`), the rebuild of the ledger from the parties' copies, and
+the 0.3.0 profile: link announcements, the Steward's fee, the margin from
+the announcement, patience, `proto`, the report's proof, and the vectors.
 """
 
 import contextlib
@@ -321,9 +323,9 @@ class StatusReport(unittest.TestCase):
         self.assertEqual([w["bytes"] for w in by["bw-forest"]["history"]], [1_000_000, 1_000_000])
         self.assertEqual([(w["bytes"], w["disputed"]) for w in by["bw-mint"]["history"]], [(1_000_000, False), (1_000_000, True)])
         text = json.dumps(rep)
-        self.assertNotIn("ed25519:", text)                   # names and roles only
-        self.assertNotIn("127.0.0.1", text)
+        self.assertNotIn("127.0.0.1", text)                  # names, roles and signed records; never an address
         bwkit.assert_public(text)
+        self.assertEqual(rep["commitment"]["mint"], self.lab.mint.nym)   # the Mint's NYM, so a browser can check the root
 
     def test_report_before_any_receipt_lists_the_peers(self):
         rep = self.lab.mint.status_report(now=self.lab.t)
@@ -562,21 +564,36 @@ class Commitments(unittest.TestCase):
             self.assertEqual(bwkit.main(["ledger"]), 0)
         self.assertEqual(sum(1 for line in out.getvalue().splitlines() if "COMMIT" in line), 3)
 
-    def test_report_carries_the_latest_root_and_nothing_else_new(self):
-        self.assertIsNone(self.lab.mint.status_report(now=self.lab.t)["commitment"])
+    def test_report_carries_the_latest_commitment_with_its_proof(self):
+        rep = self.lab.mint.status_report(now=self.lab.t)
+        self.assertEqual((rep["commitment"], rep["proof"]), (None, None))
         self.lab.hour(1_000_000, 1_000_000)
         self.lab.hour(2_000_000, 2_000_000)
+        self.lab.step(600, 2_500_000, 2_500_000)             # a second window in the latest hour
         rep = self.lab.mint.status_report(now=self.lab.t + 60, service=True)
-        self.assertEqual(set(rep), {"v", "generated_at", "bwkit", "phase", "window_s", "since", "service", "ledger", "nodes", "commitment"})
+        self.assertEqual(set(rep), {"v", "generated_at", "bwkit", "proto", "phase", "window_s", "since", "service", "ledger", "nodes",
+                                    "commitment", "proof"})
         c = self.lab.mint.ledger_lines()[-1]
-        self.assertEqual(rep["commitment"], {"t": c["t"], "window": self.lab.t - 3600, "root": c["root"], "count": 1, "signature": c["signature"]})
-        self.assertTrue(bwkit.verify_commitment(dict(rep["commitment"], mint=self.lab.mint.nym)))
+        self.assertEqual(rep["commitment"], {"t": c["t"], "window": self.lab.t - 600, "root": c["root"], "count": 1,
+                                             "signature": c["signature"], "mint": self.lab.mint.nym})
+        self.assertTrue(bwkit.verify_commitment(rep["commitment"]))
+        # the proof: the same document `bwkit prove` prints for that hour, verifiable with nothing else
+        self.assertEqual(rep["proof"], self.lab.mint.proof(rep["commitment"]["window"]))
+        ok, lines = bwkit.check_proof(rep["proof"], mint=self.lab.mint.nym)
+        self.assertTrue(ok, lines)
+        self.assertEqual(len(rep["proof"]["settlements"]), 1)
         for n in rep["nodes"]:
             self.assertEqual(set(n), {"name", "role", "last_receipt", "window_bytes", "window_t_first", "window_t_last",
                                       "receipts", "windows", "disputed", "total_bytes", "history"})
         text = json.dumps(rep)
-        self.assertNotIn("ed25519:", text)                   # the Mint's NYM stays out
-        bwkit.assert_public(text)
+        bwkit.assert_public(text)                             # NYMs and signatures may appear; addresses may not
+        self.assertLess(len(text), 64 * 1024)                 # the Worker's limit
+        # GET /proof gives the same document for any moment in the hour; an hour with nothing is 404
+        status, body = bwkit.http_get(self.lab.mint_url + "/proof?window=%d" % (rep["commitment"]["window"] + 1234))
+        self.assertEqual((status, json.loads(body)), (200, rep["proof"]))
+        with self.assertRaises(bwkit.urlerror.HTTPError) as cm:
+            bwkit.http_get(self.lab.mint_url + "/proof?window=%d" % (self.lab.t + 7200))
+        self.assertEqual(cm.exception.code, 404)
 
     def test_a_ledger_from_before_commitments_starts_with_the_next_window(self):
         self.lab.hour(1_000_000, 1_000_000)
@@ -675,7 +692,7 @@ class Rebuild(unittest.TestCase):
 
     def test_rebuild_agrees_with_the_mint(self):
         entries, rep = self.rebuild()
-        self.assertEqual(rep, {"receipts": 5, "acks": 4, "settlements": 4, "disputed": 2, "hours": 3,
+        self.assertEqual(rep, {"receipts": 5, "acks": 4, "links": 0, "settlements": 4, "disputed": 2, "hours": 3,
                                "receipts_without_ack": 1, "acks_without_receipt": 0, "bad": []})
         self.assertEqual([e["kind"] for e in entries],
                          ["receipt", "ack", "settlement", "commitment"] * 2 + ["receipt"] + ["receipt", "ack", "settlement"] * 2 + ["commitment"])
@@ -699,7 +716,7 @@ class Rebuild(unittest.TestCase):
         # the command line: the comparison, and a ledger a fresh Mint can load
         rc, out = self.run_cli("--compare", self.ledger)
         self.assertEqual(rc, 0)
-        self.assertTrue(out[0].startswith("rebuilt 5 receipts and 4 acks into 4 settlements (2 disputed) in 3 hours"), out)
+        self.assertTrue(out[0].startswith("rebuilt 5 receipts and 4 acks under 0 announcements into 4 settlements (2 disputed) in 3 hours"), out)
         self.assertTrue(out[1].startswith("AGREE"), out)
         path = os.path.join(self.lab.root, "rebuilt.jsonl")
         rc, out = self.run_cli("--ledger", path)
@@ -772,6 +789,435 @@ class Rebuild(unittest.TestCase):
         rc, out = self.run_cli()
         self.assertEqual(rc, 1)                               # the forged line
         self.assertEqual(sum(1 for line in out if '"kind": "settlement"' in line), 3)
+
+
+
+def mint_env(lab):
+    """The Mint's directory and config in the environment, as the service has them, for the command line."""
+    cfg = os.path.join(lab.root, "mint-config.json")
+    with open(cfg, "w") as f:
+        json.dump(lab.mint.config, f)
+    return {"BWKIT_DIR": lab.mint.dir, "BWKIT_CONFIG": cfg}
+
+
+def hop_env(lab):
+    cfg = os.path.join(lab.root, "hop-config.json")
+    with open(cfg, "w") as f:
+        json.dump(lab.hop.config, f)
+    return {"BWKIT_DIR": lab.hop.dir, "BWKIT_CONFIG": cfg}
+
+
+def cli(args, env):
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out), mock.patch.dict(os.environ, env):
+        rc = bwkit.main(args)
+    return rc, out.getvalue()
+
+
+class Links(unittest.TestCase):
+    """Link announcements (spec, Section 7): signed by the hop, registered with the Mint, in force from `since`."""
+
+    def setUp(self):
+        self.lab = Lab()
+        self.lab.hop.config["link"] = {"price": 0.10, "margin": 0.10, "min_bytes": 65536, "patience_windows": 0,
+                                       "medium": "wifi", "range_class": "building"}
+
+    def tearDown(self):
+        self.lab.close()
+
+    def settlements(self):
+        return [e for e in self.lab.mint.ledger_lines() if e["kind"] == "settlement"]
+
+    def resign(self, priv, rec, **changes):
+        body = {k: v for k, v in rec.items() if k != "sig"}
+        body.update(changes)
+        return dict(body, sig=bwkit.sign_link(priv, body))
+
+    def test_announcement_governs_the_windows_that_start_after_it(self):
+        self.lab.hour(100_000_000, 105_000_000)               # a 5% gap under the pilot's 1%: disputed, no announcement
+        s1 = self.settlements()[-1]
+        self.assertEqual((s1["proto"], s1["status"], s1["link"], s1["margin"], s1["min_bytes"], s1["price_usd_per_gb"]),
+                         (1, "disputed", None, 0.01, 65536, 0.1))
+        rec, h = self.lab.hop.announce(now=self.lab.t + 1)    # since = now; the window running now started before it
+        self.assertEqual((rec["kind"], rec["proto"], rec["relay"], rec["payer"], rec["domain"], rec["since"]),
+                         ("link", 1, self.lab.hop.nym, "*", self.lab.mint.nym, self.lab.t + 1))
+        self.assertEqual((rec["price"], rec["margin"], rec["min_bytes"], rec["medium"], rec["range_class"], rec["unit"], rec["carry"]),
+                         (0.1, 0.1, 65536, "wifi", "building", "USD/GB", 0))
+        self.assertTrue(bwkit.verify_link(rec))
+        bwkit.check_link(rec)
+        self.assertEqual(bwkit.link_hash(rec), h)
+        self.assertEqual(len(h), 64)
+        self.assertEqual(self.lab.mint.load_links(), [rec])                   # the Mint's registry
+        self.assertEqual(self.lab.hop.load_links(), [rec])                    # the hop's own copy
+        self.assertEqual(json.loads(bwkit.http_get(self.lab.mint_url + "/links")[1]), [rec])
+        st = json.loads(bwkit.http_get(self.lab.mint_url + "/status")[1])
+        self.assertEqual((st["links"], st["proto"], st["impl"]), ([rec], [1], "bwkit/" + bwkit.VERSION))
+        hs = json.loads(bwkit.http_get(self.lab.hop_url + "/status")[1])
+        self.assertEqual((hs["link"]["margin"], hs["link"]["medium"], hs["patience"][self.lab.payer.nym]["short"], hs["proto"]), (0.1, "wifi", 0, [1]))
+        self.lab.hour(200_000_000, 210_000_000)               # started at self.lab.t, before since: still the defaults (5% gap)
+        s2 = self.settlements()[-1]
+        self.assertEqual((s2["status"], s2["link"], s2["margin"]), ("disputed", None, 0.01))
+        out = self.lab.hour(300_000_000, 320_000_000)         # starts after since: a 10% gap is within the 10% margin
+        s3 = self.settlements()[-1]
+        self.assertEqual((s3["status"], s3["link"], s3["margin"], s3["min_bytes"], s3["price_usd_per_gb"], s3["amount_usd"], s3["fee_usd"]),
+                         ("settled", h, 0.1, 65536, 0.1, 0.01, 0.0005))
+        # offline, with the announcement, the same record; without it, the defaults
+        self.assertEqual(bwkit.resolve(out["receipt"], out["ack"], 0.1, now=s3["t"], link=rec), s3)
+        self.assertEqual(bwkit.resolve(out["receipt"], out["ack"], 0.1, now=s3["t"])["status"], "disputed")
+        rp, ap, lp = [os.path.join(self.lab.root, n) for n in ("r.json", "a.json", "l.json")]
+        for path, obj in ((rp, out["receipt"]), (ap, out["ack"]), (lp, rec)):
+            with open(path, "w") as f:
+                json.dump(obj, f)
+        rc, text = cli(["settle", rp, ap, "--link", lp], {})
+        self.assertEqual(rc, 0)
+        self.assertEqual({k: v for k, v in json.loads(text).items() if k != "t"}, {k: v for k, v in s3.items() if k != "t"})
+        rc, text = cli(["verify", lp], {})
+        self.assertEqual((rc, "link by %s" % self.lab.hop.nym in text), (0, True))
+        # a later announcement supersedes for the windows that start from its since; the earlier keeps its own
+        self.lab.hop.config["link"]["price"] = 0.2
+        rec2, h2 = self.lab.hop.announce(now=self.lab.t, since=self.lab.t)
+        self.assertNotEqual(h2, h)
+        self.lab.hour(400_000_000, 420_000_000)
+        s4 = self.settlements()[-1]
+        self.assertEqual((s4["link"], s4["price_usd_per_gb"], s4["amount_usd"], s4["fee_usd"]), (h2, 0.2, 0.02, 0.001))
+        links = self.lab.mint.load_links()
+        self.assertEqual(bwkit.link_in_force(links, self.lab.payer.nym, self.lab.hop.nym, s3["t_first"]), rec)
+        self.assertEqual(bwkit.link_in_force(links, self.lab.payer.nym, self.lab.hop.nym, s4["t_first"]), rec2)
+        self.assertIsNone(bwkit.link_in_force(links, self.lab.payer.nym, self.lab.hop.nym, s1["t_first"]))
+        rc, text = cli(["links"], mint_env(self.lab))
+        self.assertEqual((rc, text.count("bw-forest for any payer")), (0, 2))
+
+    def test_which_announcement_is_in_force(self):
+        a = {"relay": "h", "payer": "*", "since": 100}
+        b = {"relay": "h", "payer": "p", "since": 100}
+        c = {"relay": "h", "payer": "*", "since": 200}
+        d = {"relay": "other", "payer": "*", "since": 50}
+        e = {"relay": "h", "payer": "q", "since": 150}
+        self.assertIsNone(bwkit.link_in_force([a, b, c, d, e], "p", "h", 99))
+        self.assertIs(bwkit.link_in_force([a, b, c, d, e], "p", "h", 100), b)      # the same since: the payer's own
+        self.assertIs(bwkit.link_in_force([a, c, d], "p", "h", 150), a)
+        self.assertIs(bwkit.link_in_force([a, b, c, d, e], "p", "h", 200), c)      # the newest since
+        self.assertIs(bwkit.link_in_force([a, b, c, d, e], "q", "h", 160), e)
+        self.assertIs(bwkit.link_in_force([a, b, c, d, e], "q", "h", 300), c)
+        self.assertIsNone(bwkit.link_in_force([a, b, c, e], "p", "other", 300))
+        f, g = dict(a, note=1), dict(a, note=2)                                      # still tied: the greater hash
+        pick = bwkit.link_in_force([f, g], "p", "h", 100)
+        self.assertEqual(bwkit.link_hash(pick), max(bwkit.link_hash(f), bwkit.link_hash(g)))
+        self.assertEqual(bwkit.link_params(None)["margin"], 0.01)
+        self.assertEqual(bwkit.link_params(dict(bwkit.PILOT_LINK, margin=0.3, relay="h"))["margin"], 0.3)
+
+    def test_mint_refuses_what_it_must(self):
+        import time
+        rec, h = self.lab.hop.announce(now=self.lab.t, post=False)
+        self.assertEqual(self.lab.hop.load_links(), [])                       # not posted, not kept
+        post = lambda r: bwkit.http_post(self.lab.mint_url + "/link", r)   # noqa: E731
+        self.assertEqual(post(rec), (200, {"stored": h}))
+        status, body = post(rec)
+        self.assertEqual((status, body["error"]), (409, "duplicate"))
+        status, body = post(dict(rec, margin=0.5))
+        self.assertEqual((status, body["error"]), (400, "bad signature"))
+        status, body = post(dict(rec, extra=1))
+        self.assertEqual(status, 400)
+        hop = self.lab.hop
+        for changes, code, word in ((dict(domain=self.lab.payer.nym), 409, "domain"),
+                                    (dict(carry=1), 409, "profile"), (dict(light_time_s=10), 409, "profile"),
+                                    (dict(unit="EUR/GB"), 409, "profile"), (dict(contact_plan={"at": 1}), 409, "profile"),
+                                    (dict(payer=self.lab.mint.nym), 403, None),            # not in the peer list
+                                    (dict(since=int(time.time()) - 60), 409, "since")):   # backdated
+            status, body = post(self.resign(hop.priv, rec, **changes))
+            self.assertEqual(status, code, (changes, body))
+            if word:
+                self.assertEqual(body["error"], word, (changes, body))
+        stranger = bwkit.Ed25519PrivateKey.generate()
+        status, body = post(self.resign(stranger, rec, relay=bwkit.nym_of_pub(stranger.public_key())))
+        self.assertEqual(status, 403)
+        status, body = post(self.resign(hop.priv, rec, payer=self.lab.payer.nym, since=self.lab.t + 5))
+        self.assertEqual(status, 200)
+        self.assertEqual(len(self.lab.mint.load_links()), 2)
+        # an announcement that would change a window the Mint already holds is refused
+        self.lab.hour(1000, 1000)
+        status, body = post(self.resign(hop.priv, rec, since=self.lab.t - 3600, margin=0.2))
+        self.assertEqual((status, body["error"]), (409, "since"))
+        self.assertIn("already held", body["detail"])
+        for bad in (dict(rec, margin=2), dict(rec, min_bytes=-1), dict(rec, medium="Wi Fi"), dict(rec, since="now"),
+                    dict(rec, proto=2), dict(rec, price=True), dict(rec, receipt_lifetime_s=-1)):
+            with self.assertRaises(ValueError):
+                bwkit.check_link(bad)
+        hop.config["link"]["carry"] = 1                                        # the hop cannot announce outside profile 1
+        with self.assertRaises(SystemExit):
+            hop.announce(now=self.lab.t, post=False)
+
+
+class Fee(unittest.TestCase):
+    """The Steward's fee (spec, Section 8): f of every settlement, shown apart on the invoice."""
+
+    def test_every_settlement_carries_the_stewards_fee(self):
+        import time
+        lab = Lab()
+        try:
+            lab.hour(1_000_000_000, 1_000_000_000)
+            lab.hour(3_000_000_000, 2_000_000_000)
+            ss = [e for e in lab.mint.ledger_lines() if e["kind"] == "settlement"]
+            self.assertEqual([(s["amount_usd"], s["steward_fee"], s["fee_usd"]) for s in ss], [(0.1, 0.05, 0.005)] * 2)
+            month = time.strftime("%Y-%m", time.localtime(lab.t))
+            o = lab.mint.invoice(month)[(lab.payer.nym, lab.hop.nym)]
+            self.assertEqual((o["amount_usd"], o["fee_usd"], o["relay_usd"]), (0.2, 0.01, 0.19))
+            # a settlement from before profile 1 carries no fee, and none is taken from it
+            legacy = bwkit.legacy_shape(dict(ss[0], receipt_sig="legacy", t_last=ss[0]["t_last"] + 1))
+            self.assertEqual(set(ss[0]) - set(legacy), set(bwkit.SETTLEMENT_PROFILE_KEYS))
+            lab.mint.append("ledger.jsonl", legacy)
+            o = lab.mint.invoice(month)[(lab.payer.nym, lab.hop.nym)]
+            self.assertEqual((o["windows"], o["amount_usd"], o["fee_usd"], o["relay_usd"]), (3, 0.3, 0.01, 0.29))
+            # f is the Mint's configuration
+            lab.mint.config["steward_fee"] = 0.1
+            lab.hour(4_000_000_000, 4_000_000_000)
+            s = [e for e in lab.mint.ledger_lines() if e["kind"] == "settlement"][-1]
+            self.assertEqual((s["steward_fee"], s["fee_usd"]), (0.1, 0.01))
+            rc, text = cli(["invoice", month], mint_env(lab))
+            self.assertEqual(rc, 0)
+            self.assertIn("4 windows (2 disputed), 4.00 GB, $0.4000: the relay's $0.3800, the Steward's $0.0200", text)
+            self.assertIn("the Network Steward's share: $0.0200", text)
+            rc, text = cli(["ledger"], mint_env(lab))
+            self.assertIn("fee $0.005000  margin 0.01 (default)", text)
+        finally:
+            lab.close()
+
+
+class Patience(unittest.TestCase):
+    """The hop's patience (spec, Section 12): short windows counted per payer, the decline, the hook, the reset."""
+
+    def setUp(self):
+        self.lab = Lab()
+        self.hook_out = os.path.join(self.lab.root, "declined.txt")
+        hook = os.path.join(self.lab.root, "on-decline.sh")
+        with open(hook, "w") as f:
+            f.write('#!/bin/sh\necho "$1" >> "%s"\n' % self.hook_out)
+        os.chmod(hook, 0o755)
+        self.lab.hop.config["link"] = {"patience_windows": 2, "margin": 0.01, "min_bytes": 65536}
+        self.lab.hop.config["on_decline"] = hook
+
+    def tearDown(self):
+        self.lab.close()
+
+    def test_hop_declines_after_patience_windows_and_runs_the_hook(self):
+        import time
+        nym = self.lab.payer.nym
+        self.lab.hour(1_000_000, 1_000_000)                   # agrees: not short
+        self.lab.hour(3_000_000, 1_500_000)                   # the payer's count is the larger: not short
+        self.assertEqual(self.lab.hop.patience_state()[nym]["short"], 0)
+        self.lab.hour(4_000_000, 4_000_000)                   # payer 1 MB, hop 2.5 MB: short, 1 (a hop over-count looks the same)
+        self.lab.hour(4_500_000, 6_000_000)                   # short, 2: patience spent
+        self.assertEqual(self.lab.hop.patience_state()[nym], {"short": 2, "declined": False, "declined_at": None})
+        out = self.lab.hour(5_000_000, 7_000_000)             # the next receipt is declined
+        self.assertIsNone(out["ack"])
+        ps = self.lab.hop.patience_state()[nym]
+        self.assertEqual((ps["short"], ps["declined"], ps["declined_at"]), (2, True, self.lab.t))
+        for _ in range(30):                                    # the hook ran with the payer's NYM as its argument
+            if os.path.exists(self.hook_out):
+                break
+            time.sleep(0.1)
+        with open(self.hook_out) as f:
+            self.assertEqual(f.read().split(), [nym])
+        st = json.loads(bwkit.http_get(self.lab.hop_url + "/status")[1])
+        self.assertTrue(st["patience"][nym]["declined"])
+        self.assertEqual(st["link"]["patience_windows"], 2)
+        out = self.lab.hour(5_500_000, 8_000_000)             # and keeps declining, the hook not run again
+        self.assertIsNone(out["ack"])
+        with open(self.hook_out) as f:
+            self.assertEqual(len(f.read().split()), 1)
+        self.assertEqual(self.lab.mint.pending()[0].__len__(), 2)   # two receipts without ack on the Mint
+        # the operator clears it; the next window is acked and covers the lost ones at the payer's count
+        rc, text = cli(["patience"], hop_env(self.lab))
+        self.assertIn("2 short, declined since", text)
+        rc, text = cli(["patience", "--reset", nym], hop_env(self.lab))
+        self.assertEqual((rc, self.lab.hop.patience_state()), (0, {}))
+        out = self.lab.hour(6_000_000, 9_000_000)
+        self.assertIsNotNone(out["ack"])
+        self.assertEqual(out["ack"]["receipt"]["bytes"], 3_000_000)   # the hop's count since its last ack
+        s = [e for e in self.lab.mint.ledger_lines() if e["kind"] == "settlement"][-1]
+        self.assertEqual((s["settled_bytes"], s["status"]), (500_000, "disputed"))
+
+    def test_patience_zero_never_declines_and_the_tolerance_is_the_links(self):
+        self.lab.hop.config["link"] = {"patience_windows": 0, "clock_tolerance_s": 30}
+        for i in range(4):
+            out = self.lab.hour((i + 1) * 100_000, (i + 1) * 1_000_000, skew=12)   # short every time, and 12 s off
+            self.assertIsNotNone(out["ack"])
+        self.assertEqual(self.lab.hop.patience_state()[self.lab.payer.nym]["short"], 4)
+        self.lab.hop.config["link"]["clock_tolerance_s"] = 5
+        self.assertIsNone(self.lab.hour(500_000, 5_000_000, skew=12)["ack"])
+
+
+class Profile(unittest.TestCase):
+    """`proto: 1` in every record the kit writes; readers take a record without it as profile 1 and refuse other profiles."""
+
+    def setUp(self):
+        self.lab = Lab()
+
+    def tearDown(self):
+        self.lab.close()
+
+    def test_proto_in_every_envelope_and_record(self):
+        out = self.lab.hour(1000, 1000)
+        self.assertEqual((out["receipt"]["proto"], out["receipt"]["impl"]), (1, "bwkit/" + bwkit.VERSION))
+        self.assertEqual((out["ack"]["proto"], out["ack"]["impl"]), (1, "bwkit/" + bwkit.VERSION))
+        self.assertNotIn("bwkit", out["receipt"])
+        for e in self.lab.mint.ledger_lines():
+            if e["kind"] in ("settlement", "commitment"):
+                self.assertEqual(e["proto"], 1, e["kind"])
+        self.assertEqual(self.lab.mint.proof(self.lab.t - 3600)["proto"], 1)
+        # a 0.2.0 envelope: no proto, `bwkit` where `impl` is now: the hop acks it and the Mint stores it
+        env = self.lab.payer.make_receipt(self.lab.t + 3600)
+        del env["proto"], env["impl"]
+        env["bwkit"] = "0.2.0"
+        self.lab._patch_hop_clock(self.lab.t + 3600)
+        ack = self.lab.hop.ack(env)
+        self.assertEqual(ack["proto"], 1)
+        status, body = bwkit.http_post(self.lab.mint_url + "/receipt", [env, ack])
+        self.assertEqual((status, len(body["settlements"])), (200, 1))
+        # another profile is refused everywhere
+        env2 = dict(self.lab.payer.make_receipt(self.lab.t + 7200), proto=2)
+        with self.assertRaises(ValueError):
+            bwkit.check_envelope(env2)
+        self.assertEqual(bwkit.http_post(self.lab.mint_url + "/receipt", env2)[0], 400)
+        self.assertEqual(bwkit.http_post(self.lab.hop_url + "/ack", env2)[0], 400)
+        doc = dict(self.lab.mint.proof(self.lab.t - 3600), proto=2)
+        self.assertFalse(bwkit.check_proof(doc)[0])
+        self.assertFalse(bwkit.check_proof(dict(doc, proto=True))[0])
+
+    def test_mint_refuses_a_second_record_for_a_window_it_holds(self):
+        out = self.lab.hour(1000, 1000)
+        r2 = dict(out["receipt"]["receipt"], bytes=999)             # the same window, another count, re-signed
+        env2 = dict(out["receipt"], receipt=r2, sig=bwkit.sign_receipt(self.lab.payer.priv, r2))
+        status, body = bwkit.http_post(self.lab.mint_url + "/receipt", env2)
+        self.assertEqual((status, body["error"]), (409, "replay"))
+        a2 = dict(out["ack"]["receipt"], bytes=2000)                 # a second ack for the same receipt
+        ack2 = dict(out["ack"], receipt=a2, sig=bwkit.sign_receipt(self.lab.hop.priv, a2))
+        status, body = bwkit.http_post(self.lab.mint_url + "/receipt", ack2)
+        self.assertEqual((status, body["error"]), (409, "replay"))
+        self.assertEqual(len(self.lab.mint.ledger_lines()), 4)       # nothing stored
+        # the rebuild keeps the first and names the second
+        rows = [(1, out["receipt"]), (2, env2)]
+        entries, rep = bwkit.rebuild(rows, [(1, out["ack"]), (2, ack2)], now=self.lab.t)
+        self.assertEqual((rep["receipts"], rep["acks"], rep["settlements"]), (1, 1, 1))
+        self.assertEqual(len(rep["bad"]), 2)
+        self.assertTrue(all("replay" in b for b in rep["bad"]), rep["bad"])
+        self.assertEqual(bwkit.compare(entries, self.lab.mint.ledger_lines())[0], True)
+
+
+class RebuildWithLinks(unittest.TestCase):
+    """The rebuild's third input (spec, Section 11): the announcements; and a ledger from before profile 1."""
+
+    def setUp(self):
+        self.lab = Lab()
+        self.lab.hop.config["link"] = {"margin": 0.10}
+        self.lab.hour(100_000_000, 105_000_000)               # the defaults: disputed
+        self.rec, self.h = self.lab.hop.announce(now=self.lab.t, since=self.lab.t)
+        self.lab.hour(200_000_000, 210_000_000)               # under the announcement: settled
+        self.lab.hour(300_000_000, 340_000_000)               # under it: disputed
+        self.files = {}
+        for name, src in (("receipts.jsonl", self.lab.payer.path("receipts.jsonl")), ("acks.jsonl", self.lab.hop.path("acks.jsonl")),
+                          ("links.jsonl", self.lab.hop.path("links.jsonl"))):
+            self.files[name] = os.path.join(self.lab.root, name)
+            shutil.copy(src, self.files[name])
+        self.ledger = self.lab.mint.path("ledger.jsonl")
+
+    def tearDown(self):
+        self.lab.close()
+
+    def rebuild(self, with_links=True):
+        read = lambda n: bwkit.read_jsonl(self.files[n])[0]   # noqa: E731
+        return bwkit.rebuild(read("receipts.jsonl"), read("acks.jsonl"), read("links.jsonl") if with_links else (), now=self.lab.t + 9)
+
+    def test_rebuild_with_the_announcements_matches_and_without_them_differs(self):
+        entries, rep = self.rebuild()
+        self.assertEqual((rep["links"], rep["settlements"], rep["disputed"], rep["bad"]), (1, 3, 2, []))
+        mine = [e for e in entries if e["kind"] == "settlement"]
+        self.assertEqual([s["link"] for s in mine], [None, self.h, self.h])
+        agree, verdict, lines = bwkit.compare(entries, self.lab.mint.ledger_lines())
+        self.assertTrue(agree, (verdict, lines))
+        self.assertEqual(verdict, "AGREE: 3 settlements in 3 hours rebuilt from the parties' copies match the Mint's ledger and its 3 commitments")
+        entries2, rep2 = self.rebuild(with_links=False)
+        agree, verdict, lines = bwkit.compare(entries2, self.lab.mint.ledger_lines())
+        self.assertFalse(agree)
+        self.assertTrue(verdict.startswith("DIFFER in windows "), verdict)
+        self.assertEqual(len(lines), 4, lines)                 # two windows, and their two hours' roots
+        self.assertIn("link None here, '%s' on the Mint" % self.h, lines[0])
+        self.assertIn("margin 0.01 here, 0.1 on the Mint", lines[0])
+        self.assertIn("status 'disputed' here, 'settled' on the Mint", lines[0])
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            rc = bwkit.main(["rebuild", self.files["receipts.jsonl"], self.files["acks.jsonl"], self.files["links.jsonl"], "--compare", self.ledger])
+        self.assertEqual(rc, 0, out.getvalue())
+        self.assertTrue(out.getvalue().startswith("rebuilt 3 receipts and 3 acks under 1 announcements into 3 settlements (2 disputed) in 3 hours"), out.getvalue())
+        # the Mint's copy of the registry serves as well as the hop's
+        shutil.copy(self.lab.mint.path("links.jsonl"), self.files["links.jsonl"])
+        self.assertTrue(bwkit.compare(self.rebuild()[0], self.lab.mint.ledger_lines())[0])
+        # a forged announcement in the file is left out and named
+        with open(self.files["links.jsonl"], "a") as f:
+            f.write(json.dumps(dict(self.rec, margin=0.5)) + "\n")
+        entries3, rep3 = self.rebuild()
+        self.assertEqual(rep3["bad"], ["links.jsonl line 2: bad signature"])
+        self.assertTrue(bwkit.compare(entries3, self.lab.mint.ledger_lines())[0])
+
+    def legacy_ledger(self, entries, until=None):
+        """The Mint's ledger as 0.2.0 wrote it, up to the hour `until`: settlements without the profile-1 members, commitments over those."""
+        out, by_hour = [], {}
+        for e in entries:
+            if e["kind"] == "settlement" and (until is None or bwkit.commit_hour(e) < until):
+                e = bwkit.legacy_shape(e)
+            if e["kind"] == "settlement":
+                by_hour.setdefault(bwkit.commit_hour(e), []).append(e)
+            elif e["kind"] == "commitment":
+                e = bwkit.make_commitment(self.lab.mint.priv, by_hour[e["window"]], e["window"], e["t"])
+                if until is None or e["window"] < until:
+                    del e["proto"]
+            out.append(e)
+        return out
+
+    def test_a_ledger_from_before_profile_1_compares_in_its_own_form(self):
+        lab = Lab()                                            # a lab with no announcement, as the 0.2.0 nodes ran
+        try:
+            lab.hour(1_000_000, 1_000_000)
+            lab.hour(3_000_000, 2_000_000)
+            lab.step(600, 3_500_000, 2_500_000)
+            self.lab, keep = lab, self.lab
+            try:
+                legacy = self.legacy_ledger(lab.mint.ledger_lines())
+            finally:
+                self.lab = keep
+            self.assertTrue(all("proto" not in e for e in legacy if e["kind"] in ("settlement", "commitment")))
+            self.assertTrue(all(bwkit.verify_commitment(e) for e in legacy if e["kind"] == "commitment"))
+            entries, rep = bwkit.rebuild(bwkit.read_jsonl(lab.payer.path("receipts.jsonl"))[0],
+                                         bwkit.read_jsonl(lab.hop.path("acks.jsonl"))[0], now=lab.t + 9)
+            self.assertTrue(all(s["proto"] == 1 for s in entries if s["kind"] == "settlement"))
+            agree, verdict, lines = bwkit.compare(entries, legacy)
+            self.assertTrue(agree, (verdict, lines))
+            self.assertEqual(verdict, "AGREE: 3 settlements in 3 hours rebuilt from the parties' copies match the Mint's ledger and its 3 commitments "
+                                      "(3 settled before profile 1, compared in that form)")
+            # a mixed ledger: the first two hours before the upgrade, the last after
+            self.lab, keep = lab, self.lab
+            try:
+                mixed = self.legacy_ledger(lab.mint.ledger_lines(), until=lab.t - 600 - (lab.t - 600) % 3600)
+            finally:
+                self.lab = keep
+            agree, verdict, lines = bwkit.compare(entries, mixed)
+            self.assertTrue(agree, (verdict, lines))
+            self.assertIn("(2 settled before profile 1, compared in that form)", verdict)
+            # and a legacy record differing in a shared field is still a difference
+            legacy[2]["settled_bytes"] += 1
+            agree, verdict, lines = bwkit.compare(entries, legacy)
+            self.assertFalse(agree)
+            self.assertIn("settled_bytes 1000000 here, 1000001 on the Mint", lines[0])
+        finally:
+            lab.close()
+
+    def test_a_pre_profile_record_under_an_announcement_is_a_difference(self):
+        # the Mint's ledger stripped to the 0.2.0 shape although an announcement was in force: the rebuild says so
+        legacy = self.legacy_ledger(self.lab.mint.ledger_lines())
+        entries, rep = self.rebuild()
+        agree, verdict, lines = bwkit.compare(entries, legacy)
+        self.assertFalse(agree)
+        self.assertEqual(sum(1 for line in lines if "settled under announcement %s here; the Mint settled it before profile 1" % self.h[:16] in line), 2)
 
 
 if __name__ == "__main__":
