@@ -1,0 +1,122 @@
+{
+ "count": 3,
+ "impl": "bwkit/0.3.0",
+ "kind": "proof",
+ "mint": "ed25519:ZSkFPo6PQCl9IKHZpRXT7zp_1vBFqEcpwW0Zucj1Wsg",
+ "proto": 1,
+ "root": "2f770fa0d8a972a8f269660c0f732b6a13bdd539ecf40c8c7dd0f0e3d71ed365",
+ "settlements": [
+  {
+   "index": 0,
+   "leaf": "919f98d32e7069ff788fba972ec5e802213a43ab83b65f3f4d4bd07dffd949bf",
+   "path": [
+    [
+     "R",
+     "1616106f03786004e39f48c7a71d2f7bf97aeb667f157caadc5861839d78b059"
+    ],
+    [
+     "R",
+     "ce3964e48f5212b093e9916236bb14a7540d3c1ebc7bab10ba4869756976a2e4"
+    ]
+   ],
+   "settlement": {
+    "ack_sig": "m3ZUhYrVwhSIimTK6VeAJescIulkyWOVwQ63eRfV8o_0Did17iG4t1sNngvGaiw4ZrF0cSofhDfp0SPE3HCQDw",
+    "amount_usd": 0.0,
+    "fee_usd": 0.0,
+    "hop": "ed25519:7NXLckho5kxw7Bht2Dcjv_v4-ShUgY1sAdYX3V0RVec",
+    "hop_bytes": 1712,
+    "hop_index": 1,
+    "kind": "settlement",
+    "link": "84f82fb7c2473dfa6f340178a32b37177f31afb112976c5e69769afbda0ca2d2",
+    "margin": 0.05,
+    "min_bytes": 65536,
+    "payer": "ed25519:IGSk-aXtuMXYJ8tMVPFTPqR2hXXtCjkDgRKur2IWVuM",
+    "payer_bytes": 1712,
+    "price_usd_per_gb": 0.2,
+    "proto": 1,
+    "receipt_sig": "8zyLXPVUzNHEmb7IUqeWzsAkp3W1d7v81avPlYFX79q44grhPeOzmqwazOQHECb71rvr-yQxb67WS5rMS7IVAQ",
+    "rule": "the smaller of the two signed counts; neither party is bound beyond what it signed",
+    "settled_bytes": 1712,
+    "status": "settled",
+    "steward_fee": 0.05,
+    "t": 1800011402,
+    "t_first": 1800010800,
+    "t_last": 1800011400
+   }
+  },
+  {
+   "index": 1,
+   "leaf": "1616106f03786004e39f48c7a71d2f7bf97aeb667f157caadc5861839d78b059",
+   "path": [
+    [
+     "L",
+     "919f98d32e7069ff788fba972ec5e802213a43ab83b65f3f4d4bd07dffd949bf"
+    ],
+    [
+     "R",
+     "ce3964e48f5212b093e9916236bb14a7540d3c1ebc7bab10ba4869756976a2e4"
+    ]
+   ],
+   "settlement": {
+    "ack_sig": "dkhC6ua0UD6t-F_QSGDqULKYkg8KMQe9o69xlqK2FBHIJWhb44wZBX-vck6FHhhnp5eNOCb0wx-Zfp7G6FovAQ",
+    "amount_usd": 0.004,
+    "fee_usd": 0.0002,
+    "hop": "ed25519:7NXLckho5kxw7Bht2Dcjv_v4-ShUgY1sAdYX3V0RVec",
+    "hop_bytes": 20100000,
+    "hop_index": 1,
+    "kind": "settlement",
+    "link": "84f82fb7c2473dfa6f340178a32b37177f31afb112976c5e69769afbda0ca2d2",
+    "margin": 0.05,
+    "min_bytes": 65536,
+    "payer": "ed25519:IGSk-aXtuMXYJ8tMVPFTPqR2hXXtCjkDgRKur2IWVuM",
+    "payer_bytes": 20000000,
+    "price_usd_per_gb": 0.2,
+    "proto": 1,
+    "receipt_sig": "vIKiJKn8AeAmGOJt1bNyFK5QFu59TX5CfdVZ2St2223Tt6psZNWcMTTLqSBrejzjJuqUtHWqotDV_t9YNGCPBg",
+    "rule": "the smaller of the two signed counts; neither party is bound beyond what it signed",
+    "settled_bytes": 20000000,
+    "status": "settled",
+    "steward_fee": 0.05,
+    "t": 1800012602,
+    "t_first": 1800011400,
+    "t_last": 1800012600
+   }
+  },
+  {
+   "index": 2,
+   "leaf": "ce3964e48f5212b093e9916236bb14a7540d3c1ebc7bab10ba4869756976a2e4",
+   "path": [
+    [
+     "L",
+     "df494f0946b0163444a022cd18b0db045e0c2a71713d8d013af7bcbc1807c863"
+    ]
+   ],
+   "settlement": {
+    "ack_sig": "1C7psNI46Er3vUWGQsnJtW23IP8mpqxD6GGTjNEVI9PkoRk41uDhCpOt1EbTDfOtmYwdk4a2monHSlKiksIIBQ",
+    "amount_usd": 0.006,
+    "fee_usd": 0.0003,
+    "hop": "ed25519:7NXLckho5kxw7Bht2Dcjv_v4-ShUgY1sAdYX3V0RVec",
+    "hop_bytes": 31000000,
+    "hop_index": 1,
+    "kind": "settlement",
+    "link": "84f82fb7c2473dfa6f340178a32b37177f31afb112976c5e69769afbda0ca2d2",
+    "margin": 0.05,
+    "min_bytes": 65536,
+    "payer": "ed25519:IGSk-aXtuMXYJ8tMVPFTPqR2hXXtCjkDgRKur2IWVuM",
+    "payer_bytes": 30000000,
+    "price_usd_per_gb": 0.2,
+    "proto": 1,
+    "receipt_sig": "I6ud8AYp_d7tUBS0tb590Iri82exWQQDAHiDzK-wKU8r6nVCVjAHEvneORtqZUJ19OEbsNUtCtsNqD8lYHmKDw",
+    "rule": "the smaller of the two signed counts; neither party is bound beyond what it signed",
+    "settled_bytes": 30000000,
+    "status": "settled",
+    "steward_fee": 0.05,
+    "t": 1800014402,
+    "t_first": 1800012600,
+    "t_last": 1800014400
+   }
+  }
+ ],
+ "signature": "irO1yXhz2brzUevefO71D9oo0lVbXBkWEYNzV9x2VIqzlVZZv-BKMU0ASltvNaM377RA7UkYznKiwHtVycilDQ",
+ "window": 1800010800
+}

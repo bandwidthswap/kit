@@ -1220,5 +1220,75 @@ class RebuildWithLinks(unittest.TestCase):
         self.assertEqual(sum(1 for line in lines if "settled under announcement %s here; the Mint settled it before profile 1" % self.h[:16] in line), 2)
 
 
+class Vectors(unittest.TestCase):
+    """The kit against its own vectors (spec/CONFORMANCE.md): what it writes now is what is committed."""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools"))
+        import conform
+        import vectors
+        cls.vectors, cls.conform = vectors, conform
+
+    def test_the_committed_vectors_are_what_the_kit_writes(self):
+        self.assertEqual(self.vectors.check(), [])
+        files = self.vectors.generate(self.vectors.inputs())
+        self.assertEqual(set(files), {"keys.json", "receipt.json", "ack.json", "link.json", "settlement-default.json",
+                                      "settlement-disputed.json", "settlement-settled.json", "commitment.json", "proof.json",
+                                      "rebuild/receipts.jsonl", "rebuild/acks.jsonl", "rebuild/links.jsonl", "rebuild/ledger.jsonl"})
+        self.assertEqual((files["settlement-default.json"]["link"], files["settlement-default.json"]["status"]), (None, "settled"))
+        self.assertEqual((files["settlement-disputed.json"]["link"], files["settlement-disputed.json"]["status"]),
+                         (bwkit.link_hash(files["link.json"]), "disputed"))
+        self.assertEqual((files["settlement-settled.json"]["price_usd_per_gb"], files["settlement-settled.json"]["margin"]), (0.2, 0.05))
+        self.assertEqual((files["commitment.json"]["count"], len(files["proof.json"]["settlements"])), (3, 3))
+        self.assertTrue(bwkit.check_proof(files["proof.json"], files["keys.json"]["mint"]["nym"])[0])
+
+    def test_conform_passes_on_the_vectors_and_fails_on_a_changed_byte(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(self.conform.main([self.vectors.VECTORS_DIR]), 0)
+        self.assertIn("conformance: PASS", out.getvalue())
+        tmp = os.path.join(tempfile.mkdtemp(prefix="bwkit-conform-"), "v")
+        shutil.copytree(self.vectors.VECTORS_DIR, tmp)
+        try:
+            p = os.path.join(tmp, "settlement-settled.json")
+            with open(p) as f:
+                s = json.load(f)
+            s["settled_bytes"] += 1
+            with open(p, "w") as f:
+                json.dump(s, f)
+            p = os.path.join(tmp, "proof.json")
+            with open(p) as f:
+                doc = json.load(f)
+            doc["settlements"][1]["path"][0][0] = "L" if doc["settlements"][1]["path"][0][0] == "R" else "R"
+            with open(p, "w") as f:
+                json.dump(doc, f)
+            os.remove(os.path.join(tmp, "ack.json"))
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(self.conform.main([tmp]), 1)
+            text = out.getvalue()
+            self.assertIn("FAIL settlement-settled.json: $.settled_bytes: 20000001 here, 20000000 expected", text)
+            self.assertIn("FAIL proof.json: $.settlements[1].path[0][0]", text)
+            self.assertIn("FAIL ack.json:", text)
+            self.assertIn("FAIL proof.json verifies against the Mint's NYM", text)
+            self.assertIn("ok   commitment.json", text)
+            self.assertIn("conformance: FAIL", text)
+        finally:
+            shutil.rmtree(os.path.dirname(tmp))
+
+    def test_the_vectors_pin_the_number_encodings(self):
+        files = self.vectors.generate(self.vectors.inputs())
+        ss = [e for e in files["rebuild/ledger.jsonl"] if e["kind"] == "settlement"]
+        amounts = {json.dumps(s["amount_usd"]) for s in ss}
+        fees = {json.dumps(s["fee_usd"]) for s in ss}
+        self.assertTrue({"0.0", "5e-05", "0.01"} <= amounts, amounts)   # positional, exponent, and the zero with its point
+        self.assertIn("3e-06", fees)
+        tiny = [s for s in ss if s["settled_bytes"] == 1712][0]
+        self.assertIn('"amount_usd":0.0,', bwkit.canon_json({k: v for k, v in tiny.items() if k != "t"}))
+        small = [s for s in ss if s["settled_bytes"] == 500_000][0]
+        self.assertIn('"amount_usd":5e-05,"fee_usd":3e-06,', bwkit.canon_json(small).replace('"hop"', "").replace("", ""))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

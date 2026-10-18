@@ -1,0 +1,17 @@
+{
+ "hop": {
+  "name": "vec-hop",
+  "nym": "ed25519:7NXLckho5kxw7Bht2Dcjv_v4-ShUgY1sAdYX3V0RVec",
+  "seed": "37de99ca6d1d1f7de3ae97914e8a05d09e222ac72156bcb33b78694f4075b86c"
+ },
+ "mint": {
+  "name": "vec-mint",
+  "nym": "ed25519:ZSkFPo6PQCl9IKHZpRXT7zp_1vBFqEcpwW0Zucj1Wsg",
+  "seed": "0ef04a03dfb962cf962708dc2f2ee8d408452af54bf251f53a7e8dd3a3347093"
+ },
+ "payer": {
+  "name": "vec-payer",
+  "nym": "ed25519:IGSk-aXtuMXYJ8tMVPFTPqR2hXXtCjkDgRKur2IWVuM",
+  "seed": "0682cebd3b5d957c0b79e4987ffe8179b6f6854cb66e645b05e8739f97b90563"
+ }
+}

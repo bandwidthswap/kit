@@ -1,0 +1,18 @@
+{
+ "from": "vec-hop",
+ "impl": "bwkit/0.3.0",
+ "kind": "ack",
+ "meter": null,
+ "proto": 1,
+ "receipt": {
+  "bytes": 60000000,
+  "hop": "ed25519:7NXLckho5kxw7Bht2Dcjv_v4-ShUgY1sAdYX3V0RVec",
+  "hop_index": 1,
+  "merkle_root": "e335a9a108fa04c6743f6a7d3eeaaec932b2057cd03e0a37525d7e6c435619ee",
+  "payer": "ed25519:IGSk-aXtuMXYJ8tMVPFTPqR2hXXtCjkDgRKur2IWVuM",
+  "prev_sig": "edhghTNFZDbrLwSLZyxUjuN3UOJ7zXFEkT8uuhhHXMqWfsxYvkPZcaZZ9cnwC_LB9ZbeBodRjp6mtjkitLgWAw",
+  "t_first": 1800003600,
+  "t_last": 1800007200
+ },
+ "sig": "EYmryue4tH2UEUygLLK72CqPpx-Rt-UpMuqN2X8mquGJzAG0Nbyo3DyivNSImxkOtnxvqP93OKR9BcMHPpsxBA"
+}

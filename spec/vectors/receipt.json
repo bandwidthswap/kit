@@ -1,0 +1,26 @@
+{
+ "from": "vec-payer",
+ "impl": "bwkit/0.3.0",
+ "kind": "receipt",
+ "meter": {
+  "reset": false,
+  "rx0": 51000000,
+  "rx1": 76000000,
+  "t0": 1800003600,
+  "t1": 1800007200,
+  "tx0": 52000000,
+  "tx1": 77000000
+ },
+ "proto": 1,
+ "receipt": {
+  "bytes": 50000000,
+  "hop": "ed25519:7NXLckho5kxw7Bht2Dcjv_v4-ShUgY1sAdYX3V0RVec",
+  "hop_index": 1,
+  "merkle_root": "e335a9a108fa04c6743f6a7d3eeaaec932b2057cd03e0a37525d7e6c435619ee",
+  "payer": "ed25519:IGSk-aXtuMXYJ8tMVPFTPqR2hXXtCjkDgRKur2IWVuM",
+  "prev_sig": "",
+  "t_first": 1800003600,
+  "t_last": 1800007200
+ },
+ "sig": "edhghTNFZDbrLwSLZyxUjuN3UOJ7zXFEkT8uuhhHXMqWfsxYvkPZcaZZ9cnwC_LB9ZbeBodRjp6mtjkitLgWAw"
+}

@@ -1,0 +1,163 @@
+{
+ "links": [
+  {
+   "clock_tolerance_s": 5,
+   "margin": 0.1,
+   "medium": "wifi",
+   "min_bytes": 65536,
+   "patience_windows": 2,
+   "payer": "*",
+   "price": 0.1,
+   "range_class": "building",
+   "since": 1800003600
+  },
+  {
+   "clock_tolerance_s": 5,
+   "margin": 0.05,
+   "medium": "wire",
+   "min_bytes": 65536,
+   "patience_windows": 0,
+   "payer": "payer",
+   "price": 0.2,
+   "range_class": "room",
+   "since": 1800010800
+  }
+ ],
+ "names": {
+  "hop": "vec-hop",
+  "mint": "vec-mint",
+  "payer": "vec-payer"
+ },
+ "note": "Test-only seeds; never use these keys on a node. Timestamps are fixed; T0 is an hour boundary.",
+ "price_usd_per_gb": 0.1,
+ "proto": 1,
+ "rebuild_at": 1800020000,
+ "seeds": {
+  "hop": "37de99ca6d1d1f7de3ae97914e8a05d09e222ac72156bcb33b78694f4075b86c",
+  "mint": "0ef04a03dfb962cf962708dc2f2ee8d408452af54bf251f53a7e8dd3a3347093",
+  "payer": "0682cebd3b5d957c0b79e4987ffe8179b6f6854cb66e645b05e8739f97b90563"
+ },
+ "standalone": {
+  "commitment_hour": 1800010800,
+  "link": 0,
+  "receipt": 1,
+  "settlement-default": 0,
+  "settlement-disputed": 1,
+  "settlement-settled": 5
+ },
+ "steward_fee": 0.05,
+ "windows": [
+  {
+   "hop_bytes": 100500000,
+   "meter": {
+    "reset": false,
+    "rx0": 1000000,
+    "rx1": 51000000,
+    "t0": 1800000000,
+    "t1": 1800003600,
+    "tx0": 2000000,
+    "tx1": 52000000
+   },
+   "payer_bytes": 100000000,
+   "settled_at": 1800003602,
+   "t_first": 1800000000,
+   "t_last": 1800003600
+  },
+  {
+   "hop_bytes": 60000000,
+   "meter": {
+    "reset": false,
+    "rx0": 51000000,
+    "rx1": 76000000,
+    "t0": 1800003600,
+    "t1": 1800007200,
+    "tx0": 52000000,
+    "tx1": 77000000
+   },
+   "payer_bytes": 50000000,
+   "settled_at": 1800007202,
+   "t_first": 1800003600,
+   "t_last": 1800007200
+  },
+  {
+   "hop_bytes": null,
+   "meter": {
+    "reset": false,
+    "rx0": 76000000,
+    "rx1": 76500000,
+    "t0": 1800007200,
+    "t1": 1800009000,
+    "tx0": 77000000,
+    "tx1": 77500000
+   },
+   "payer_bytes": 1000000,
+   "settled_at": 1800009002,
+   "t_first": 1800007200,
+   "t_last": 1800009000
+  },
+  {
+   "hop_bytes": 1600000,
+   "meter": {
+    "reset": false,
+    "rx0": 76500000,
+    "rx1": 76750000,
+    "t0": 1800009000,
+    "t1": 1800010800,
+    "tx0": 77500000,
+    "tx1": 77750000
+   },
+   "payer_bytes": 500000,
+   "settled_at": 1800010802,
+   "t_first": 1800009000,
+   "t_last": 1800010800
+  },
+  {
+   "hop_bytes": 1712,
+   "meter": {
+    "reset": false,
+    "rx0": 76750000,
+    "rx1": 76750856,
+    "t0": 1800010800,
+    "t1": 1800011400,
+    "tx0": 77750000,
+    "tx1": 77750856
+   },
+   "payer_bytes": 1712,
+   "settled_at": 1800011402,
+   "t_first": 1800010800,
+   "t_last": 1800011400
+  },
+  {
+   "hop_bytes": 20100000,
+   "meter": {
+    "reset": false,
+    "rx0": 76750856,
+    "rx1": 86750856,
+    "t0": 1800011400,
+    "t1": 1800012600,
+    "tx0": 77750856,
+    "tx1": 87750856
+   },
+   "payer_bytes": 20000000,
+   "settled_at": 1800012602,
+   "t_first": 1800011400,
+   "t_last": 1800012600
+  },
+  {
+   "hop_bytes": 31000000,
+   "meter": {
+    "reset": false,
+    "rx0": 86750856,
+    "rx1": 101750856,
+    "t0": 1800012600,
+    "t1": 1800014400,
+    "tx0": 87750856,
+    "tx1": 102750856
+   },
+   "payer_bytes": 30000000,
+   "settled_at": 1800014402,
+   "t_first": 1800012600,
+   "t_last": 1800014400
+  }
+ ]
+}
