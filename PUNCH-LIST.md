@@ -10,12 +10,14 @@ Work that is open in the kit and the lab, grouped by when it can be done. Each i
 - **Oct 25, 04:06: the house's purchase runs out.** Purchase `60162767`: 168 windows, at least 50 MB a window, two cents a gigabyte premium, a dollar of escrow. Check that it closes on its own, the unspent escrow returns to bw-house, and `bwkit steward book`, `bwkit invoice` and the dashboard agree on what was paid.
 - **Nov 1: the first invoice with the neighbor.** `sudo -u bwkit bwkit invoice 2026-10` on bw-mint, settled the way neighbors do; there is no payment rail. `phase0/NEIGHBOR.md` names November as the first full month.
 
-## Lab tests still to run
+## In the lab
 
-These are the month's tests from `phase0/NEIGHBOR.md`, none run yet.
+The first two are the month's tests from `phase0/NEIGHBOR.md`, not run yet. The third is a chore.
 
 - **The outage.** Take the neighbor's internet down for an hour. Receipts and acks should wait in the outbox and settle when it returns, with no window lost. This is the claim in the paper's Section 1, and the dashboard's outbox section has never drawn a real one.
 - **A forced dispute across the link.** Run `phase0/dispute-test.sh` with the hop at the neighbor's, and resolve it from the two signed receipts alone.
+
+- **DHCP reservations on the gateway** for the three bench nodes, so the addresses in the site repo's `PHASE0-SETUP.md` stay true. Open since Oct 16 and never recorded as done. It is hands-on; the clicks are in that file, under "DHCP reservations on the gateway".
 
 ## Kit fixes
 
