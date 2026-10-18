@@ -1,0 +1,248 @@
+# A cabin in the forest (the field note's second map), with the Steward's match.
+#
+# Six kilometres past the end of the street, through trees, a cabin with no connection posts
+# a purchase commitment with the street's Mint: a route from the cabin to House 3's dish, at
+# least a gigabyte an hour, a premium of ten cents a gigabyte over the posted prices, 720
+# hourly windows, a deadline of sixty days (window 1440), and a proving allowance of ten
+# windows a week. 720 windows × 1 GB × ($0.15 posted + $0.10 premium) = $180 escrowed. The
+# Steward matches m of it. Nobody builds for two days. At window 48 a neighbour puts a relay
+# on the ridge, 3 km each way at $0.05/GB; House 3's dish is $0.10/GB. A full window of
+# 1.2 GB draws 30¢ from the escrow (6¢ + 6¢ premium to the ridge, 12¢ + 6¢ to House 3,
+# 1.5¢ of it to the Steward). Rain at windows 60–63 moves 0.5 GB: 12.5¢ paid, 5¢ of premium
+# back to the cabin. A hiker tries the route at windows 72–74 and the escrow reimburses the
+# hiker's posted price. The relay is dark for a day from window 96, and for good from
+# window 480; at the deadline the unspent escrow returns to the cabin and to the Steward.
+
+[scenario]
+name = "A cabin in the forest"
+description = "The cabin posts a $180 bounty at window 0; a neighbour builds the ridge relay at window 48; rain, a hiker, a dark day, then dark for good; the deadline at window 1440."
+windows = 1464
+window_seconds = 3600
+report = "phase"
+detail_windows = [48, 60, 72, 1440]
+
+[params]
+f = 0.05
+m = 0.025
+program_window = 24
+first_link_size = 2.00
+first_link_premium = 0.05
+bounty_deadline = 168
+
+[steward]
+opening_escrow = { street = 200.00 }   # fees the street's Steward has taken so far; the match may not exceed m of its income
+
+[[domains]]
+id = "street"
+name = "the street"
+unit = "USD"
+symbol = "$"
+mint = "mint"
+
+[[places]]
+id = "cabin"
+name = "the cabin"
+domain = "street"
+medium = "915 MHz"
+range = "hill"
+
+[[places]]
+id = "ridge"
+name = "the ridge"
+domain = "street"
+medium = "915 MHz"
+range = "hill"
+since = 48            # enters the map when the neighbour's anchor does
+
+[[places]]
+id = "house3"
+name = "House 3"
+domain = "street"
+medium = "wire"
+range = "building"
+
+[[places]]
+id = "house3a"
+name = "House 3a"
+domain = "street"
+medium = "wire"
+range = "building"
+
+[[places]]
+id = "internet"
+name = "the internet"
+domain = "street"
+medium = "satellite"
+range = "world"
+mapped = false
+
+[[nodes]]
+id = "cabin"
+name = "the cabin"
+place = "cabin"
+roles = ["payer", "relay"]
+bonds = { street = 20 }
+bond_since = -720
+
+[[nodes]]
+id = "hiker"
+name = "a hiker's phone"
+place = "cabin"
+roles = ["payer"]
+bonds = { street = 1 }
+bond_since = -720
+
+[[nodes]]
+id = "h3"
+name = "House 3"
+place = "house3"
+roles = ["relay"]
+bonds = { street = 10 }
+
+[[nodes]]
+id = "h3a"
+name = "House 3a"
+place = "house3a"
+roles = ["payer"]
+bonds = { street = 5 }
+
+[[nodes]]
+id = "mint"
+name = "Street Mint"
+place = "house3"
+roles = ["mint"]
+
+[[nodes]]
+id = "internet"
+name = "the internet"
+place = "internet"
+roles = ["endpoint"]
+
+[[links]]
+id = "wire-3a"
+src = "h3a"
+dst = "h3"
+owner = "h3"
+price = 0
+medium = "wire"
+range = "building"
+rate_mbps = 1000
+
+[[links]]
+id = "h3-dish"
+src = "h3"
+dst = "internet"
+price = 0.10
+medium = "satellite"
+range = "world"
+rate_mbps = 150
+
+# the cabin's own hotspot, for whoever is at the cabin
+[[links]]
+id = "cabin-hotspot"
+src = "hiker"
+dst = "cabin"
+owner = "cabin"
+price = 0
+medium = "hotspot"
+range = "hill"
+rate_mbps = 50
+
+[[demands]]
+id = "3a"
+label = "House 3a's traffic"
+payer = "h3a"
+src = "h3a"
+dst = "internet"
+gb_per_day = 10
+
+[[demands]]
+id = "cabin"
+label = "the cabin's traffic"
+payer = "cabin"
+src = "cabin"
+dst = "internet"
+gb_per_window = 1.2
+from = 48
+
+[[demands.schedule]]
+from = 60
+to = 63
+gb_per_window = 0.5
+
+[[demands]]
+id = "hiker"
+label = "a hiker tries the route"
+payer = "hiker"
+src = "hiker"
+dst = "internet"
+gb_per_window = 0.3
+from = 72
+to = 74
+
+[[commitments]]
+at = 0
+id = "cabin-bounty"
+label = "the cabin's bounty"
+poster = "cabin"
+src = "cabin"
+dst = "internet"
+via = "h3"
+min_gb_per_window = 1
+premium = 0.10
+posted = 0.15
+windows = 720
+deadline = 1440
+proving_windows = 10
+proving_period = 168
+
+[[events]]
+at = 48
+kind = "add_node"
+note = "a neighbour builds the ridge relay"
+[events.node]
+id = "ridge"
+name = "the ridge relay"
+place = "ridge"
+roles = ["relay"]
+bonds = { street = 10 }
+
+[[events]]
+at = 48
+kind = "add_link"
+[events.link]
+id = "ridge-up"
+src = "cabin"
+dst = "ridge"
+owner = "ridge"
+price = 0.05
+medium = "915 MHz"
+range = "hill"
+rate_mbps = 4
+
+[[events]]
+at = 48
+kind = "add_link"
+[events.link]
+id = "ridge-down"
+src = "ridge"
+dst = "h3"
+owner = "ridge"
+price = 0
+medium = "915 MHz"
+range = "hill"
+rate_mbps = 4
+
+[[events]]
+kind = "outage"
+node = "ridge"
+from = 96
+to = 119
+note = "the ridge relay goes dark for a day"
+note_up = "the ridge relay is back"
+
+[[events]]
+at = 480
+kind = "node_down"
+node = "ridge"
+note = "the ridge relay goes dark for good"

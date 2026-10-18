@@ -1,0 +1,254 @@
+# A street with three dishes (the field note's first map).
+#
+# Three houses each sell a satellite uplink at $0.10/GB to one dependent house, by wire.
+# Wi-Fi joins House 1 and House 2, a 915 MHz radio joins House 2 and House 3, and each
+# house charges $0.02/GB to carry a neighbour's traffic across its street link. The Mint
+# is a Raspberry Pi at House 2 and the receipts are hourly. Day one everything works and
+# the street links carry nothing. At window 24 snow takes House 1's dish down: House 1a's
+# bytes cross the Wi-Fi to House 2's dish and House 1a pays both houses; House 1 pays
+# House 2 for its own twenty gigabytes. The field note's figures: working, House 1 and 2
+# earn $2.85 a day and House 3 $0.95; down, House 2 earns $7.60, House 1 earns 57¢ and
+# pays $2.00. At the end of day two the Steward's rule sees the Wi-Fi as a sole bridge
+# carrying fees and posts those fees as a bounty for a second path through another place.
+
+[scenario]
+name = "A street with three dishes"
+description = "Three one-hop markets on day 1; House 1's dish goes down at window 24 and House 1a's bytes take the Wi-Fi to House 2's dish."
+windows = 48
+window_seconds = 3600
+report = "phase"
+
+[params]
+f = 0.05
+m = 0.025
+program_window = 24
+reconcile_every = 24
+
+[[domains]]
+id = "street"
+name = "the street"
+unit = "USD"
+symbol = "$"
+mint = "mint"
+
+[[places]]
+id = "house1"
+name = "House 1"
+domain = "street"
+medium = "wire"
+range = "building"
+
+[[places]]
+id = "house2"
+name = "House 2"
+domain = "street"
+medium = "wire"
+range = "building"
+
+[[places]]
+id = "house3"
+name = "House 3"
+domain = "street"
+medium = "wire"
+range = "building"
+
+[[places]]
+id = "house1a"
+name = "House 1a"
+domain = "street"
+medium = "wire"
+range = "building"
+
+[[places]]
+id = "house2a"
+name = "House 2a"
+domain = "street"
+medium = "wire"
+range = "building"
+
+[[places]]
+id = "house3a"
+name = "House 3a"
+domain = "street"
+medium = "wire"
+range = "building"
+
+[[places]]
+id = "internet"
+name = "the internet"
+domain = "street"
+medium = "satellite"
+range = "world"
+mapped = false
+
+[[nodes]]
+id = "h1"
+name = "House 1"
+place = "house1"
+roles = ["relay", "payer"]
+bonds = { street = 10 }
+
+[[nodes]]
+id = "h2"
+name = "House 2"
+place = "house2"
+roles = ["relay"]
+bonds = { street = 10 }
+
+[[nodes]]
+id = "h3"
+name = "House 3"
+place = "house3"
+roles = ["relay"]
+bonds = { street = 10 }
+
+[[nodes]]
+id = "h1a"
+name = "House 1a"
+place = "house1a"
+roles = ["payer"]
+bonds = { street = 5 }
+
+[[nodes]]
+id = "h2a"
+name = "House 2a"
+place = "house2a"
+roles = ["payer"]
+bonds = { street = 5 }
+
+[[nodes]]
+id = "h3a"
+name = "House 3a"
+place = "house3a"
+roles = ["payer"]
+bonds = { street = 5 }
+
+[[nodes]]
+id = "mint"
+name = "Street Mint"
+place = "house2"
+roles = ["mint"]
+
+[[nodes]]
+id = "internet"
+name = "the internet"
+place = "internet"
+roles = ["endpoint"]
+
+# the dependents' wires: the dish house's access link, nothing charged for it
+[[links]]
+id = "wire-1a"
+src = "h1a"
+dst = "h1"
+owner = "h1"
+price = 0
+medium = "wire"
+range = "building"
+rate_mbps = 1000
+
+[[links]]
+id = "wire-2a"
+src = "h2a"
+dst = "h2"
+owner = "h2"
+price = 0
+medium = "wire"
+range = "building"
+rate_mbps = 1000
+
+[[links]]
+id = "wire-3a"
+src = "h3a"
+dst = "h3"
+owner = "h3"
+price = 0
+medium = "wire"
+range = "building"
+rate_mbps = 1000
+
+# the dishes
+[[links]]
+id = "h1-dish"
+src = "h1"
+dst = "internet"
+price = 0.10
+medium = "satellite"
+range = "world"
+rate_mbps = 150
+
+[[links]]
+id = "h2-dish"
+src = "h2"
+dst = "internet"
+price = 0.10
+medium = "satellite"
+range = "world"
+rate_mbps = 150
+
+[[links]]
+id = "h3-dish"
+src = "h3"
+dst = "internet"
+price = 0.10
+medium = "satellite"
+range = "world"
+rate_mbps = 150
+
+# the street links, each direction owned by the house that sends across it
+[[links]]
+id = "wifi"
+src = "h1"
+dst = "h2"
+price = 0.02
+medium = "wifi"
+range = "street"
+rate_mbps = 200
+bidirectional = true
+
+[[links]]
+id = "radio"
+src = "h2"
+dst = "h3"
+price = 0.02
+medium = "915 MHz"
+range = "street"
+rate_mbps = 4
+bidirectional = true
+
+[[demands]]
+id = "1a"
+label = "House 1a's traffic"
+payer = "h1a"
+src = "h1a"
+dst = "internet"
+gb_per_day = 30
+
+[[demands]]
+id = "2a"
+label = "House 2a's traffic"
+payer = "h2a"
+src = "h2a"
+dst = "internet"
+gb_per_day = 30
+
+[[demands]]
+id = "3a"
+label = "House 3a's traffic"
+payer = "h3a"
+src = "h3a"
+dst = "internet"
+gb_per_day = 10
+
+[[demands]]
+id = "h1-own"
+label = "House 1's own use"
+payer = "h1"
+src = "h1"
+dst = "internet"
+gb_per_day = 20
+
+[[events]]
+at = 24
+kind = "link_down"
+link = "h1-dish"
+note = "snow on House 1's dish"

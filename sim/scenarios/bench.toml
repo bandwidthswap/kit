@@ -1,0 +1,128 @@
+# The bench: Phase 0 as it runs (INSTALLATIONS.md §1, paper Section 9).
+#
+# bw-house is the payer, bw-forest the hop, bw-mint the Mint; a WireGuard tunnel on one
+# home LAN, hourly windows, ten cents a gigabyte, a monthly invoice. The first five windows
+# replay the forced tests of Oct 16, 2026 with the lab's exact byte counts: an agreeing
+# window (21,938,052 against 21,939,460, within one percent, settled at the smaller count);
+# the hop under-claiming after a counter reset (21,945,428 against 1,712: disputed, settled
+# at 1,712); the hop over-claiming (272 against 21,947,428: settled at 272); the hop's clock
+# stepped ten seconds (declined, the window lost, nothing paid); then back in sync. The rest
+# of the day is ordinary windows. The running kit remits no fee (there is no Steward yet);
+# this run applies v0.5's five percent so the books here close the way the paper's do.
+
+[scenario]
+name = "The bench"
+description = "Phase 0's three nodes, the forced tests of Oct 16 in windows 0–4, then a day of ordinary windows."
+windows = 24
+window_seconds = 3600
+report = "phase"
+detail_windows = [0, 1, 2, 3, 4]
+
+[params]
+f = 0.05
+m = 0.025
+program_window = 24
+
+[[domains]]
+id = "lab"
+name = "the lab"
+unit = "USD"
+symbol = "$"
+mint = "bw-mint"
+
+[[places]]
+id = "house"
+name = "the house"
+domain = "lab"
+medium = "wire"
+range = "building"
+
+[[places]]
+id = "forest"
+name = "the forest"
+domain = "lab"
+medium = "wire"
+range = "building"
+
+[[nodes]]
+id = "bw-house"
+name = "bw-house"
+place = "house"
+roles = ["payer"]
+
+[[nodes]]
+id = "bw-forest"
+name = "bw-forest"
+place = "forest"
+roles = ["relay"]
+
+[[nodes]]
+id = "bw-mint"
+name = "bw-mint"
+place = "house"
+roles = ["mint"]
+
+[[links]]
+id = "wg0"
+src = "bw-house"
+dst = "bw-forest"
+owner = "bw-forest"
+price = 0.10
+medium = "WireGuard over Ethernet"
+range = "building"
+light_time_s = 0.000007
+clock_tolerance_s = 5
+window_kind = "hour"
+
+[[demands]]
+id = "tunnel"
+label = "bytes across the tunnel"
+payer = "bw-house"
+src = "bw-house"
+dst = "bw-forest"
+bytes_per_window = 21938052
+
+[[demands.schedule]]
+from = 1
+to = 1
+bytes = 21945428
+
+[[demands.schedule]]
+from = 2
+to = 2
+bytes = 21947428
+
+[[events]]
+at = 0
+kind = "count"
+node = "bw-forest"
+bytes = 21939460
+note = "agreeing window: the hop's meter reads 1,408 bytes more than the payer's"
+
+[[events]]
+at = 1
+kind = "count"
+node = "bw-forest"
+bytes = 1712
+note = "the hop's counter is reset mid-window: it under-claims"
+
+[[events]]
+at = 2
+kind = "count"
+node = "bw-house"
+bytes = 272
+note = "the payer's counter is reset mid-window: the hop over-claims"
+
+[[events]]
+at = 3
+kind = "clock"
+node = "bw-forest"
+offset_s = 10
+note = "the hop's clock is stepped ten seconds"
+
+[[events]]
+at = 4
+kind = "clock"
+node = "bw-forest"
+offset_s = 0
+note = "chrony steps the hop's clock back"

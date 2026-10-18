@@ -1,0 +1,208 @@
+# Earth, Mars and Jupiter (the field note's third map, INSTALLATIONS.md §4).
+#
+# An Earth institution wants a terabyte from a lander on Europa. The lander sends to the
+# Jupiter relay orbiter, which sends to Earth at $50 a gigabyte per contact (35 to 52 light
+# minutes); the Jupiter Mint settles the lander's hop in Jupiter's unit from the same
+# receipts, out of the orbiter's price. Windows are six-hour contacts. At window 100 the
+# Sun comes between Earth and Jupiter for three weeks (84 windows): the orbiter sends to a
+# Mars bridge relay instead, 40 in Mars's unit, which holds the bundle under a custody
+# receipt for the next Earth contact (one window, six hours, carry $0.50/GB·h = $3) and
+# sends it on at $20 + $3. Earth pays $63 a gigabyte: $21.85 kept by the Mars bridge,
+# $38.00 by the orbiter, $3.15 to two Stewards. For two days in the middle (windows 140 to
+# 147) Mars is behind the Sun too: nothing moves, nothing is paid. Three bookkeepers in
+# three units reconcile daily whenever a link between them exists, through Mars when the
+# direct line is gone.
+
+[scenario]
+name = "Earth, Mars and Jupiter"
+description = "A terabyte from Europa, 10 GB a six-hour contact: direct at $50/GB; around Mars at $63/GB during the conjunction; nothing when Mars is behind the Sun too."
+windows = 240
+window_seconds = 21600
+report = "phase"
+per_gb = true
+detail_windows = [101]
+
+[params]
+f = 0.05
+m = 0.025
+program_window = 4
+reconcile_every = 4
+max_wait = 4
+bounty_deadline = 28
+
+[[domains]]
+id = "earth"
+name = "Earth"
+unit = "USD"
+symbol = "$"
+mint = "earth-mint"
+
+[[domains]]
+id = "mars"
+name = "Mars"
+unit = "MRS"
+symbol = ""
+mint = "mars-mint"
+
+[[domains]]
+id = "jupiter"
+name = "Jupiter"
+unit = "JUP"
+symbol = ""
+mint = "jup-mint"
+
+[[places]]
+id = "earth"
+name = "Earth"
+domain = "earth"
+medium = "X-band"
+range = "world"
+
+[[places]]
+id = "mars"
+name = "Mars orbit"
+domain = "mars"
+medium = "X-band"
+range = "world"
+
+[[places]]
+id = "jupiter"
+name = "Jupiter orbit"
+domain = "jupiter"
+medium = "X-band"
+range = "world"
+
+[[places]]
+id = "europa"
+name = "Europa"
+domain = "jupiter"
+medium = "UHF proximity radio"
+range = "world"
+
+[[nodes]]
+id = "earth-inst"
+name = "Earth institution"
+place = "earth"
+roles = ["payer"]
+bonds = { earth = 100000 }
+
+[[nodes]]
+id = "earth-mint"
+name = "Earth Mint"
+place = "earth"
+roles = ["mint"]
+
+[[nodes]]
+id = "mars-bridge"
+name = "Mars bridge relay"
+place = "mars"
+roles = ["relay"]
+bonds = { earth = 20000, mars = 20000 }
+rates = { "MRS>USD" = 1.0 }
+
+[[nodes]]
+id = "mars-mint"
+name = "Mars Mint"
+place = "mars"
+roles = ["mint"]
+
+[[nodes]]
+id = "jup-orbiter"
+name = "Jupiter relay orbiter"
+place = "jupiter"
+roles = ["relay"]
+bonds = { earth = 50000, mars = 50000, jupiter = 50000 }
+rates = { "JUP>MRS" = 1.0, "JUP>USD" = 1.0 }
+
+[[nodes]]
+id = "jup-mint"
+name = "Jupiter Mint"
+place = "jupiter"
+roles = ["mint"]
+
+[[nodes]]
+id = "lander"
+name = "Europa lander"
+place = "europa"
+roles = ["relay", "endpoint"]
+bonds = { jupiter = 1000 }
+
+# the lander's hop, settled by the Jupiter Mint in Jupiter's unit, paid by the orbiter out of its own price
+[[links]]
+id = "europa-up"
+src = "lander"
+dst = "jup-orbiter"
+owner = "lander"
+domain = "jupiter"
+price = 2.00
+light_time_s = 0.002
+medium = "UHF proximity radio"
+range = "point-to-point"
+window_kind = "contact"
+
+# the direct line, a contact per window
+[[links]]
+id = "direct"
+src = "jup-orbiter"
+dst = "earth-inst"
+owner = "jup-orbiter"
+domain = "earth"
+price = 50.00
+light_time_s = 2600
+medium = "X-band point-to-point"
+range = "world"
+window_kind = "contact"
+passes_upstream = false
+
+# the way around: Jupiter to Mars in Mars's unit, Mars to Earth with carry for the custody
+[[links]]
+id = "jup-mars"
+src = "jup-orbiter"
+dst = "mars-bridge"
+owner = "jup-orbiter"
+domain = "mars"
+price = 40.00
+light_time_s = 2550
+medium = "X-band point-to-point"
+range = "world"
+window_kind = "contact"
+passes_upstream = false
+
+[[links]]
+id = "mars-earth"
+src = "mars-bridge"
+dst = "earth-inst"
+owner = "mars-bridge"
+domain = "earth"
+price = 20.00
+carry = 0.50
+light_time_s = 750
+medium = "X-band point-to-point"
+range = "world"
+window_kind = "contact"
+store_and_forward = true
+passes_upstream = true
+
+[[demands]]
+id = "europa"
+label = "a terabyte from Europa"
+payer = "earth-inst"
+src = "lander"
+dst = "earth-inst"
+gb_per_window = 10
+
+[[events]]
+kind = "outage"
+link = "direct"
+from = 100
+to = 183
+note = "solar conjunction: the Sun between Earth and Jupiter"
+note_up = "the line to Jupiter returns"
+
+[[events]]
+kind = "outage"
+link = "mars-earth"
+from = 140
+to = 147
+note = "Mars behind the Sun too"
+note_up = "Mars is clear again"

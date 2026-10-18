@@ -1,0 +1,140 @@
+# Earth to Moon with two Mints (INSTALLATIONS.md §3).
+#
+# A relay on the lunar near side carries a surface instrument's data home for an Earth
+# institution: 50 GB an hour at $1 a gigabyte, Ka-band, light time 1.28 s, continuous
+# contact. Two settlement domains in one unit, a Mint on each world, the relay bonded with
+# both and reconciled daily: the Earth Mint settles each window from the payer's copy, the
+# Moon Mint from the hop's, and the two commitments agree at the day's end. The clock test
+# from the installations runs in windows 30 and 31: the relay's clock stepped 6 s is inside
+# the link's tolerance (5 s + 2.56 s light time both ways) and accepted; stepped 9 s it is
+# declined and the window is lost.
+
+[scenario]
+name = "Earth to Moon"
+description = "50 GB an hour home from the Moon at $1/GB, two Mints reconciling daily; the relay's clock stepped 6 s (accepted) then 9 s (declined)."
+windows = 72
+window_seconds = 3600
+report = "day"
+per_gb = true
+detail_windows = [30, 31]
+
+[params]
+f = 0.05
+m = 0.025
+program_window = 24
+reconcile_every = 24
+bounty_deadline = 168
+
+[[domains]]
+id = "earth"
+name = "Earth"
+unit = "USD"
+symbol = "$"
+mint = "earth-mint"
+
+[[domains]]
+id = "moon"
+name = "the Moon"
+unit = "USD"
+symbol = "$"
+mint = "moon-mint"
+
+[[places]]
+id = "earth-station"
+name = "the Earth station"
+domain = "earth"
+medium = "Ka-band"
+range = "world"
+
+[[places]]
+id = "near-side"
+name = "the lunar near side"
+domain = "moon"
+medium = "Ka-band"
+range = "world"
+
+[[nodes]]
+id = "earth-inst"
+name = "Earth institution"
+place = "earth-station"
+roles = ["payer"]
+bonds = { earth = 10000 }
+
+[[nodes]]
+id = "earth-mint"
+name = "Earth Mint"
+place = "earth-station"
+roles = ["mint"]
+
+[[nodes]]
+id = "moon-relay"
+name = "lunar relay"
+place = "near-side"
+roles = ["relay"]
+bonds = { earth = 5000, moon = 5000 }
+
+[[nodes]]
+id = "instrument"
+name = "surface instrument"
+place = "near-side"
+roles = ["endpoint"]
+owner = "science"
+
+[[nodes]]
+id = "moon-mint"
+name = "Moon Mint"
+place = "near-side"
+roles = ["mint"]
+
+[[links]]
+id = "surface"
+src = "instrument"
+dst = "moon-relay"
+owner = "moon-relay"
+domain = "moon"
+price = 0
+medium = "UHF proximity radio"
+range = "point-to-point"
+
+[[links]]
+id = "ka"
+src = "moon-relay"
+dst = "earth-inst"
+owner = "moon-relay"
+domain = "earth"
+price = 1.00
+light_time_s = 1.28
+clock_tolerance_s = 5
+medium = "Ka-band point-to-point radio"
+range = "world"
+window_kind = "hour"
+rate_mbps = 150
+
+[[demands]]
+id = "home"
+label = "instrument data home"
+payer = "earth-inst"
+src = "instrument"
+dst = "earth-inst"
+gb_per_window = 50
+
+[[events]]
+at = 30
+kind = "clock"
+node = "moon-relay"
+offset_s = 6
+note = "the relay's clock stepped 6 s: inside 5 + 2.56 s"
+
+[[events]]
+at = 31
+kind = "clock"
+node = "moon-relay"
+offset_s = 9
+note = "the relay's clock stepped 9 s: outside the tolerance"
+
+[[events]]
+at = 32
+kind = "clock"
+node = "moon-relay"
+offset_s = 0
+note = "the relay's clock restored"

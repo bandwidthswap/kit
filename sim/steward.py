@@ -1,0 +1,166 @@
+"""The Network Steward: a rule, not a party (Section 7), one per settlement domain.
+
+Income is the fraction f of every fee (Section 3.3). Output is purchase
+commitments only (Section 5.1), under three programs:
+
+1. Matching: when a bonded, aged payer escrows a commitment, add up to m of
+   the payer's escrow, m strictly below f, and never more than m of the
+   Steward's income in all.
+2. The second bridge: at the end of each program window, wherever a link
+   carried settled fees and the map shows no second path between its ends
+   through a different mapped place, post a commitment for one, sized from
+   the fees the sole link carried, with the sole link's effective price per
+   gigabyte as the premium. Second bridges spend before first links.
+3. The first link: every mapped place with no settled receipt across a link
+   gets a standing commitment, sized by a parameter, renewed until a receipt
+   settles across it. Funded from what is left.
+
+Everything a commitment returns comes back to the escrow and is posted again.
+"""
+
+from fractions import Fraction
+
+from . import routing
+from .model import Commitment
+from .money import GB, fmt, pct
+
+
+class Steward:
+    def __init__(self, run, domain):
+        self.run = run
+        self.domain = domain
+        self.unit = run.unit_of(domain)
+        self.account = "steward:" + domain
+        opening = run.scn.opening_escrow.get(domain, Fraction(0))
+        self.escrow = opening
+        self.income = opening            # fees received, the opening balance counted as earlier income
+        self.received = Fraction(0)      # fees received during the run
+        self.matched = Fraction(0)
+        self.posted = Fraction(0)        # bounties posted (second bridge and first link)
+        self.refunds = Fraction(0)       # escrow that came back
+        self.declined = []               # (window, what, why) postings the rule could not make
+
+    # -------------------------------------------------------------- income
+
+    def receive(self, amount):
+        self.escrow += amount
+        self.income += amount
+        self.received += amount
+
+    def refund(self, amount):
+        self.escrow += amount
+        self.refunds += amount
+
+    # -------------------------------------------------------------- program 1
+
+    def match(self, cm, w):
+        p = self.run.params
+        m = p["m"]
+        if cm.kind != "payer" or m <= 0:
+            return Fraction(0)
+        poster = self.run.nodes.get(cm.poster)
+        if poster is None:
+            return Fraction(0)
+        age = w - poster.bond_since
+        if age < p["min_bond_age"]:
+            self.declined.append((w, "match " + cm.id, "the poster's bond is %d windows old, the program needs %d" % (age, p["min_bond_age"])))
+            self.run.log(w, "Steward (%s): no match for %s, the poster's bond is too young" % (self.domain, cm.label or cm.id))
+            return Fraction(0)
+        allowance = m * self.income - self.matched
+        amt = min(m * cm.escrow, allowance, self.escrow)
+        if amt <= 0:
+            why = "no escrow" if self.escrow <= 0 else "the match allowance (m of income) is spent"
+            self.declined.append((w, "match " + cm.id, why))
+            self.run.log(w, "Steward (%s): no match for %s, %s" % (self.domain, cm.label or cm.id, why))
+            return Fraction(0)
+        self.escrow -= amt
+        self.matched += amt
+        per_window = cm.escrow / cm.windows if cm.windows else None
+        cm.pool += amt
+        cm.escrow += amt
+        cm.contributions[self.account] = cm.contributions.get(self.account, Fraction(0)) + amt
+        if per_window:
+            extra = int(amt / per_window)
+            cm.windows += extra      # the match buys more windows at the poster's own terms
+        self.run.pay(self.account, "escrow:" + cm.id, amt, self.unit, w,
+                     "Steward matches %s of the poster's escrow (m = %s)" % (fmt(amt, self.unit, self.run.symbol(self.unit)), pct(m)),
+                     kind="match", commitment=cm.id)
+        self.run.log(w, "Steward (%s): matches %s with %s (m = %s of %s), %d more windows" % (
+            self.domain, cm.label or cm.id, fmt(amt, self.unit, self.run.symbol(self.unit)), pct(m),
+            fmt(cm.escrow - amt, self.unit, self.run.symbol(self.unit)), extra if per_window else 0))
+        return amt
+
+    # -------------------------------------------------------------- programs 2 and 3
+
+    def bounty_budget(self):
+        """What the second-bridge and first-link programs may spend: the escrow less the unspent match allowance."""
+        p = self.run.params
+        reserve = max(Fraction(0), p["m"] * self.income - self.matched)
+        return max(Fraction(0), self.escrow - reserve)
+
+    def run_programs(self, w):
+        run = self.run
+        p = run.params
+        # 2. the second bridge
+        stats = [(st["fees"], lid, st) for lid, st in run.link_stats.items()
+                 if run.links[lid].domain == self.domain and st["fees"] > 0]
+        stats.sort(key=lambda t: (-t[0], t[1]))
+        for fees, lid, st in stats:
+            link = run.links[lid]
+            if not routing.is_sole(run, link, w, st["origins"], st["dests"], st["places"]):
+                continue
+            if any(c.open and c.kind == "second_bridge" and c.avoid_link == lid for c in run.commitments.values()):
+                continue
+            budget = self.bounty_budget()
+            if budget <= 0:
+                self.declined.append((w, "second bridge for " + lid, "no escrow left"))
+                run.log(w, "Steward (%s): %s is a sole bridge carrying %s, but the escrow is spent" % (
+                    self.domain, lid, fmt(fees, self.unit, run.symbol(self.unit))))
+                break
+            value = min(fees, budget)
+            windows = p["program_window"]
+            premium = fees / Fraction(st["bytes"], GB) if st["bytes"] else Fraction(0)
+            cm = Commitment(id=run.new_id(self.domain + "-bridge"), kind="second_bridge", poster=self.account,
+                            domain=self.domain, unit=self.unit, min_bytes=st["bytes"] // windows, premium=premium,
+                            windows=windows, deadline=w + 1 + p["bounty_deadline"], posted_at=w + 1,
+                            escrow=value, contributions={self.account: value}, pool=value,
+                            from_places=frozenset(st["origin_places"]) - {None},
+                            to_places=frozenset(st["dest_places"] | {routing.place_of(run, link.dst)}) - {None},
+                            avoid_link=lid, existing_places=frozenset(st["places"]),
+                            label="second path around %s" % lid)
+            self._post(cm, w, "sole bridge %s carried %s in %d windows; bounty for a second path from %s to %s through a mapped place other than %s, premium %s/GB" % (
+                lid, fmt(fees, self.unit, run.symbol(self.unit)), windows,
+                ", ".join(run.places[x].name for x in sorted(cm.from_places)),
+                ", ".join(run.places[x].name for x in sorted(cm.to_places)),
+                ", ".join(run.places[x].name for x in sorted(cm.existing_places)),
+                fmt(premium, self.unit, run.symbol(self.unit))))
+        # 3. the first link
+        if p["first_link_size"] > 0:
+            for place in sorted(run.places.values(), key=lambda x: x.id):
+                if place.domain != self.domain or not place.mapped or place.since > w:
+                    continue
+                if place.id in run.place_linked:
+                    continue
+                if any(c.open and c.kind == "first_link" and c.to_place == place.id for c in run.commitments.values()):
+                    continue
+                budget = self.bounty_budget()
+                value = min(p["first_link_size"], budget)
+                if value <= 0:
+                    self.declined.append((w, "first link to " + place.id, "no escrow left"))
+                    break
+                cm = Commitment(id=run.new_id(self.domain + "-first"), kind="first_link", poster=self.account,
+                                domain=self.domain, unit=self.unit, min_bytes=0, premium=p["first_link_premium"],
+                                windows=p["bounty_deadline"], deadline=w + 1 + p["bounty_deadline"], posted_at=w + 1,
+                                escrow=value, contributions={self.account: value}, pool=value,
+                                to_place=place.id, label="first link to %s" % place.name)
+                self._post(cm, w, "standing offer for the first link to %s, premium %s/GB" % (
+                    place.name, fmt(p["first_link_premium"], self.unit, run.symbol(self.unit))))
+
+    def _post(self, cm, w, why):
+        self.escrow -= cm.escrow
+        self.posted += cm.escrow
+        self.run.commitments[cm.id] = cm
+        self.run.pay(self.account, "escrow:" + cm.id, cm.escrow, self.unit, w, "the Steward posts %s" % cm.label,
+                     kind="post", commitment=cm.id)
+        self.run.log(w, "Steward (%s): posts %s of %s: %s" % (
+            self.domain, fmt(cm.escrow, self.unit, self.run.symbol(self.unit)), cm.label, why))
