@@ -269,7 +269,7 @@ Anyone holding the payer's receipts, the hop's acknowledgements and the announce
 
 The rule:
 
-1. Verify every envelope and announcement. A line that is not JSON, a record that is malformed, or a signature that fails is named and left out; so is an envelope whose `kind` does not match its file, or an announcement that is not for this domain.
+1. Verify every envelope and announcement. A line that is not JSON, a record that is malformed, a signature that fails, or an announcement outside profile 1 is named and left out; so is an envelope whose `kind` does not match its file. (The rebuild has no Mint NYM to hold an announcement's `domain` against; a Mint's registry holds only its own.)
 2. Drop exact repeats (the same signature twice). Of two valid receipts with the same window key (Section 6), keep the first in file order and name the other as a replay.
 3. Pair each receipt with the acknowledgement whose `prev_sig` is its signature. A receipt without one stays without (the hop declined it); an acknowledgement without a receipt is listed last.
 4. Settle each pair by Section 8 under the announcement in force at its `t_first` from `links.jsonl`, with `t` set to the rebuild's own clock, and name a pair that does not settle (the acknowledgement changed a field) as left out.

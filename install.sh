@@ -5,7 +5,8 @@
 #
 # Puts bwkit.py at /usr/local/bin/bwkit, makes the bwkit system user and
 # /var/lib/bwkit, writes a first /etc/bwkit/config.json for the role if none
-# exists, installs the systemd units and generates the node's key. It does
+# exists (the pilot's defaults: the hop's link terms, the Mint's price and the
+# Steward's fee), installs the systemd units and generates the node's key. It does
 # not start anything: see README.md for the peer exchange, the baseline
 # sample and the enable step.
 set -eu
@@ -25,8 +26,8 @@ if [ ! -f /etc/bwkit/config.json ]; then
   host="$(hostname)"
   case "$role" in
     payer) printf '{\n "role": "payer",\n "name": "%s",\n "iface": "wg0",\n "hop_name": "bw-forest",\n "hop_url": "http://10.77.0.2:8710",\n "mint": "http://bw-mint.local:8710"\n}\n' "$host" ;;
-    hop)   printf '{\n "role": "hop",\n "name": "%s",\n "iface": "wg0",\n "mint": "http://bw-mint.local:8710"\n}\n' "$host" ;;
-    mint)  printf '{\n "role": "mint",\n "name": "%s",\n "price_usd_per_gb": 0.10\n}\n' "$host" ;;
+    hop)   printf '{\n "role": "hop",\n "name": "%s",\n "iface": "wg0",\n "mint": "http://bw-mint.local:8710",\n "link": {"price": 0.10, "margin": 0.01, "min_bytes": 65536, "patience_windows": 0, "medium": "wire", "range_class": "room"}\n}\n' "$host" ;;
+    mint)  printf '{\n "role": "mint",\n "name": "%s",\n "price_usd_per_gb": 0.10,\n "steward_fee": 0.05\n}\n' "$host" ;;
   esac > /etc/bwkit/config.json
   echo "wrote /etc/bwkit/config.json for role $role"
 fi
