@@ -42,9 +42,15 @@ Host bw-neighbor-away
 
 The first name reaches it on the house LAN; the second reaches it at the neighbor's, through `bw-house` and the tailnet, once `100.x.y.z` is replaced with the address `neighbor.sh prep` prints for it (or the Mac joins the tailnet itself and the jump is not needed).
 
-## Provisioning, on the bench
+## Provisioning, from wherever the Mac is
 
-With the Pi on the house switch and a pre-authentication key from the Tailscale admin console, from the kit's clone:
+`prep` runs every step in order and assumes the Mac can reach all four nodes at once. It does not have to: each step runs on its own, so the Pi can be set up from the neighbor's own network while the bench waits for a visit to the house LAN. Three things make that work. `NODES=bw-neighbor neighbor.sh tailnet` joins only the Pi; `neighbor.sh kit` installs the hop without needing the Mint; and `neighbor.sh peers`, run once every node is on the tailnet, exchanges the NYMs and gives the hop the Mint's tailnet address. Once the Mac is on the tailnet too (install Tailscale on the Mac and sign in), `SSH_SUFFIX=-ts` makes every step reach the nodes through the tailnet aliases in `~/.ssh/config` (`bw-house-ts` and the rest, which resolve by MagicDNS), from anywhere.
+
+The order that was actually used on October 17, with the Pi already at the neighbor's: `upgrade`, `time`, `logs` and `NODES=bw-neighbor tailnet` and `kit` from the neighbor's network; then, from the house LAN or the tailnet, `NODES="bw-house bw-mint" tailnet`, `peers`, `house`, `check`, and `wifi` last.
+
+## Provisioning, all at once
+
+With the Pi on the house LAN, every node reachable, and a pre-authentication key from the Tailscale admin console, from the kit's clone (the key is best kept in a private file and sourced, so it never appears in a shell history or a chat):
 
 ```
 TS_AUTHKEY='tskey-auth-...' WIFI_SSID='their network' WIFI_PSK='their password' phase0/neighbor.sh prep

@@ -22,6 +22,13 @@
 #   WIFI_SSID / WIFI_PSK   the neighbor's Wi-Fi, written as a NetworkManager profile that connects when the network is seen
 #   FETCH_URL        the house's hourly purchase from the neighbor (default: 100 MB from Cloudflare's speed test)
 #   MINT_LAN         the Mint's LAN address, which bw-house keeps using (default 192.168.0.61)
+#   NODES            which nodes the tailnet step joins (default: bw-house bw-neighbor bw-mint); the Pi can be joined on
+#                    its own from the neighbor's network, and the bench nodes later from the house LAN
+#   SSH_SUFFIX       appended to every node name for SSH, e.g. "-ts" to use the tailnet aliases in ~/.ssh/config
+#                    (bw-house-ts and the rest) once the Mac is on the tailnet and the nodes are reachable from anywhere
+#   MINT_TS / NEIGH_TS   the Mint's and the neighbor's tailnet addresses, when the script cannot ask them itself
+#
+# Steps, each usable on its own: upgrade time logs tailnet kit peers house check wifi bench
 #
 # Nothing here prints or copies a private key. Tailscale's keys are made on each node; the node's NYM key is made by
 # install.sh and stays on the node, which is the neighbor's. The Mac keeps SSH access through bw-house (phase0/NEIGHBOR.md).
@@ -31,11 +38,15 @@ SSH="ssh -o ConnectTimeout=8 -o BatchMode=yes"
 N="bw-neighbor"
 MINT_LAN="${MINT_LAN:-192.168.0.61}"
 FETCH_URL="${FETCH_URL:-https://speed.cloudflare.com/__down?bytes=100000000}"
-ts_ip() { run "$1" 'tailscale ip -4' | head -1; }
+ts_ip() {
+  case "$1" in bw-mint) [ -n "${MINT_TS:-}" ] && { echo "$MINT_TS"; return; } ;; "$N") [ -n "${NEIGH_TS:-}" ] && { echo "$NEIGH_TS"; return; } ;; esac
+  run "$1" 'tailscale ip -4' | head -1
+}
 
 say() { printf '\n== %s\n' "$*"; }
-run() { h="$1"; shift; $SSH "$h" "$@"; }
-sudo_sh() { h="$1"; $SSH "$h" sudo sh -s; }   # script on stdin, never as an ssh argument
+run() { h="$1$SSH_SUFFIX"; shift; $SSH "$h" "$@"; }
+sudo_sh() { h="$1$SSH_SUFFIX"; $SSH "$h" sudo sh -s; }   # script on stdin, never as an ssh argument
+SSH_SUFFIX="${SSH_SUFFIX:-}"
 
 step_upgrade() {
   say "upgrade and reboot $N"
@@ -75,38 +86,48 @@ step_wifi() {
 
 step_tailnet() {
   [ -n "${TS_AUTHKEY:-}" ] || { echo "TS_AUTHKEY=tskey-auth-... is required (a pre-authentication key from the Tailscale admin console)"; exit 2; }
-  say "tailnet: bw-house, $N and bw-mint join; $N offers itself as an exit node"
-  for h in bw-house $N bw-mint; do
+  nodes="${NODES:-bw-house $N bw-mint}"
+  say "tailnet: $nodes join; $N offers itself as an exit node"
+  for h in $nodes; do
     run "$h" 'command -v tailscale >/dev/null || (curl -fsSL https://tailscale.com/install.sh | sudo sh >/dev/null); tailscale version | head -1'
   done
-  sudo_sh $N <<'EOS'
+  case " $nodes " in *" $N "*) sudo_sh $N <<'EOS'
 set -e
 printf 'net.ipv4.ip_forward = 1\nnet.ipv6.conf.all.forwarding = 1\n' > /etc/sysctl.d/99-bwkit-exit.conf
 sysctl -q -p /etc/sysctl.d/99-bwkit-exit.conf
 echo "$(hostname): forwarding on, for exit-node service"
 EOS
-  for h in bw-house bw-mint; do
-    printf '%s\n' "$TS_AUTHKEY" | $SSH "$h" 'read k; sudo tailscale up --authkey "$k" --hostname "$(hostname)" >/dev/null && echo "$(hostname): on the tailnet at $(tailscale ip -4)"'
+  ;; esac
+  for h in $nodes; do
+    extra=""; [ "$h" = "$N" ] && extra="--advertise-exit-node"
+    printf '%s\n' "$TS_AUTHKEY" | $SSH "$h$SSH_SUFFIX" "read k; sudo tailscale up --authkey \"\$k\" --hostname \"\$(hostname)\" $extra >/dev/null && echo \"\$(hostname): on the tailnet at \$(tailscale ip -4)\""
   done
-  printf '%s\n' "$TS_AUTHKEY" | $SSH $N 'read k; sudo tailscale up --authkey "$k" --hostname "$(hostname)" --advertise-exit-node >/dev/null && echo "$(hostname): on the tailnet at $(tailscale ip -4), exit node offered (approve it in the admin console)"'
-  sleep 3
-  run bw-house "ping -c 3 -W 3 $(ts_ip $N) | tail -1"
-  run $N "ping -c 3 -W 3 $(ts_ip bw-mint) | tail -1"
+  case " $nodes " in *" $N "*) echo "$N: exit node offered; approve it in the admin console, and disable key expiry for each node there";; esac
 }
 
 step_kit() {
   say "bwkit on $N as the hop; NYMs exchanged with bw-house and bw-mint"
   COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py install.sh systemd | $SSH $N 'mkdir -p ~/kit && tar -C ~/kit -xf -'
   run $N 'cd ~/kit && sudo ./install.sh hop'
-  mint_ts="$(ts_ip bw-mint)"
+  mint_ts="$(ts_ip bw-mint 2>/dev/null || true)"
+  [ -n "$mint_ts" ] || { echo "the Mint's tailnet address is not known yet (bw-mint not reachable and MINT_TS not set); the hop's config gets it in the peers step"; mint_ts="MINT_TS_PENDING"; }
   run $N "sudo -u bwkit python3 - <<'PY'
 import json; p='/etc/bwkit/config.json'; c=json.load(open(p)); c['mint']='http://$mint_ts:8710'; c['iface']='tailscale0'; json.dump(c,open(p,'w'),indent=2); print('hop config:',c)
+PY"
+  run $N 'sudo systemctl enable -q --now bwkit && sleep 1 && systemctl is-active bwkit'
+}
+
+step_peers() {
+  say "NYMs exchanged among bw-house, $N and bw-mint; the hop's Mint address"
+  mint_ts="$(ts_ip bw-mint)"
+  run $N "sudo -u bwkit python3 - <<'PY'
+import json; p='/etc/bwkit/config.json'; c=json.load(open(p)); c['mint']='http://$mint_ts:8710'; json.dump(c,open(p,'w'),indent=2); print('hop config:',c)
 PY"
   neigh_nym="$(run $N 'sudo -u bwkit bwkit nym')"
   house_nym="$(run bw-house 'sudo -u bwkit bwkit nym')"
   run $N "sudo -u bwkit bwkit peer add bw-house '$house_nym'"
   for h in bw-house bw-mint; do run "$h" "sudo -u bwkit bwkit peer add $N '$neigh_nym'"; done
-  run $N 'sudo systemctl enable -q --now bwkit && sleep 1 && systemctl is-active bwkit'
+  run $N 'sudo systemctl restart bwkit && sleep 1 && systemctl is-active bwkit'
 }
 
 step_house() {
@@ -174,9 +195,9 @@ step_bench() {
 }
 
 case "${1:-}" in
-  prep)  step_upgrade; step_time; step_logs; step_tailnet; step_kit; step_house; step_check; step_wifi ;;
+  prep)  step_upgrade; step_time; step_logs; step_tailnet; step_kit; step_peers; step_house; step_check; step_wifi ;;
   check) step_check ;;
   bench) step_bench ;;
-  upgrade|time|logs|wifi|tailnet|kit|house) "step_$1" ;;
+  upgrade|time|logs|wifi|tailnet|kit|peers|house) "step_$1" ;;
   *) sed -n '2,20p' "$0"; exit 2 ;;
 esac
