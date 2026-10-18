@@ -27,6 +27,8 @@
 #   SSH_SUFFIX       appended to every node name for SSH, e.g. "-ts" to use the tailnet aliases in ~/.ssh/config
 #                    (bw-house-ts and the rest) once the Mac is on the tailnet and the nodes are reachable from anywhere
 #   MINT_TS / NEIGH_TS   the Mint's and the neighbor's tailnet addresses, when the script cannot ask them itself
+#   NEIGH_SSH        the SSH alias to reach bw-neighbor by when it is not on the Mac's network: bw-neighbor-away in
+#                    ~/.ssh/config goes to its tailnet address through bw-house, once bw-house is on the tailnet
 #
 # Steps, each usable on its own: upgrade time logs tailnet kit peers house check wifi bench
 #
@@ -44,8 +46,9 @@ ts_ip() {
 }
 
 say() { printf '\n== %s\n' "$*"; }
-run() { h="$1$SSH_SUFFIX"; shift; $SSH "$h" "$@"; }
-sudo_sh() { h="$1$SSH_SUFFIX"; $SSH "$h" sudo sh -s; }   # script on stdin, never as an ssh argument
+host_of() { if [ "$1" = "$N" ] && [ -n "${NEIGH_SSH:-}" ]; then echo "$NEIGH_SSH"; else echo "$1$SSH_SUFFIX"; fi; }
+run() { h="$(host_of "$1")"; shift; $SSH "$h" "$@"; }
+sudo_sh() { h="$(host_of "$1")"; $SSH "$h" sudo sh -s; }   # script on stdin, never as an ssh argument
 SSH_SUFFIX="${SSH_SUFFIX:-}"
 
 step_upgrade() {
@@ -81,7 +84,7 @@ EOS
 step_wifi() {
   [ -n "${WIFI_SSID:-}" ] || { say "wifi: WIFI_SSID not set, skipping (Ethernet at the neighbor's)"; return 0; }
   say "wifi: a profile for the neighbor's network, activated when it is seen"
-  printf '%s\n%s\n' "$WIFI_SSID" "${WIFI_PSK:-}" | $SSH $N 'read ssid; read psk; sudo nmcli connection delete neighbor >/dev/null 2>&1; sudo nmcli connection add type wifi con-name neighbor ifname wlan0 ssid "$ssid" wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$psk" connection.autoconnect yes connection.autoconnect-priority 10 >/dev/null && echo "wifi profile written for $ssid (priority over the house network, so it wins when both are in range)"'
+  printf '%s\n%s\n' "$WIFI_SSID" "${WIFI_PSK:-}" | $SSH "$(host_of $N)" 'read ssid; read psk; sudo nmcli connection delete neighbor >/dev/null 2>&1; sudo nmcli connection add type wifi con-name neighbor ifname wlan0 ssid "$ssid" wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$psk" connection.autoconnect yes connection.autoconnect-priority 10 >/dev/null && echo "wifi profile written for $ssid (priority over the house network, so it wins when both are in range)"'
 }
 
 step_tailnet() {
@@ -100,7 +103,7 @@ EOS
   ;; esac
   for h in $nodes; do
     extra=""; [ "$h" = "$N" ] && extra="--advertise-exit-node"
-    printf '%s\n' "$TS_AUTHKEY" | $SSH "$h$SSH_SUFFIX" "read k; sudo tailscale up --authkey \"\$k\" --hostname \"\$(hostname)\" $extra >/dev/null && echo \"\$(hostname): on the tailnet at \$(tailscale ip -4)\""
+    printf '%s\n' "$TS_AUTHKEY" | $SSH "$(host_of "$h")" "read k; sudo tailscale up --authkey \"\$k\" --hostname \"\$(hostname)\" $extra >/dev/null && echo \"\$(hostname): on the tailnet at \$(tailscale ip -4)\""
   done
   case " $nodes " in *" $N "*) echo "$N: exit node offered; approve it in the admin console, and disable key expiry for each node there";; esac
 }
