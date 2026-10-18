@@ -19,7 +19,6 @@ These are the month's tests from `phase0/NEIGHBOR.md`, none run yet.
 
 ## Kit fixes
 
-- **A lost window stays in `health` forever.** bw-mint and bw-house both flag the window of Oct 16, 16:28 (the forced clock test) as lost, and will on every check from now on. A lost window should leave `health` after a day; it stays in the ledger and in the page's open-windows table.
 - **One test is flaky.** `test_bwkit.py` failed once in four runs on Oct 18, before `bwkit.py` changed, and the name of the failing test was not captured. Run it in a loop until it fails, then fix the cause.
 - **bw-forest is not on the tailnet.** It runs 0.4.0 on the bench and answers on the house LAN, but a fleet page reading over the tailnet cannot reach it. Join it with `NODES=bw-forest phase0/neighbor.sh tailnet`, which needs a fresh pre-authentication key in `~/.config/bwkit/neighbor.env`. Or decide that it waits for Phase 1, when it becomes the radio hop.
 

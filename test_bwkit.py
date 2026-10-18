@@ -1980,7 +1980,8 @@ class Health(unittest.TestCase):
             self.assertEqual(node.health({}, t0 + 599)["items"], [], node.role)
             self.assertEqual(node.health({}, t0 + 720)["items"], [{"level": "warn", "text": waiting, "since": t0}], node.role)
             self.assertEqual(node.health({}, t0 + 7201)["items"], [{"level": "warn", "text": lost, "since": t0}], node.role)
-            self.assertEqual(node.health({}, t0 + 8 * 86400)["items"], [], node.role)   # after a week the books hold it
+            self.assertEqual(node.health({}, t0 + 86400)["items"], [{"level": "warn", "text": lost, "since": t0}], node.role)
+            self.assertEqual(node.health({}, t0 + 86401)["items"], [], node.role)       # after a day the ledger and the open-windows table hold it
         self.assertEqual(lab.hop.health({}, lab.t + 720)["items"], [])                   # the hop never saw it
 
     def test_the_outbox_and_the_hops_patience(self):

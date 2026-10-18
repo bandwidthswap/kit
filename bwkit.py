@@ -153,7 +153,7 @@ HEALTH = {                              # the checks every view shows (dashboard
     "disk_bytes": 500_000_000,          # less free disk than this for the ledger is bad
     "ack_wait_s": 600,                  # a receipt without its ack for this long needs attention
     "lost_after_s": 7200,               # two windows without an ack: the hop never countersigned, the window is lost
-    "lost_shown_s": 7 * 86400,          # a lost window is listed for a week; after that the books hold it
+    "lost_shown_s": 86400,              # a lost window is listed for a day; after that the ledger and the open-windows table hold it
     "commit_slack_s": 300,              # an hour is committed within five minutes of closing
     "report_s": 600,                    # the public status is posted every two minutes; ten without one is a warning
     "gap_windows": 24,                  # the gap is judged as the median over this many of a link's newest windows
@@ -2261,7 +2261,7 @@ class Node:
         dict the clock and disk are read from (status_dict passes its own).
         The checks: a clock off its source beyond a second; disk under 500
         MB; a receipt waiting more than ten minutes for its ack; a receipt
-        two windows old without one (a lost window, listed for a week); an
+        two windows old without one (a lost window, listed for a day); an
         hour with settlements and no commitment (the Mint, since
         commitments began); the public status not posted in ten minutes
         (the Mint); an outbox not empty (a hop, a payer); a payer declined
