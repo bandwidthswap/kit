@@ -20,7 +20,8 @@
 #   TS_AUTHKEY       required for prep: a Tailscale pre-authentication key from the admin console (one-off keys are best;
 #                    it goes to each node once on stdin and is never echoed). Disable key expiry for the three nodes afterwards.
 #   WIFI_SSID / WIFI_PSK   the neighbor's Wi-Fi, written as a NetworkManager profile that connects when the network is seen
-#   FETCH_URL        the house's hourly purchase from the neighbor (default: 100 MB from Cloudflare's speed test)
+#   FETCH_URLS       the house's hourly purchase from the neighbor: sources tried in order until one serves 100 MB
+#                    (default: Cloudflare's speed test, then tele2's, then Hetzner's; Cloudflare answered 403 once)
 #   MINT_LAN         the Mint's LAN address, which bw-house keeps using (default 192.168.0.61)
 #   NODES            which nodes the tailnet step joins (default: bw-house bw-neighbor bw-mint); the Pi can be joined on
 #                    its own from the neighbor's network, and the bench nodes later from the house LAN
@@ -39,7 +40,7 @@ kit="$(cd "$(dirname "$0")/.." && pwd)"
 SSH="ssh -o ConnectTimeout=8 -o BatchMode=yes"
 N="bw-neighbor"
 MINT_LAN="${MINT_LAN:-192.168.0.61}"
-FETCH_URL="${FETCH_URL:-https://speed.cloudflare.com/__down?bytes=100000000}"
+FETCH_URLS="${FETCH_URLS:-https://speed.cloudflare.com/__down?bytes=100000000 http://speedtest.tele2.net/100MB.zip https://speed.hetzner.de/100MB.bin}"
 ts_ip() {
   case "$1" in bw-mint) [ -n "${MINT_TS:-}" ] && { echo "$MINT_TS"; return; } ;; "$N") [ -n "${NEIGH_TS:-}" ] && { echo "$NEIGH_TS"; return; } ;; esac
   run "$1" 'tailscale ip -4' | head -1
@@ -144,14 +145,19 @@ set -e
 cat > /usr/local/bin/bwkit-fetch <<'EOC'
 #!/bin/sh
 # The house's hourly purchase from the neighbor: one download with bw-neighbor as the exit node, so real bytes cross
-# the metered interface on both ends. The LAN stays reachable meanwhile (the Mint, the other nodes); afterwards the
-# exit node is dropped so the house's own traffic goes its own way for the rest of the hour.
-url="\$1"; exit_node="\$2"
+# the metered interface on both ends. Sources are tried in order until one serves the file; the LAN stays reachable
+# meanwhile, and the exit node is dropped afterwards whatever happened.
+exit_node="\$1"; shift
 tailscale set --exit-node="\$exit_node" --exit-node-allow-lan-access=true || { logger -t bwkit-fetch "purchase skipped: could not set the exit node \$exit_node"; exit 1; }
-out="\$(curl -s -o /dev/null --max-time 900 -w '%{http_code} %{size_download} %{time_total}' "\$url")"; rc=\$?
+ok=1
+for url in "\$@"; do
+  out="\$(curl -s -o /dev/null -A "bwkit-fetch/0.1 (+https://bandwidthswap.com)" --max-time 900 -w '%{http_code} %{size_download} %{time_total}' "\$url")"; rc=\$?
+  set -- \$out
+  if [ "\$rc" = 0 ] && [ "\${1:-}" = 200 ] && [ "\${2:-0}" -gt 1000000 ]; then logger -t bwkit-fetch "purchase: \$2 bytes in \$3 s through \$exit_node from \$url"; ok=0; break
+  else logger -t bwkit-fetch "source failed: \$url (curl \$rc, http \${1:-?}, \${2:-0} bytes)"; fi
+done
 tailscale set --exit-node=
-set -- \$out
-if [ "\$rc" = 0 ] && [ "\$1" = 200 ] && [ "\${2:-0}" -gt 0 ]; then logger -t bwkit-fetch "purchase: \$2 bytes in \$3 s through \$exit_node"; else logger -t bwkit-fetch "purchase failed: curl \$rc, http \${1:-?}, \${2:-0} bytes"; exit 1; fi
+exit \$ok
 EOC
 chmod 755 /usr/local/bin/bwkit-fetch
 cat > /etc/systemd/system/bwkit-fetch.service <<EOC
@@ -159,7 +165,7 @@ cat > /etc/systemd/system/bwkit-fetch.service <<EOC
 Description=Bandwidth Swap: the house's hourly purchase from the neighbor
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/bwkit-fetch $FETCH_URL $neigh_ts
+ExecStart=/usr/local/bin/bwkit-fetch $neigh_ts $FETCH_URLS
 EOC
 cat > /etc/systemd/system/bwkit-fetch.timer <<EOC
 [Unit]
@@ -172,7 +178,7 @@ WantedBy=timers.target
 EOC
 systemctl daemon-reload
 systemctl enable -q --now bwkit-fetch.timer
-echo "bw-house: bwkit-fetch.timer enabled ($FETCH_URL)"
+echo "bw-house: bwkit-fetch.timer enabled ($FETCH_URLS)"
 EOS
   say "baseline sample on payer and hop (the first window starts now)"
   run bw-house 'sudo -u bwkit bwkit sample'
