@@ -55,11 +55,12 @@ The script does, in order and each step ending with its check:
 1. **Upgrade** and reboot.
 2. **Time.** chrony from the pool, through the neighbor's own internet once it is there. The bench nodes take time from `bw-house`; this one cannot, so the clock rule of Section 3.5 is tested across two time sources for the first time.
 3. **Logs** in RAM.
-4. **Wi-Fi** profile, if given.
+4. (The neighbor's **Wi-Fi** profile is written last, see 9.)
 5. **Tailnet.** Tailscale is installed on `bw-house`, `bw-neighbor` and `bw-mint` (the official installer, fetched over HTTPS) and each joins with the key. `bw-neighbor` turns forwarding on and offers itself as an exit node, which is how it sells its connection: approve that in the admin console. The script prints each node's tailnet address.
 6. **Kit.** `bwkit` as the hop, metering `tailscale0`, its Mint reached at `bw-mint`'s tailnet address, NYMs exchanged with `bw-house` and `bw-mint`.
 7. **The house side.** `bw-house`'s payer switches from `bw-forest` on `wg0` to `bw-neighbor` on `tailscale0` (the bench config is kept as `config.json.bench`; `neighbor.sh bench` puts it back) and keeps talking to the Mint on the LAN, so that traffic is not counted. A timer buys one download an hour, 100 MB from Cloudflare's speed test by default, with `bw-neighbor` set as the exit node for the duration and the LAN still reachable, then drops the exit node again. That is the house buying the neighbor's connection, and the bytes cross `tailscale0` on both ends, where both meters count them. At ten cents a gigabyte it is about a quarter a day.
 8. **Check.** The tailnet as `bw-house` sees it, a ping to the neighbor, the hop's status over the tailnet, the neighbor's clock, the Mint's view.
+9. **The neighbor's Wi-Fi**, last: a NetworkManager profile with priority over the house network. If their network is in range from the house the Pi may switch to it right then, which no longer matters: it stays on the tailnet either way.
 
 On the bench all three nodes reach the tailnet over the house's connection, so the whole thing is tested before the Pi leaves the house. The one thing that cannot be tested there is the neighbor's Wi-Fi.
 

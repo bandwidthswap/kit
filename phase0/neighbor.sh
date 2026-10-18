@@ -10,7 +10,9 @@
 # download an hour.
 #
 #   TS_AUTHKEY=tskey-auth-... phase0/neighbor.sh prep
-#                       everything, in order: upgrade, time, logs, wifi, tailnet (three nodes), kit, the house side, check
+#                       everything, in order: upgrade, time, logs, tailnet (three nodes), kit, the house side, check, and the
+#                       neighbor's wifi last, with priority: if their network is in range from the house the Pi may switch
+#                       to it at that point, which is harmless once everything else is set
 #   phase0/neighbor.sh check    after the move: tailnet status, ping, the hop's status over the tailnet, the Mint's view
 #   phase0/neighbor.sh bench    put bw-house's payer back on bw-forest over wg0 (the bench as it was)
 #
@@ -68,7 +70,7 @@ EOS
 step_wifi() {
   [ -n "${WIFI_SSID:-}" ] || { say "wifi: WIFI_SSID not set, skipping (Ethernet at the neighbor's)"; return 0; }
   say "wifi: a profile for the neighbor's network, activated when it is seen"
-  printf '%s\n%s\n' "$WIFI_SSID" "${WIFI_PSK:-}" | $SSH $N 'read ssid; read psk; sudo nmcli connection add type wifi con-name neighbor ifname wlan0 ssid "$ssid" wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$psk" connection.autoconnect yes >/dev/null && echo "wifi profile written for $ssid"'
+  printf '%s\n%s\n' "$WIFI_SSID" "${WIFI_PSK:-}" | $SSH $N 'read ssid; read psk; sudo nmcli connection delete neighbor >/dev/null 2>&1; sudo nmcli connection add type wifi con-name neighbor ifname wlan0 ssid "$ssid" wifi-sec.key-mgmt wpa-psk wifi-sec.psk "$psk" connection.autoconnect yes connection.autoconnect-priority 10 >/dev/null && echo "wifi profile written for $ssid (priority over the house network, so it wins when both are in range)"'
 }
 
 step_tailnet() {
@@ -172,7 +174,7 @@ step_bench() {
 }
 
 case "${1:-}" in
-  prep)  step_upgrade; step_time; step_logs; step_wifi; step_tailnet; step_kit; step_house; step_check ;;
+  prep)  step_upgrade; step_time; step_logs; step_tailnet; step_kit; step_house; step_check; step_wifi ;;
   check) step_check ;;
   bench) step_bench ;;
   upgrade|time|logs|wifi|tailnet|kit|house) "step_$1" ;;
