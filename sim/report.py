@@ -204,8 +204,9 @@ def header(run):
     lines = [run.name, ""]
     if run.scn.description:
         lines += [run.scn.description, ""]
-    lines.append("%d windows of %d s · f = %s · m = %s · program window %d · reconcile every %d · receipts: %s" % (
-        run.windows, run.window_seconds, pct(p["f"]), pct(p["m"]), p["program_window"], p["reconcile_every"], SOURCE))
+    lines.append("%d windows of %d s · f = %s · m = %s · payout cap %s of a payer's fees · program window %d · reconcile every %d · receipts: %s" % (
+        run.windows, run.window_seconds, pct(p["f"]), pct(p["m"]), pct(p["f"] - p["steward_margin"]), p["program_window"],
+        p["reconcile_every"], SOURCE))
     return lines
 
 
@@ -262,6 +263,9 @@ def render(run, by=None, detail=None, log=False):
         out.append("   %s: income %s · matched %s · posted %s · back %s · escrow now %s" % (
             run.name_of(s.account), fmt(s.received, s.unit, run.symbol(s.unit)), fmt(s.matched, s.unit, run.symbol(s.unit)),
             fmt(s.posted, s.unit, run.symbol(s.unit)), fmt(s.refunds, s.unit, run.symbol(s.unit)), fmt(s.escrow, s.unit, run.symbol(s.unit))))
+        if s.capped:
+            out.append("   %s: the per-payer cap held back %s of payouts (f − margin = %s of each payer's fees in)" % (
+                run.name_of(s.account), fmt(s.capped, s.unit, run.symbol(s.unit)), pct(run.params["f"] - run.params["steward_margin"])))
         m = run.mints[d]
         if m.kept:
             out.append("   %s kept %s of the fees it owed its Steward" % (run.name_of(m.account), fmt(m.kept, m.unit, run.symbol(m.unit))))

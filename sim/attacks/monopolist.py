@@ -13,8 +13,8 @@ paper accepts that one party may own both).
 
 from fractions import Fraction
 
-from ..money import fmt, pct
-from . import run_dict
+from sim.money import fmt, pct
+from sim.attacks import run_dict
 
 PROGRAM = 24
 SWITCH = 48

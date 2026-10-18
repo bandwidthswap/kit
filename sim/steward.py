@@ -39,6 +39,10 @@ class Steward:
         self.posted = Fraction(0)        # bounties posted (second bridge and first link)
         self.refunds = Fraction(0)       # escrow that came back
         self.declined = []               # (window, what, why) postings the rule could not make
+        self.fees_in = {}                # payer NYM -> gross fees it has paid for carriage in this domain
+        self.paid_on = {}                # payer NYM -> what the Steward has paid out on that payer's receipts
+        self.paid_out = Fraction(0)
+        self.capped = Fraction(0)        # what the cap held back
 
     # -------------------------------------------------------------- income
 
@@ -50,6 +54,35 @@ class Steward:
     def refund(self, amount):
         self.escrow += amount
         self.refunds += amount
+
+    # -------------------------------------------------------------- the per-payer cap (Section 3.3)
+
+    def fee_in(self, payer, gross):
+        """A receipt with this payer settled for `gross`; the Steward took f of it."""
+        self.fees_in[payer] = self.fees_in.get(payer, Fraction(0)) + gross
+
+    def allowance(self, payer):
+        """What the Steward may still pay out on this payer's receipts: (f - margin) of its fees in, less what it has."""
+        p = self.run.params
+        cap = max(Fraction(0), (p["f"] - p["steward_margin"]) * self.fees_in.get(payer, Fraction(0)))
+        return max(Fraction(0), cap - self.paid_on.get(payer, Fraction(0)))
+
+    def draw(self, cm, amount, payer):
+        """Take `amount` from a commitment's pools for a payout on `payer`'s receipt: the poster's money first,
+        then the Steward's, which the per-payer cap limits. Returns (from the poster, from the Steward)."""
+        own = min(amount, cm.pool_own)
+        cm.pool_own -= own
+        rest = amount - own
+        match = Fraction(0)
+        if rest > 0 and cm.pool_match > 0:
+            match = min(rest, cm.pool_match, self.allowance(payer))
+            held = min(rest, cm.pool_match) - match
+            if held > 0:
+                self.capped += held
+            cm.pool_match -= match
+            self.paid_on[payer] = self.paid_on.get(payer, Fraction(0)) + match
+            self.paid_out += match
+        return own, match
 
     # -------------------------------------------------------------- program 1
 
@@ -76,7 +109,7 @@ class Steward:
         self.escrow -= amt
         self.matched += amt
         per_window = cm.escrow / cm.windows if cm.windows else None
-        cm.pool += amt
+        cm.pool_match += amt
         cm.escrow += amt
         cm.contributions[self.account] = cm.contributions.get(self.account, Fraction(0)) + amt
         if per_window:
@@ -117,19 +150,20 @@ class Steward:
                 run.log(w, "Steward (%s): %s is a sole bridge carrying %s, but the escrow is spent" % (
                     self.domain, lid, fmt(fees, self.unit, run.symbol(self.unit))))
                 break
-            value = min(fees, budget)
+            take = p["f"] * fees                       # the Steward's income from the sole link
+            value = min(take, budget)
             windows = p["program_window"]
-            premium = fees / Fraction(st["bytes"], GB) if st["bytes"] else Fraction(0)
+            premium = value / Fraction(st["bytes"], GB) if st["bytes"] else Fraction(0)
             cm = Commitment(id=run.new_id(self.domain + "-bridge"), kind="second_bridge", poster=self.account,
                             domain=self.domain, unit=self.unit, min_bytes=st["bytes"] // windows, premium=premium,
                             windows=windows, deadline=w + 1 + p["bounty_deadline"], posted_at=w + 1,
-                            escrow=value, contributions={self.account: value}, pool=value,
+                            escrow=value, contributions={self.account: value}, pool_match=value,
                             from_places=frozenset(st["origin_places"]) - {None},
                             to_places=frozenset(st["dest_places"] | {routing.place_of(run, link.dst)}) - {None},
                             avoid_link=lid, existing_places=frozenset(st["places"]),
                             label="second path around %s" % lid)
-            self._post(cm, w, "sole bridge %s carried %s in %d windows; bounty for a second path from %s to %s through a mapped place other than %s, premium %s/GB" % (
-                lid, fmt(fees, self.unit, run.symbol(self.unit)), windows,
+            self._post(cm, w, "sole bridge %s carried %s in %d windows, %s of it the Steward's; bounty for a second path from %s to %s through a mapped place other than %s, premium %s/GB" % (
+                lid, fmt(fees, self.unit, run.symbol(self.unit)), windows, fmt(take, self.unit, run.symbol(self.unit)),
                 ", ".join(run.places[x].name for x in sorted(cm.from_places)),
                 ", ".join(run.places[x].name for x in sorted(cm.to_places)),
                 ", ".join(run.places[x].name for x in sorted(cm.existing_places)),
@@ -151,7 +185,7 @@ class Steward:
                 cm = Commitment(id=run.new_id(self.domain + "-first"), kind="first_link", poster=self.account,
                                 domain=self.domain, unit=self.unit, min_bytes=0, premium=p["first_link_premium"],
                                 windows=p["bounty_deadline"], deadline=w + 1 + p["bounty_deadline"], posted_at=w + 1,
-                                escrow=value, contributions={self.account: value}, pool=value,
+                                escrow=value, contributions={self.account: value}, pool_match=value,
                                 to_place=place.id, label="first link to %s" % place.name)
                 self._post(cm, w, "standing offer for the first link to %s, premium %s/GB" % (
                     place.name, fmt(p["first_link_premium"], self.unit, run.symbol(self.unit))))

@@ -2,7 +2,7 @@
 
 import sys
 
-from . import mint, monopolist, wash
+from sim.attacks import mint, monopolist, wash
 
 ATTACKS = {"wash": wash.main, "monopolist": monopolist.main, "mint": mint.main}
 

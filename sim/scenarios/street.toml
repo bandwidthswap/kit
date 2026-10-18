@@ -9,7 +9,8 @@
 # House 2 for its own twenty gigabytes. The field note's figures: working, House 1 and 2
 # earn $2.85 a day and House 3 $0.95; down, House 2 earns $7.60, House 1 earns 57¢ and
 # pays $2.00. At the end of day two the Steward's rule sees the Wi-Fi as a sole bridge
-# carrying fees and posts those fees as a bounty for a second path through another place.
+# carrying fees and posts its take of those fees (3¢) as a bounty for a second path through
+# another place.
 
 [scenario]
 name = "A street with three dishes"

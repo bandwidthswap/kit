@@ -2,7 +2,7 @@
 
     [scenario]      name, description, windows, window_seconds, report (phase | day | window),
                     detail_windows (windows to print row by row), per_gb (print a per-gigabyte view)
-    [params]        f, m, mint_share, program_window, reconcile_every, first_link_size, first_link_premium,
+    [params]        f, m, steward_margin, mint_share, program_window, reconcile_every, first_link_size, first_link_premium,
                     bounty_deadline, min_bond_age, clock_base_s, drift_s_per_day, sees_ownership, max_wait,
                     bridge_after_exclusion, epoch
     [[domains]]     id, name, unit, symbol, mint
@@ -33,6 +33,7 @@ from .money import GB, money
 DEFAULT_PARAMS = {
     "f": "0.05",                   # the fee fraction paid to the Steward (Section 3.3)
     "m": "0.025",                  # the match cap, strictly below f (Section 7)
+    "steward_margin": "0.005",     # the Steward pays out on a payer's receipts at most (f - margin) of the fees that payer paid in
     "mint_share": "0",             # the Mint's share of each payment (Section 4 names one, with no number)
     "program_window": 24,          # the Steward's programs run at the end of every so many windows
     "reconcile_every": 24,         # Mints reconcile at the end of every so many windows, when a link exists
@@ -47,7 +48,7 @@ DEFAULT_PARAMS = {
     "bridge_after_exclusion": "stop",  # a bridge bonded on both sides stops settling with an excluded Mint, or keeps
     "epoch": 0,                    # Unix time of window 0, for the receipts' timestamps
 }
-FRACTION_PARAMS = ("f", "m", "mint_share", "first_link_size", "first_link_premium", "clock_base_s", "drift_s_per_day")
+FRACTION_PARAMS = ("f", "m", "steward_margin", "mint_share", "first_link_size", "first_link_premium", "clock_base_s", "drift_s_per_day")
 
 
 class ScenarioError(ValueError):

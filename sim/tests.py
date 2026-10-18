@@ -34,6 +34,14 @@ def cents(x):
     return round(F(x), 2)
 
 
+def assert_cap_held(tc, run):
+    """The Steward never paid out, on any one payer's receipts, more than (f − margin) of the fees that payer paid in."""
+    bound = run.params["f"] - run.params["steward_margin"]
+    for st in run.stewards.values():
+        for payer, paid in st.paid_on.items():
+            tc.assertLessEqual(paid, bound * st.fees_in.get(payer, F(0)), "%s on %s" % (st.account, payer))
+
+
 class Receipts(unittest.TestCase):
     def test_the_labs_three_tests(self):
         self.assertEqual(settle_counts(21938052, 21939460), (21938052, "settled"))
@@ -93,8 +101,9 @@ class Street(unittest.TestCase):
         payers = ("h1a", "h2a", "h3a", "h1")
         self.assertEqual(sum(r.paid(p, 24, 47) for p in payers), F("9.60"))
         bounties = [c for c in r.commitments.values() if c.kind == "second_bridge"]
-        self.assertEqual([(c.avoid_link, c.escrow) for c in bounties], [("wifi", F("0.60"))])
-        self.assertEqual(bounties[0].premium, F("0.02"))
+        # the Steward's take of the Wi-Fi's 60¢, not the 60¢ itself
+        self.assertEqual([(c.avoid_link, c.escrow) for c in bounties], [("wifi", F("0.03"))])
+        self.assertEqual(bounties[0].premium, F("0.001"))
 
 
 class Cabin(unittest.TestCase):
@@ -137,10 +146,13 @@ class Cabin(unittest.TestCase):
         self.assertEqual(cm.contributions["steward:street"], F("4.50"))
         self.assertEqual(cm.windows, 738)
         back_cabin = r.received("cabin", 1440, 1440, kinds=("refund",))
-        back_steward = r.received("steward:street", 1440, 1440, kinds=("refund",))
+        back_steward = sum(p.amount for p in r.rows(1440, 1440) if p.to == "steward:street" and p.commitment == "cabin-bounty")
         self.assertGreater(back_cabin, 0)
-        self.assertEqual(back_cabin / back_steward, F(180) / F("4.50"))
+        # the cabin's own money is drawn first; the ridge went dark before the matched windows, so the whole match returns
+        self.assertEqual(back_steward, F("4.50"))
+        self.assertEqual(back_cabin + back_steward + cm.paid_out + r.received("cabin", 0, 1439, kinds=("refund",)), F("184.50"))
         self.assertEqual(cm.status, "expired")
+        self.assertEqual(cm.pool, 0)
 
     def test_without_the_match(self):
         r = run("cabin-nomatch")
@@ -206,19 +218,39 @@ class Wash(unittest.TestCase):
         self.assertEqual(net, F("0.025") * F("0.95") - F("0.05"))
         self.assertLess(net, 0)
 
-    def test_turns_positive_only_above_f(self):
-        self.assertLess(wash.run_wash(F("0.05"), F("0.05"))[0], 0)
-        self.assertGreater(wash.run_wash(F("0.05"), F("0.055"))[0], 0)
+    def test_never_positive_with_the_cap(self):
+        """Beyond f − margin the per-payer cap holds the match back, so no m makes the trader whole."""
+        nets = {}
+        for m in (F("0.05"), F("0.055"), F("0.10")):
+            net, run = wash.run_wash(F("0.05"), m)
+            self.assertLess(net, 0)
+            assert_cap_held(self, run)
+            nets[m] = net
+        # the curve is flat once the cap binds: more match buys nothing
+        self.assertLess(abs(nets[F("0.10")] - nets[F("0.055")]), F("0.002"))
+
+    def test_without_the_cap_it_turned_positive_above_f(self):
+        self.assertGreater(wash.run_wash(F("0.05"), F("0.055"), margin=F("-1"))[0], 0)
 
     def test_second_bridge_with_ownership_seen(self):
         net, _ = wash.run_wash(F("0.05"), F("0.025"), every_program=True, sees_ownership=True)
         self.assertLess(net, 0)
 
     def test_second_bridge_with_ownership_unseen(self):
-        deep, _ = wash.run_wash(F("0.05"), F("0.025"), every_program=True, sees_ownership=False)
+        """NOTES.md item 14: with the bounty sized at f of the fees and the per-payer cap, the trader loses either way."""
+        deep, run = wash.run_wash(F("0.05"), F("0.025"), every_program=True, sees_ownership=False)
         own, _ = wash.run_wash(F("0.05"), F("0.025"), every_program=True, sees_ownership=False, pool=F(0))
-        self.assertGreater(deep, 0)       # the finding recorded in NOTES.md
+        self.assertLess(deep, 0)
         self.assertLess(own, 0)
+        assert_cap_held(self, run)
+        # the bounty is the Steward's take of the sole link's fees
+        bounty = [c for c in run.commitments.values() if c.kind == "second_bridge"][0]
+        self.assertEqual(bounty.escrow, F("0.05") * 24)
+
+    def test_splitting_across_payer_nyms_gains_nothing(self):
+        nets = [wash.run_wash(F("0.05"), F("0.025"), every_program=True, sees_ownership=False, payers=k)[0] for k in (1, 2, 4)]
+        self.assertLess(max(nets), 0)
+        self.assertLess(max(nets) - min(nets), F("0.0005"))
 
 
 class Monopolist(unittest.TestCase):
@@ -260,6 +292,12 @@ class Output(unittest.TestCase):
                     rows = list(csv.reader(fh))
             self.assertEqual(rows[0], ["from", "to", "amount", "unit", "window", "reason"])
             self.assertEqual(len(rows) - 1, len(r.payments))
+
+    def test_cap_holds_in_every_scenario(self):
+        for name in ("street", "cabin", "cabin-nomatch", "earth-moon", "earth-mars-jupiter"):
+            assert_cap_held(self, run(name))
+        for r in (monopolist.run_monopolist("other-hill")["run"], mint.run_mint("stop")["run"]):
+            assert_cap_held(self, r)
 
     def test_books_balance(self):
         """Every unit that enters as a payment leaves as a payment: the accounts sum to zero."""

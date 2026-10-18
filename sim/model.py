@@ -185,7 +185,8 @@ class Commitment:
     posted_at: int
     escrow: Fraction                 # value posted, every contribution included
     contributions: dict = field(default_factory=dict)   # account -> amount
-    pool: Fraction = Fraction(0)     # what is left to pay out
+    pool_own: Fraction = Fraction(0)     # the poster's money left to pay out (drawn first)
+    pool_match: Fraction = Fraction(0)   # the Steward's money left: a match, or a whole bounty (capped per payer)
     # the route, a payer's commitment: nodes or places, and a node the path must use
     src: Optional[str] = None
     dst: Optional[str] = None
@@ -210,7 +211,8 @@ class Commitment:
     def __post_init__(self):
         self.premium = money(self.premium)
         self.escrow = money(self.escrow)
-        self.pool = money(self.pool)
+        self.pool_own = money(self.pool_own)
+        self.pool_match = money(self.pool_match)
         self.contributions = {k: money(v) for k, v in self.contributions.items()}
         self.from_places = frozenset(self.from_places)
         self.to_places = frozenset(self.to_places)
@@ -219,6 +221,10 @@ class Commitment:
     @property
     def open(self):
         return self.status == "open"
+
+    @property
+    def pool(self):
+        return self.pool_own + self.pool_match
 
     def per_window_premium(self):
         return self.premium * Fraction(self.min_bytes, GB)

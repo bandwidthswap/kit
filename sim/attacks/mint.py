@@ -14,9 +14,9 @@ forfeits its Earth and Mars bonds the next time it does.
 
 from fractions import Fraction
 
-from ..money import fmt
-from ..scenario import load_raw
-from . import run_dict
+from sim.money import fmt
+from sim.scenario import load_raw
+from sim.attacks import run_dict
 
 START, END = 100, 183
 

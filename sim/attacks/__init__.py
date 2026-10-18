@@ -9,8 +9,8 @@ ends with one summary line of who lost or gained what. `run_*` functions return 
 for tests.py.
 """
 
-from ..engine import Run
-from ..scenario import from_dict
+from sim.engine import Run
+from sim.scenario import from_dict
 
 
 def run_dict(raw, name):

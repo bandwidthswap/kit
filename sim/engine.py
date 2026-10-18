@@ -263,7 +263,7 @@ class Run:
         cid = c.get("id") or self.new_id("commitment")
         cm = Commitment(id=cid, kind="payer", poster=poster, domain=domain, unit=unit, min_bytes=min_bytes,
                         premium=premium, windows=windows, deadline=deadline, posted_at=w, escrow=escrow,
-                        contributions={poster: escrow}, pool=escrow, src=c.get("src"), dst=c.get("dst"),
+                        contributions={poster: escrow}, pool_own=escrow, src=c.get("src"), dst=c.get("dst"),
                         via=c.get("via"), proving_windows=int(c.get("proving_windows", 0)),
                         proving_period=int(c.get("proving_period", 168)), label=c.get("label", cid))
         self.commitments[cid] = cm
@@ -362,21 +362,21 @@ class Run:
                 self.refund_pool(cm, w)
 
     def refund_pool(self, cm, w):
+        """The poster's money back to the poster, the Steward's back to the Steward's escrow."""
         total = cm.pool
         if total <= 0:
             return
-        whole = sum(cm.contributions.values())
-        for acct, c in sorted(cm.contributions.items()):
-            share = total * c / whole
-            if share <= 0:
-                continue
-            if acct.startswith("steward:"):
-                self.stewards[acct[8:]].refund(share)
-                self.pay("escrow:" + cm.id, acct, share, cm.unit, w, "unspent escrow back to the Steward", kind="refund", commitment=cm.id)
-            else:
-                self.pay("escrow:" + cm.id, acct, share, cm.unit, w, "unspent escrow returned to the poster", kind="refund", commitment=cm.id)
+        if cm.pool_own > 0 and not cm.poster.startswith("steward:"):
+            self.pay("escrow:" + cm.id, cm.poster, cm.pool_own, cm.unit, w, "unspent escrow returned to the poster", kind="refund", commitment=cm.id)
+        elif cm.pool_own > 0:
+            self.stewards[cm.domain].refund(cm.pool_own)
+            self.pay("escrow:" + cm.id, cm.poster, cm.pool_own, cm.unit, w, "unspent escrow back to the Steward", kind="refund", commitment=cm.id)
+        if cm.pool_match > 0:
+            self.stewards[cm.domain].refund(cm.pool_match)
+            self.pay("escrow:" + cm.id, "steward:" + cm.domain, cm.pool_match, cm.unit, w, "unspent escrow back to the Steward", kind="refund", commitment=cm.id)
         cm.refunded += total
-        cm.pool = Fraction(0)
+        cm.pool_own = Fraction(0)
+        cm.pool_match = Fraction(0)
 
     # ------------------------------------------------------------ bundles
 
@@ -487,16 +487,21 @@ class Run:
             from_pool = Fraction(0)
             cm = b.own
             if cm is not None and cm.open and cm.pool > 0 and por == payer:
-                from_pool = min(gross, cm.pool)
-                cm.pool -= from_pool
-                cm.paid_out += from_pool
-                cm.served.add(w)
-                cm_used = cm.id
-                fee_remitted += self.pay_gross("escrow:" + cm.id, owner, from_pool, link, w,
-                                               what + " (posted price from the commitment's escrow)", b, cm.id, "commitment", settled)
+                own, match = self.stewards[cm.domain].draw(cm, gross, payer)
+                from_pool = own + match
+                if from_pool > 0:
+                    cm.paid_out += from_pool
+                    cm.served.add(w)
+                    cm_used = cm.id
+                    tail = " (posted price from the commitment's escrow%s)" % (", %s of it the Steward's match" % fmt(match, unit, self.symbol(unit)) if match else "")
+                    fee_remitted += self.pay_gross("escrow:" + cm.id, owner, from_pool, link, w, what + tail, b, cm.id, "commitment", settled)
                 if from_pool < gross:
-                    cm.status = "exhausted"
-                    self.log(w, "%s is exhausted mid-window; %s pays the rest of the posted price itself" % (cm.label, self.nodes[payer].name))
+                    if cm.pool <= 0:
+                        cm.status = "exhausted"
+                        self.log(w, "%s is exhausted mid-window; %s pays the rest of the posted price itself" % (cm.label, self.nodes[payer].name))
+                    else:
+                        self.log(w, "%s: the Steward's cap holds its match back on %s's receipt; %s pays the rest itself" % (
+                            cm.label, self.nodes[payer].name, self.nodes[payer].name))
             rest = gross - from_pool
             if rest > 0:
                 fee_remitted += self.pay_gross(por, owner, rest, link, w, what, b, None, "payment", settled)
@@ -518,6 +523,8 @@ class Run:
                 billed = converted
             if por == payer:
                 self.reimburse(b, rest if from_pool == 0 else Fraction(0), w, link)
+        if owner != payer and gross > 0:
+            self.stewards[link.domain].fee_in(payer, gross)
         if owner != payer and settled > 0:
             self.pay_premiums(b, link, settled, w, owner)
             # the Steward's statistics for this program window
@@ -597,14 +604,18 @@ class Run:
         for cm, kind in todo:
             if cm.unit != unit:
                 continue
-            prem = min(cm.premium * g * part, cm.pool)
+            want = min(cm.premium * g * part, cm.pool)
+            if want <= 0:
+                continue
+            own, match = self.stewards[cm.domain].draw(cm, want, b.payer)
+            prem = own + match
             if prem <= 0:
                 continue
-            cm.pool -= prem
             cm.paid_out += prem
             cm.served.add(w)
-            label = "premium %s/GB on %s, %s's share %s" % (fmt(cm.premium, unit, self.symbol(unit)), cm.label,
-                                                            self.nodes[owner].name, pct(part))
+            label = "premium %s/GB on %s, %s's share %s%s" % (fmt(cm.premium, unit, self.symbol(unit)), cm.label,
+                                                              self.nodes[owner].name, pct(part),
+                                                              " (capped)" if prem < want else "")
             self.pay_gross("escrow:" + cm.id, owner, prem, link, w, label, b, cm.id, kind, settled)
             if cm.pool <= 0:
                 cm.status = "exhausted"
@@ -621,9 +632,11 @@ class Run:
             used = cm.proving_used.setdefault(period, set())
             if w not in used and len(used) >= cm.proving_windows:
                 continue
-            amt = min(paid, cm.pool)
+            own, match = self.stewards[cm.domain].draw(cm, min(paid, cm.pool), b.payer)
+            amt = own + match
+            if amt <= 0:
+                continue
             used.add(w)
-            cm.pool -= amt
             cm.paid_out += amt
             self.pay("escrow:" + cm.id, b.payer, amt, cm.unit, w, "proving allowance of %s: %s's posted price on %s reimbursed" % (
                 cm.label, self.nodes[b.payer].name, link.id), kind="reimburse", nbytes=b.nbytes, link=link.id,
@@ -634,9 +647,9 @@ class Run:
         self.delivered.append((w, b.demand, b.nbytes, [l.id for l in b.path], b.dispatched, b.key))
         cm = b.own
         if cm is not None and cm.open and cm.min_bytes and b.nbytes < cm.min_bytes:
-            back = min(cm.premium * gb(cm.min_bytes - b.nbytes), cm.pool)
+            back = min(cm.premium * gb(cm.min_bytes - b.nbytes), cm.pool_own)
             if back > 0:
-                cm.pool -= back
+                cm.pool_own -= back
                 cm.refunded += back
                 self.pay("escrow:" + cm.id, cm.poster, back, cm.unit, w,
                          "shortfall: %s delivered against a minimum of %s, the rest of the window's premium returns" % (
