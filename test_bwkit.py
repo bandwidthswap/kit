@@ -1762,6 +1762,54 @@ class StewardRole(unittest.TestCase):
             st.nym   # noqa: B018
 
 
+def get_raw(url, method="GET"):
+    """(status, headers, body text) of one request, errors included."""
+    req = bwkit.urlrequest.Request(url, headers={"User-Agent": "test", "Origin": "http://elsewhere:1"}, method=method)
+    try:
+        with bwkit.urlrequest.urlopen(req, timeout=10) as resp:
+            return resp.status, dict(resp.headers), resp.read().decode()
+    except bwkit.urlerror.HTTPError as e:
+        return e.code, dict(e.headers), e.read().decode()
+
+
+class Served(unittest.TestCase):
+    """What the three roles serve over GET: open to every origin (CORS), and never an address."""
+
+    def setUp(self):
+        self.lab = Lab()
+        self.payer_srv = self.lab.payer.serve("127.0.0.1", 0, block=False)
+        self.payer_url = "http://127.0.0.1:%d" % self.payer_srv.server_address[1]
+
+    def tearDown(self):
+        self.payer_srv.shutdown()
+        self.payer_srv.server_close()
+        self.lab.close()
+
+    PATHS = {"mint": ("/status", "/ledger", "/ledger?since=1", "/commitments", "/purchases", "/links", "/map", "/steward", "/proof?window=1800000000",
+                      "/proof?window=x", "/nothing", "/", "/snapshot"),
+             "hop": ("/status", "/purchases", "/map", "/ledger", "/nothing", "/", "/snapshot"),
+             "payer": ("/status", "/purchases", "/map", "/nothing", "/", "/snapshot")}
+
+    def test_every_get_is_cors_open_and_address_free(self):
+        lab = self.lab
+        lab.hour(100_000_000, 100_000_000)
+        lab.hop.flush()
+        for url, role in ((lab.mint_url, "mint"), (lab.hop_url, "hop"), (self.payer_url, "payer")):
+            for path in self.PATHS[role]:
+                status, headers, body = get_raw(url + path)
+                self.assertEqual(headers.get("Access-Control-Allow-Origin"), "*", (role, path, status))
+                self.assertIsNone(bwkit.assert_public(body), (role, path))              # the Worker's two patterns: an IPv4, a MAC
+                self.assertNotIn("127.0.0.1", body, (role, path))
+                if headers.get("Content-Type", "").startswith("application/json"):
+                    json.loads(body)
+            status, headers, body = get_raw(url + "/status", method="OPTIONS")
+            self.assertEqual((status, headers.get("Access-Control-Allow-Origin"), headers.get("Access-Control-Allow-Methods"), body),
+                             (204, "*", "GET, OPTIONS", ""), role)
+            status, headers, _ = get_raw(url + "/receipt", method="POST")                   # an error answer is open too
+            self.assertEqual(headers.get("Access-Control-Allow-Origin"), "*", role)
+        self.assertEqual(get_raw(lab.mint_url + "/receipt", method="POST")[0], 400)
+
+
 class Health(unittest.TestCase):
     """/status.health on every role: the node's own verdicts in the page's wording (dashboard/PLAN.md 1.3)."""
 

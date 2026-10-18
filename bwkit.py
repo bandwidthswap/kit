@@ -2392,22 +2392,40 @@ class Node:
             def log_message(self, fmt, *args):
                 pass
 
+            # Every answer carries Access-Control-Allow-Origin: *. Nothing a node serves is secret or carries an address
+            # (assert_public is the test's check), and the fleet page in an operator's browser, and a hop's page reading
+            # its Mint, come from another origin.
+            def cors(self):
+                self.send_header("Access-Control-Allow-Origin", "*")
+
             def reply(self, status, obj):
                 data = json.dumps(obj, sort_keys=True).encode()
                 self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(data)))
+                self.cors()
                 self.end_headers()
                 self.wfile.write(data)
 
-            def raw(self, data, ctype, filename=None):
-                self.send_response(200)
+            def raw(self, data, ctype, filename=None, status=200):
+                self.send_response(status)
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(data)))
                 if filename:
                     self.send_header("Content-Disposition", 'inline; filename="%s"' % filename)
+                self.cors()
                 self.end_headers()
                 self.wfile.write(data)
+
+            def do_OPTIONS(self):
+                """The CORS preflight: any origin may GET; a POST is for nodes, which send no preflight."""
+                self.send_response(204)
+                self.cors()
+                self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+                self.send_header("Access-Control-Allow-Headers", "*")
+                self.send_header("Access-Control-Max-Age", "86400")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
 
             def do_GET(self):
                 url = urlparse.urlsplit(self.path)
