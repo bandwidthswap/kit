@@ -33,7 +33,7 @@ window.BW = window.BW || {};
 
   function attentionAll(nodes, now){
     var all=[]; nodes.forEach(function(n){ nodeAttention(n, now).forEach(function(i){ all.push({level:i.level, text:i.text, node:n.name||n.url}); }); });
-    all.sort(function(a,b){ var o={bad:0,warn:1,info:2}; return (o[a.level]||3)-(o[b.level]||3); });
+    all.sort(function(a,b){ var o={bad:0,warn:1,info:2}, r=function(l){ return l in o ? o[l] : 3; }; return r(a.level)-r(b.level); });
     if(!all.length) return '<h2>Attention across the fleet</h2><div class="now"><div class="ok"><span class="k">nothing</span><span class="v">all clear</span><span class="s">every node answered and nothing needs attention</span></div></div>';
     return '<h2>Attention across the fleet <small>'+all.length+' item'+(all.length===1?'':'s')+'</small></h2><div class="cards">'+all.map(function(i){ return '<div class="card '+i.level+'">'+esc(i.text)+'<span class="who">'+esc(i.node)+'</span></div>'; }).join('')+'</div>';
   }

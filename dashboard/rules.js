@@ -71,6 +71,6 @@ window.BW = window.BW || {};
     if(B.close!=null && X.C.length){ var c=X.C[X.C.length-1], took=c.t-(c.window+H); if(took>Math.max(5*B.close, B.close+30)) add('info','The last hour took '+F.dur(took)+' to commit; they usually take '+F.dur(B.close)+'.'); }
     var openFirst={}; X.purchases.forEach(function(p){ if(p.kind==='purchase'&&p.program==='first_link'&&p.deadline>=now&&!p.closed) openFirst[p.route.to]=(openFirst[p.route.to]||0)+1; });
     Object.keys(openFirst).forEach(function(k){ if(openFirst[k]>1) add('warn',openFirst[k]+' first-link offers are open for '+F.esc(k)+'; the rule should hold one standing offer and top it up.'); });
-    var seen={}; return items.filter(function(i){ if(seen[i.text]) return false; seen[i.text]=1; return true; }).sort(function(a,b){ var o={bad:0,warn:1,info:2}; return (o[a.level]||3)-(o[b.level]||3); });
+    var seen={}; return items.filter(function(i){ if(seen[i.text]) return false; seen[i.text]=1; return true; }).sort(function(a,b){ var o={bad:0,warn:1,info:2}, r=function(l){ return l in o ? o[l] : 3; }; return r(a.level)-r(b.level); });
   };
 })(window.BW);

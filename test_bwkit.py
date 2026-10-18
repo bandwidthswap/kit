@@ -2224,6 +2224,20 @@ class Dashboard(unittest.TestCase):
         self.assertIn('"kind": "ack"', snap["acks"])
 
 
+class PageUnderNode(unittest.TestCase):
+    """dashboard/test.mjs: the page's modules fed the real snapshots in dashboard/fixtures/, when node is on the PATH."""
+
+    def test_the_pages_numbers_on_the_fixtures(self):
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed; run `node dashboard/test.mjs` where it is")
+        import subprocess
+        here = os.path.dirname(os.path.abspath(__file__))
+        out = subprocess.run([node, os.path.join(here, "dashboard", "test.mjs")], capture_output=True, text=True, timeout=120)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("checks passed on fleet.json, hop.json, mint.json, payer.json", out.stdout)
+
+
 class Rules(unittest.TestCase):
     """steward_rules.py with the floats the Mint's Steward feeds it; the simulator holds the same functions to exact figures."""
 
