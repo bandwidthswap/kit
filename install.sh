@@ -21,8 +21,8 @@ install -d -m 0755 /etc/bwkit
 install -m 0755 "$here/bwkit.py" /usr/local/bin/bwkit
 install -m 0644 "$here/steward_rules.py" /usr/local/bin/steward_rules.py   # imported by bwkit from its own directory
 install -d -m 0755 /usr/local/share/bwkit/dashboard
-install -m 0644 "$here"/dashboard/*.html "$here"/dashboard/*.css "$here"/dashboard/*.js /usr/local/share/bwkit/dashboard/   # the node's own page, served at / and /dash/
-rm -f /usr/local/share/bwkit/dashboard.html   # the single-file page of 0.4.0
+install -m 0644 "$here"/dashboard/index.html "$here"/dashboard/*.css "$here"/dashboard/*.js /usr/local/share/bwkit/dashboard/   # the node's own page, served at / and /dash/
+rm -f /usr/local/share/bwkit/dashboard.html /usr/local/share/bwkit/dashboard/dashboard.html   # the single-file page of 0.4.0
 install -m 0644 "$here"/systemd/*.service "$here"/systemd/*.timer /etc/systemd/system/
 systemctl daemon-reload
 
