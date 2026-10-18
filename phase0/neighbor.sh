@@ -14,6 +14,7 @@
 #                       neighbor's wifi last, with priority: if their network is in range from the house the Pi may switch
 #                       to it at that point, which is harmless once everything else is set
 #   phase0/neighbor.sh check    after the move: tailnet status, ping, the hop's status over the tailnet, the Mint's view
+#   phase0/neighbor.sh fetch    (re)install the hourly purchase script and its timer on bw-house, nothing else
 #   phase0/neighbor.sh bench    put bw-house's payer back on bw-forest over wg0 (the bench as it was)
 #
 # Environment:
@@ -31,7 +32,7 @@
 #   NEIGH_SSH        the SSH alias to reach bw-neighbor by when it is not on the Mac's network: bw-neighbor-away in
 #                    ~/.ssh/config goes to its tailnet address through bw-house, once bw-house is on the tailnet
 #
-# Steps, each usable on its own: upgrade time logs tailnet kit peers house check wifi bench
+# Steps, each usable on its own: upgrade time logs tailnet kit peers house fetch check wifi bench
 #
 # Nothing here prints or copies a private key. Tailscale's keys are made on each node; the node's NYM key is made by
 # install.sh and stays on the node, which is the neighbor's. The Mac keeps SSH access through bw-house (phase0/NEIGHBOR.md).
@@ -49,7 +50,8 @@ ts_ip() {
 say() { printf '\n== %s\n' "$*"; }
 host_of() { if [ "$1" = "$N" ] && [ -n "${NEIGH_SSH:-}" ]; then echo "$NEIGH_SSH"; else echo "$1$SSH_SUFFIX"; fi; }
 run() { h="$(host_of "$1")"; shift; $SSH "$h" "$@"; }
-sudo_sh() { h="$(host_of "$1")"; $SSH "$h" sudo sh -s; }   # script on stdin, never as an ssh argument
+shq() { printf "'%s'" "$(printf %s "$1" | sed "s/'/'\\\\''/g")"; }
+sudo_sh() { h="$(host_of "$1")"; shift; a=""; for x in "$@"; do a="$a $(shq "$x")"; done; $SSH "$h" "sudo sh -s --$a"; }   # script on stdin, never as an ssh argument; the rest as $1..
 SSH_SUFFIX="${SSH_SUFFIX:-}"
 
 step_upgrade() {
@@ -140,24 +142,56 @@ step_house() {
   run bw-house "sudo cp -n /etc/bwkit/config.json /etc/bwkit/config.json.bench; sudo python3 - <<'PY'
 import json; p='/etc/bwkit/config.json'; c=json.load(open(p)); c['hop_name']='$N'; c['hop_url']='http://$neigh_ts:8710'; c['iface']='tailscale0'; json.dump(c,open(p,'w'),indent=2); print('payer config:',c)
 PY"
-  sudo_sh bw-house <<EOS
+  step_fetch
+  say "baseline sample on payer and hop (the first window starts now)"
+  run bw-house 'sudo -u bwkit bwkit sample'
+  run $N 'sudo -u bwkit bwkit sample'
+  run bw-house 'sudo systemctl restart bwkit-receipt.timer; systemctl list-timers bwkit-receipt.timer bwkit-fetch.timer --no-pager | head -3'
+}
+
+step_fetch() {
+  say "the purchase script and its timer on bw-house (sources, in order: $FETCH_URLS)"
+  neigh_ts="$(ts_ip $N)"
+  # The script and the units go over verbatim (the outer heredoc is quoted); the exit node and the sources arrive as $1..
+  sudo_sh bw-house "$neigh_ts" $FETCH_URLS <<'EOS'
 set -e
+neigh_ts="$1"; shift; urls="$*"
 cat > /usr/local/bin/bwkit-fetch <<'EOC'
 #!/bin/sh
 # The house's hourly purchase from the neighbor: one download with bw-neighbor as the exit node, so real bytes cross
 # the metered interface on both ends. Sources are tried in order until one serves the file; the LAN stays reachable
-# meanwhile, and the exit node is dropped afterwards whatever happened.
-exit_node="\$1"; shift
-tailscale set --exit-node="\$exit_node" --exit-node-allow-lan-access=true || { logger -t bwkit-fetch "purchase skipped: could not set the exit node \$exit_node"; exit 1; }
+# meanwhile, and the exit node is dropped afterwards whatever happened. A purchase counts only on HTTP 200 with more
+# than 1 MB to show for it. Around each try the byte counters of the metered interface and of the uplink are read, so
+# the purchase line in the journal shows the rate the download got and how many uplink bytes each metered byte cost
+# (encapsulation and the relayed path's retransmissions); the same goes as one JSON line to purchases.jsonl under
+# /var/lib/bwkit, which outlives the journal (in RAM on this node). phase0/link-report.sh in the kit reads both.
+exit_node="$1"; shift
+metered="${METERED:-tailscale0}"; uplink="${UPLINK:-eth0}"
+record="${BWKIT_DIR:-/var/lib/bwkit}/purchases.jsonl"
+counters() { cat "/sys/class/net/$metered/statistics/rx_bytes" "/sys/class/net/$metered/statistics/tx_bytes" "/sys/class/net/$uplink/statistics/rx_bytes" "/sys/class/net/$uplink/statistics/tx_bytes" 2>/dev/null | tr '\n' ' '; }
+tailscale set --exit-node="$exit_node" --exit-node-allow-lan-access=true || { logger -t bwkit-fetch "purchase skipped: could not set the exit node $exit_node"; exit 1; }
 ok=1
-for url in "\$@"; do
-  out="\$(curl -s -o /dev/null -A "bwkit-fetch/0.1 (+https://bandwidthswap.com)" --max-time 900 -w '%{http_code} %{size_download} %{time_total}' "\$url")"; rc=\$?
-  set -- \$out
-  if [ "\$rc" = 0 ] && [ "\${1:-}" = 200 ] && [ "\${2:-0}" -gt 1000000 ]; then logger -t bwkit-fetch "purchase: \$2 bytes in \$3 s through \$exit_node from \$url"; ok=0; break
-  else logger -t bwkit-fetch "source failed: \$url (curl \$rc, http \${1:-?}, \${2:-0} bytes)"; fi
+for url in "$@"; do
+  before="$(counters)"; t0="$(date +%s)"
+  out="$(curl -s -o /dev/null -A "bwkit-fetch/0.1 (+https://bandwidthswap.com)" --max-time 900 -w '%{http_code} %{size_download} %{time_total}' "$url")"; rc=$?
+  after="$(counters)"
+  set -- $out; code="${1:-?}"; bytes="${2:-0}"; secs="${3:-0}"
+  set -- $before; m_rx0="${1:-0}"; m_tx0="${2:-0}"; u_rx0="${3:-0}"; u_tx0="${4:-0}"
+  set -- $after; m_rx=$(( ${1:-0} - m_rx0 )); m_tx=$(( ${2:-0} - m_tx0 )); u_rx=$(( ${3:-0} - u_rx0 )); u_tx=$(( ${4:-0} - u_tx0 ))
+  if [ "$rc" = 0 ] && [ "$code" = 200 ] && [ "$bytes" -gt 1000000 ]; then
+    rate="$(awk -v b="$bytes" -v s="$secs" 'BEGIN { printf "%.2f", (s > 0) ? b * 8 / s / 1e6 : 0 }')"
+    ratio="$(awk -v a="$u_rx" -v b="$m_rx" 'BEGIN { printf "%.3f", (b > 0) ? a / b : 0 }')"
+    logger -t bwkit-fetch "purchase: $bytes bytes in $secs s, $rate Mbit/s, through $exit_node from $url; $metered rx +$m_rx tx +$m_tx, $uplink rx +$u_rx tx +$u_tx, uplink/metered $ratio"
+    [ -f "$record" ] || install -o bwkit -g bwkit -m 0644 /dev/null "$record"
+    printf '{"t":%s,"bytes":%s,"seconds":%s,"mbit_s":%s,"source":"%s","%s":{"rx":%s,"tx":%s},"%s":{"rx":%s,"tx":%s},"uplink_per_metered":%s}\n' \
+      "$t0" "$bytes" "$secs" "$rate" "$url" "$metered" "$m_rx" "$m_tx" "$uplink" "$u_rx" "$u_tx" "$ratio" >> "$record"
+    ok=0; break
+  else
+    logger -t bwkit-fetch "source failed: $url (curl $rc, http $code, $bytes bytes)"
+  fi
 done
 tailscale set --exit-node=
-exit \$ok
+exit $ok
 EOC
 chmod 755 /usr/local/bin/bwkit-fetch
 cat > /etc/systemd/system/bwkit-fetch.service <<EOC
@@ -165,9 +199,9 @@ cat > /etc/systemd/system/bwkit-fetch.service <<EOC
 Description=Bandwidth Swap: the house's hourly purchase from the neighbor
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/bwkit-fetch $neigh_ts $FETCH_URLS
+ExecStart=/usr/local/bin/bwkit-fetch $neigh_ts $urls
 EOC
-cat > /etc/systemd/system/bwkit-fetch.timer <<EOC
+cat > /etc/systemd/system/bwkit-fetch.timer <<'EOC'
 [Unit]
 Description=Bandwidth Swap: buy from the neighbor every hour, twenty minutes past
 [Timer]
@@ -178,12 +212,8 @@ WantedBy=timers.target
 EOC
 systemctl daemon-reload
 systemctl enable -q --now bwkit-fetch.timer
-echo "bw-house: bwkit-fetch.timer enabled ($FETCH_URLS)"
+echo "bw-house: bwkit-fetch.timer enabled ($urls)"
 EOS
-  say "baseline sample on payer and hop (the first window starts now)"
-  run bw-house 'sudo -u bwkit bwkit sample'
-  run $N 'sudo -u bwkit bwkit sample'
-  run bw-house 'sudo systemctl restart bwkit-receipt.timer; systemctl list-timers bwkit-receipt.timer bwkit-fetch.timer --no-pager | head -3'
 }
 
 step_check() {
@@ -209,6 +239,6 @@ case "${1:-}" in
   prep)  step_upgrade; step_time; step_logs; step_tailnet; step_kit; step_peers; step_house; step_check; step_wifi ;;
   check) step_check ;;
   bench) step_bench ;;
-  upgrade|time|logs|wifi|tailnet|kit|peers|house) "step_$1" ;;
+  upgrade|time|logs|wifi|tailnet|kit|peers|house|fetch) "step_$1" ;;
   *) sed -n '2,20p' "$0"; exit 2 ;;
 esac

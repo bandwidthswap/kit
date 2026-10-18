@@ -64,7 +64,7 @@ The script does, in order and each step ending with its check:
 4. (The neighbor's **Wi-Fi** profile is written last, see 9.)
 5. **Tailnet.** Tailscale is installed on `bw-house`, `bw-neighbor` and `bw-mint` (the official installer, fetched over HTTPS) and each joins with the key. `bw-neighbor` turns forwarding on and offers itself as an exit node, which is how it sells its connection: approve that in the admin console, and while there turn off key expiry on each machine (Machines, the row's menu, Disable key expiry), or they drop off the tailnet after 180 days. The script prints each node's tailnet address.
 6. **Kit.** `bwkit` as the hop, metering `tailscale0`, its Mint reached at `bw-mint`'s tailnet address, NYMs exchanged with `bw-house` and `bw-mint`.
-7. **The house side.** `bw-house`'s payer switches from `bw-forest` on `wg0` to `bw-neighbor` on `tailscale0` (the bench config is kept as `config.json.bench`; `neighbor.sh bench` puts it back) and keeps talking to the Mint on the LAN, so that traffic is not counted. A timer buys one download an hour, 100 MB, with `bw-neighbor` set as the exit node for the duration and the LAN still reachable, then drops the exit node again. The sources are tried in order until one serves the file (`FETCH_URLS`; by default Cloudflare's speed test, then tele2's, then Hetzner's), and the purchase counts only on HTTP 200 with the bytes to show for it: `journalctl -t bwkit-fetch` on `bw-house` says what each hour got. That is the house buying the neighbor's connection, and the bytes cross `tailscale0` on both ends, where both meters count them. At ten cents a gigabyte it is about a quarter a day.
+7. **The house side.** `bw-house`'s payer switches from `bw-forest` on `wg0` to `bw-neighbor` on `tailscale0` (the bench config is kept as `config.json.bench`; `neighbor.sh bench` puts it back) and keeps talking to the Mint on the LAN, so that traffic is not counted. A timer buys one download an hour, 100 MB, with `bw-neighbor` set as the exit node for the duration and the LAN still reachable, then drops the exit node again. The sources are tried in order until one serves the file (`FETCH_URLS`; by default Cloudflare's speed test, then tele2's, then Hetzner's), and the purchase counts only on HTTP 200 with the bytes to show for it: `journalctl -t bwkit-fetch` on `bw-house` says what each hour got, with the rate and the uplink bytes it cost ("Measuring the link", below). `neighbor.sh fetch` reinstalls just the purchase script and its timer. That is the house buying the neighbor's connection, and the bytes cross `tailscale0` on both ends, where both meters count them. At ten cents a gigabyte it is about a quarter a day.
 8. **Check.** The tailnet as `bw-house` sees it, a ping to the neighbor, the hop's status over the tailnet, the neighbor's clock, the Mint's view.
 9. **The neighbor's Wi-Fi**, last: a NetworkManager profile with priority over the house network. If their network is in range from the house the Pi may switch to it right then, which no longer matters: it stays on the tailnet either way.
 
@@ -87,9 +87,39 @@ The first receipt across the link settled as a dispute: the house signed 21.99 M
 
 The first full purchase (00:38 CDT) showed the other thing worth knowing. Cloudflare's speed test, which had served 100 MB to `bw-house` by hand all evening, answered 403 as soon as the request went out through the neighbor's exit node, with Cloudflare's own `curl` User-Agent and with a named one alike, and 1 MB of it would still come when asked for by range; it is their bot check deciding by path, not a fault of the link. The script now tries sources in order and checks what it got, and the first purchase that counted came from tele2: 104,857,600 bytes in 230 s, about 3.6 Mbit/s through a 2.4 GHz Wi-Fi, a Starlink uplink and a relayed tailnet path. The meters agreed with it on both ends.
 
+## Measuring the link
+
+Three things the paper cannot say today are measured here, honestly and cheaply, so a week of the link answers them: how far apart the two sites' clocks drift (Section 3.5 and Section 10 call it unmeasured), how many bytes the seller's uplink really spends per byte the payer is paid for (WireGuard and relay encapsulation, plus the retransmissions of the relayed path), and what rate each hourly purchase got.
+
+**What is logged, where.** `phase0/link-log.sh` installs a `bwkit-linklog` timer on `bw-house` and `bw-neighbor`. Every ten minutes, on the same minute at both sites (`OnCalendar=*:0/10`, one second of slack), it appends one line to `/var/lib/bwkit/linklog.jsonl`, owned by `bwkit` like the rest of that directory:
+
+```
+{"t":1792305669,"offset":-0.000561613,"root_delay":0.045329411,"stratum":3,"tailscale0":[250609994,6223509],"eth0":[392576992,112467409]}
+```
+
+`t` is Unix seconds. `offset` is this clock minus NTP time, in seconds, as chrony estimates it against its own source (positive: ahead; `chronyc -c tracking` reports the opposite sign and the script flips it). `root_delay` and `stratum` are chrony's. Then the raw rx and tx byte counters of the metered interface and of the uplink (`eth0` at the house, `wlan0` at the neighbor's). About 140 bytes a line, 144 lines a day, 600 KB a month, on the card, so it survives a reboot; nothing in it is an address. `phase0/link-log.sh status` shows the timers and the last line on each node.
+
+The hourly purchase (`bwkit-fetch` on `bw-house`, reinstalled by `neighbor.sh fetch`) reads the same counters before and after each download and writes one journal line per purchase that says it all:
+
+```
+purchase: 104857600 bytes in 191.48 s, 4.38 Mbit/s, through <exit node> from http://speedtest.tele2.net/100MB.zip; tailscale0 rx +105635410 tx +1891077, eth0 rx +117834120 tx +3390118, uplink/metered 1.115
+```
+
+`uplink/metered` is `eth0` bytes received per `tailscale0` byte received for that download: the encapsulation and the relay, the house side of the overhead. The `tailscale0` count against the bytes delivered (the report's `met/pay` column) is the other part: TCP's retransmissions travel inside the tunnel, so the meters count them and the payer pays for them, which is also why the two meters disagree by more than one percent on this path. Because the journal is in RAM on `bw-house`, the same purchase also goes as one JSON line to `/var/lib/bwkit/purchases.jsonl`, which outlives a reboot. The rules of the purchase are unchanged: sources tried in order, a purchase counts only on HTTP 200 with more than 1 MB, the exit node dropped afterwards whatever happened.
+
+**How to read it.** From the Mac, with its Tailscale up:
+
+```
+phase0/link-report.sh        # the last 7 days; phase0/link-report.sh 30 for a month
+```
+
+It pulls both logs, the house's purchase records and fetch journal, and the Mint's ledger, and prints four short tables, plain text with no addresses: (1) per day, the clock between the sites in milliseconds, house minus neighbor, taken as the difference of the two `offset` values logged at the same minute, with each side's largest excursion from its own NTP source beside it; (2) each purchase with its rate in Mbit/s, its metered bytes per byte delivered and its house-side uplink bytes per metered byte (`-` for the purchases before the counters were logged), plus the sources that failed before one served; (3) per day and per site, uplink bytes per metered byte from the ten-minute counters, both directions, which is the seller's side of the overhead; (4) each window on the Mint with `bw-neighbor` as the hop, the payer's count against the hop's and the gap as a share of the payer's. `KEEP=dir` keeps the pulled files.
+
+**What the numbers are and are not.** The clock figure is the difference of two chrony estimates, each against a different reference (the house's LAN server, the pool), not a measurement across the link; it bounds how far apart the two signing clocks can be, which is what the receipt's five-second rule rests on, and it says nothing about the link's delay. The per-day overhead from the ten-minute counters includes each node's own traffic (the tailnet's control plane, chrony, ssh), which a day of purchases dwarfs; the per-purchase ratio from `bwkit-fetch` does not. A counter reset (reboot, interface recreated) shows as a negative delta and the report skips that interval. The rate is curl's: bytes over the whole request, including the connection.
+
 ## What to watch for a month
 
-- The clock: `chronyc tracking` on both ends, and whether the hop ever declines a receipt (its journal says so since bwkit 0.1.1). Section 10 lists drift between sites as unmeasured; this is the measurement.
+- The clock: `phase0/link-report.sh` gives the day-by-day figure between the sites; `chronyc tracking` on both ends is the live view, and the hop's journal says if it ever declines a receipt (since bwkit 0.1.1). Section 10 lists drift between sites as unmeasured; this is the measurement.
 - The outbox when the neighbor's internet drops: receipts wait and settle when it returns, which is the claim in Section 1 of the paper.
 - At least one dispute, forced the way the bench did it (`phase0/dispute-test.sh` works unchanged with the hop at the neighbor's), and resolved from the two signed receipts alone.
 - The invoice at the end of the month: `sudo -u bwkit bwkit invoice 2026-11` on `bw-mint`. There is no payment rail; settle it the way neighbors do.
