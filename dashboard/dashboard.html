@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>bwkit</title>
+<style>
+/* The node's own dashboard, served by bwkit at / on the node's HTTP port and read on the LAN or the tailnet.
+   Works offline: no fonts or scripts from anywhere else. One page for every role; the sections a role has are drawn,
+   the rest are not. Layout: a status bar, a "now" strip, then the books in the order an operator reads them. */
+:root{
+  --bg:#f3f4f1; --panel:#ffffff; --fg:#161c18; --muted:#5f6a62; --line:#d6dbd5; --soft:#e9ede8;
+  --accent:#1d6a58; --accent-ink:#ffffff; --ok:#1d6a58; --warn:#b9561c; --bad:#a3302a; --info:#2b5f9e;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+}
+@media (prefers-color-scheme: dark){ :root:not([data-theme="light"]){
+  --bg:#121715; --panel:#181f1c; --fg:#e6ebe6; --muted:#9aa89e; --line:#2a3430; --soft:#1f2824;
+  --accent:#5fc3a6; --accent-ink:#0f1a16; --ok:#5fc3a6; --warn:#e8955a; --bad:#ef8a84; --info:#7fb0ea; color-scheme:dark } }
+:root[data-theme="dark"]{
+  --bg:#121715; --panel:#181f1c; --fg:#e6ebe6; --muted:#9aa89e; --line:#2a3430; --soft:#1f2824;
+  --accent:#5fc3a6; --accent-ink:#0f1a16; --ok:#5fc3a6; --warn:#e8955a; --bad:#ef8a84; --info:#7fb0ea; color-scheme:dark }
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);font-size:14px;line-height:1.45}
+.bar{position:sticky;top:0;z-index:3;background:var(--panel);border-bottom:1px solid var(--line);padding:8px max(16px,env(safe-area-inset-left,0px));display:flex;flex-wrap:wrap;gap:6px 18px;align-items:baseline}
+.bar .name{font-weight:700;font-size:18px;letter-spacing:.01em}
+.bar .role{font-family:var(--mono);font-size:12px;background:var(--soft);border-radius:4px;padding:2px 7px;text-transform:uppercase;letter-spacing:.08em}
+.bar .nym,.bar .v{font-family:var(--mono);font-size:12px;color:var(--muted);overflow-wrap:anywhere}
+.bar .spacer{flex:1}
+.bar .snap{font-size:12px;color:var(--warn);font-weight:600}
+main{max-width:1240px;margin:0 auto;padding:16px max(16px,env(safe-area-inset-left,0px)) 56px}
+h2{font-size:15px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:28px 0 8px;display:flex;gap:12px;align-items:baseline}
+h2 small{font-weight:400;letter-spacing:0;text-transform:none;color:var(--muted);font-size:13px}
+.now{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:8px;overflow:hidden}
+.now div{background:var(--panel);padding:10px 12px;min-width:0}
+.now .k{display:block;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+.now .v{display:block;font-family:var(--mono);font-size:20px;font-variant-numeric:tabular-nums;margin-top:2px;overflow-wrap:anywhere}
+.now .s{display:block;font-size:12px;color:var(--muted)}
+.now .ok .v{color:var(--ok)} .now .warn .v{color:var(--warn)} .now .bad .v{color:var(--bad)}
+.tbl{overflow-x:auto;background:var(--panel);border:1px solid var(--line);border-radius:8px}
+table{border-collapse:collapse;width:100%;font-size:13px}
+th,td{padding:6px 10px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap;vertical-align:top}
+th{font-size:11px;letter-spacing:.07em;text-transform:uppercase;color:var(--muted);font-weight:600;background:var(--soft);position:sticky;top:0}
+td.n,th.n{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums}
+td.m{font-family:var(--mono);font-size:12px}
+td.w{white-space:normal;min-width:18ch}
+tbody tr:last-child td{border-bottom:0}
+tr.sum td{font-weight:600;border-top:2px solid var(--line);background:var(--soft)}
+.st{display:inline-block;border-radius:999px;padding:1px 8px;font-size:11px;letter-spacing:.06em;text-transform:uppercase;font-weight:600;color:#fff}
+.st.settled{background:var(--ok);color:var(--accent-ink)} .st.disputed{background:var(--warn)} .st.open{background:var(--info)} .st.closed{background:var(--muted)} .st.pending{background:var(--warn)} .st.declined{background:var(--bad)}
+.strip{display:flex;gap:2px;align-items:flex-end;height:54px;padding:6px 0 0}
+.strip i{display:block;flex:1;min-width:3px;background:var(--accent);border-radius:2px 2px 0 0;opacity:.85}
+.strip i.disputed{background:var(--warn)} .strip i.none{background:var(--line);height:2px!important}
+.legend{font-size:12px;color:var(--muted);margin:4px 0 0}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px;min-width:0}
+.card h3{margin:0 0 6px;font-size:14px;font-weight:700;display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+.card dl{display:grid;grid-template-columns:auto 1fr;gap:2px 10px;margin:0;font-size:13px}
+.card dt{color:var(--muted)} .card dd{margin:0;font-family:var(--mono);font-size:12px;overflow-wrap:anywhere}
+.note{font-size:13px;color:var(--muted);margin:6px 0 0;max-width:80ch}
+.empty{color:var(--muted);padding:14px;background:var(--panel);border:1px dashed var(--line);border-radius:8px}
+code{font-family:var(--mono);font-size:12px;background:var(--soft);border-radius:3px;padding:0 4px}
+a{color:var(--accent)}
+.err{background:var(--bad);color:#fff;padding:8px 12px;border-radius:6px;margin:0 0 12px}
+@media (max-width:640px){ .bar .name{font-size:16px} .now .v{font-size:17px} }
+</style>
+</head>
+<body>
+<header class="bar">
+  <span class="name" id="h-name">bwkit</span>
+  <span class="role" id="h-role">node</span>
+  <span class="nym" id="h-nym"></span>
+  <span class="v" id="h-ver"></span>
+  <span class="spacer"></span>
+  <span class="snap" id="h-snap" hidden>snapshot</span>
+  <span class="v" id="h-at"></span>
+</header>
+<main id="main">
+  <div class="err" id="err" hidden></div>
+  <div id="sections"></div>
+</main>
+
+<script id="snapshot" type="application/json"></script>
+<script>
+(function(){
+  'use strict';
+  var $ = function(id){ return document.getElementById(id); };
+  var H = 3600;
+
+  // ------------------------------------------------------------------ formatting
+  function esc(s){ return String(s).replace(/[&<>"]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]; }); }
+  function pad(n){ return (n<10?'0':'')+n; }
+  function tstamp(t){ if(!t) return '–'; var d=new Date(t*1000); return pad(d.getMonth()+1)+'-'+pad(d.getDate())+' '+pad(d.getHours())+':'+pad(d.getMinutes()); }
+  function hm(t){ var d=new Date(t*1000); return pad(d.getHours())+':'+pad(d.getMinutes()); }
+  function ago(t, now){ if(!t) return 'never'; var s=Math.max(0, now-t); if(s<90) return s+' s ago'; if(s<5400) return Math.round(s/60)+' min ago'; if(s<172800) return (s/3600).toFixed(1)+' h ago'; return Math.round(s/86400)+' d ago'; }
+  function bytes(n){ if(n==null) return '–'; if(n>=1e9) return (n/1e9).toFixed(2)+' GB'; if(n>=1e6) return (n/1e6).toFixed(2)+' MB'; if(n>=1e3) return (n/1e3).toFixed(1)+' kB'; return n+' B'; }
+  function usd(x){ if(x==null) return '–'; var a=Math.abs(x); return (x<0?'−':'')+'$'+(a===0?'0.0000':a>=0.001?a.toFixed(4):a.toFixed(6)); }
+  function pct(x, d){ return (100*x).toFixed(d==null?1:d)+'%'; }
+  function short(nym){ return nym ? nym.replace(/^ed25519:/,'').slice(0,8)+'…' : '–'; }
+  function sortBy(arr, key, desc){ return arr.slice().sort(function(a,b){ var x=key(a), y=key(b); return x<y ? (desc?1:-1) : x>y ? (desc?-1:1) : 0; }); }
+
+  // ------------------------------------------------------------------ data
+  var D = { status:null, ledger:[], commitments:[], purchases:[], steward:null, map:null, snapshot:false, fetchedAt:0 };
+
+  function parseJsonl(text){ var out=[]; text.split('\n').forEach(function(l){ l=l.trim(); if(!l) return; try{ out.push(JSON.parse(l)); }catch(e){} }); return out; }
+
+  function loadSnapshot(){
+    var el=$('snapshot'); if(!el || !el.textContent.trim()) return false;
+    var s=JSON.parse(el.textContent);
+    D.status=s.status; D.ledger=typeof s.ledger==='string'?parseJsonl(s.ledger):(s.ledger||[]); D.commitments=s.commitments||[];
+    D.purchases=typeof s.purchases==='string'?parseJsonl(s.purchases):(s.purchases||[]); D.steward=s.steward||null; D.map=s.map||null;
+    D.snapshot=true; D.fetchedAt=s.taken_at||(s.status&&s.status.time)||0; return true;
+  }
+  function get(path, text){ return fetch(path,{cache:'no-store'}).then(function(r){ if(!r.ok) throw new Error(path+' '+r.status); return text?r.text():r.json(); }); }
+  function loadLive(){
+    var opt=function(p, text, dflt){ return get(p, text).catch(function(){ return dflt; }); };
+    return Promise.all([ get('/status'), get('/ledger', true), opt('/commitments', false, []), opt('/purchases', true, ''), opt('/steward', false, null), opt('/map', false, null) ])
+      .then(function(r){ D.status=r[0]; D.ledger=parseJsonl(r[1]); D.commitments=r[2]||[]; D.purchases=typeof r[3]==='string'?parseJsonl(r[3]):(r[3]||[]); D.steward=r[4]; D.map=r[5]; D.fetchedAt=Math.floor(Date.now()/1000); });
+  }
+
+  // ------------------------------------------------------------------ derived
+  function derive(){
+    var st=D.status||{}, L=D.ledger;
+    var names={};                                         // NYM -> name, from the records that carry both
+    L.forEach(function(e){ if(e.kind==='receipt'&&e.receipt) names[e.receipt.payer]=e.from; if(e.kind==='ack'&&e.receipt) names[e.receipt.hop]=e.from; });
+    if(st.nym) names[st.nym]=st.name;
+    if(st.steward) names[st.steward]='steward';
+    var place={}; if(D.map&&D.map.nodes) for(var k in D.map.nodes) place[k]=D.map.nodes[k];
+    var name=function(nym){ return names[nym]||short(nym); };
+    var S=L.filter(function(e){ return e.kind==='settlement'; });
+    var R=L.filter(function(e){ return e.kind==='receipt'; }), A=L.filter(function(e){ return e.kind==='ack'; });
+    var C=(D.commitments&&D.commitments.length?D.commitments:L.filter(function(e){ return e.kind==='commitment'; }));
+    var key=function(r){ return r.payer+'|'+r.hop+'|'+r.t_first; };
+    var acked={}; A.forEach(function(a){ acked[key(a.receipt)]=a; });
+    var settledKey={}; S.forEach(function(s){ settledKey[key(s)]=s; });
+    var pending=R.filter(function(r){ return !settledKey[key(r.receipt)]; }).map(function(r){ return {r:r, ack:acked[key(r.receipt)]||null}; });
+    var links={}; S.forEach(function(s){ var k=s.payer+'>'+s.hop; (links[k]=links[k]||{payer:s.payer,hop:s.hop,windows:[]}).windows.push(s); });
+    var lastSeen={}; R.concat(A).forEach(function(e){ if(e.from&&e.received_at) lastSeen[e.from]=Math.max(lastSeen[e.from]||0, e.received_at); });
+    var peers={};
+    for(var n in names){ var nm=names[n]; if(nm==='steward'||n===st.nym) continue; peers[n]={nym:n,name:nm,roles:{},windows:0,lastSeen:lastSeen[nm]||0,place:place[nm]||null}; }
+    S.forEach(function(s){ if(peers[s.payer]){ peers[s.payer].roles.payer=1; peers[s.payer].windows++; } if(peers[s.hop]){ peers[s.hop].roles.hop=1; peers[s.hop].windows++; } });
+    var paidOn={}; S.forEach(function(s){ if(s.purchase){ var p=paidOn[s.purchase]=paidOn[s.purchase]||{premium:0,refund:0,windows:0,steward:0}; p.premium+=s.premium_usd||0; p.refund+=s.refund_usd||0; p.steward+=s.from_steward_usd||0; p.windows++; } });
+    return { st:st, names:names, name:name, S:S, R:R, A:A, C:C, pending:pending, links:links, peers:peers, paidOn:paidOn, place:place };
+  }
+
+  // ------------------------------------------------------------------ sections
+  function nowStrip(X, now){
+    var st=X.st, cells=[];
+    var up = st.time ? (now - st.time) : null;
+    cells.push({k:'service', v: D.snapshot?'snapshot':(up!=null&&up<120?'up':'stale'), s: st.time?('answered '+ago(st.time, now)):'no status', cls: D.snapshot?'':(up!=null&&up<120?'ok':'bad')});
+    var lastR = X.R.length ? X.R[X.R.length-1].received_at : 0;
+    cells.push({k:'last receipt', v: lastR?hm(lastR):'–', s: lastR?(ago(lastR, now)+', from '+esc(X.R[X.R.length-1].from)):'none yet', cls: lastR&&(now-lastR)>2*H?'warn':''});
+    var pend = st.pending||{}; var rw = X.pending.filter(function(p){ return !p.ack; }).length;
+    cells.push({k:'waiting for an ack', v: String(rw), s: rw?('receipt'+(rw>1?'s':'')+' without a hop\'s countersignature'):'nothing pending', cls: rw>1?'warn':''});
+    var disputed = X.S.filter(function(s){ return s.status==='disputed'; }).length;
+    cells.push({k:'windows settled', v: String(X.S.length), s: disputed+' disputed · '+X.C.length+' commitment'+(X.C.length===1?'':'s'), cls:''});
+    var nextCommit = (Math.floor(now/H)+1)*H;
+    cells.push({k:'next commitment', v: hm(nextCommit), s: 'the hour closes and is signed at the top of the hour', cls:''});
+    var drift = (st.time && !D.snapshot) ? (D.fetchedAt - st.time) : null;
+    cells.push({k:'clock', v: st.clock_offset_s!=null ? (Math.abs(st.clock_offset_s)<0.5 ? (st.clock_offset_s*1000).toFixed(1)+' ms' : st.clock_offset_s.toFixed(2)+' s') : (drift!=null?(drift+' s'):'–'), s: st.clock_offset_s!=null?('against its time source, stratum '+(st.stratum||'?')):'the node\'s time against this browser\'s', cls: st.clock_offset_s!=null&&Math.abs(st.clock_offset_s)>1?'bad':''});
+    if(st.disk_free_bytes!=null) cells.push({k:'disk free', v: bytes(st.disk_free_bytes), s:'for the ledger', cls: st.disk_free_bytes<5e8?'bad':''});
+    if(st.last_report_at!=null) cells.push({k:'status posted', v: ago(st.last_report_at, now), s:'to the public feed', cls:(now-st.last_report_at)>600?'warn':''});
+    return '<h2>Now <small>as the node sees it</small></h2><div class="now">'+cells.map(function(c){ return '<div class="'+c.cls+'"><span class="k">'+c.k+'</span><span class="v">'+esc(c.v)+'</span><span class="s">'+c.s+'</span></div>'; }).join('')+'</div>';
+  }
+
+  // What needs attention: the rules the operator would otherwise check by hand, in the order they matter.
+  function attention(X, now){
+    var st=X.st, items=[];
+    if(!D.snapshot && st.time && now-st.time>120) items.push(['bad','The node\'s status is '+ago(st.time, now)+'; the service may be down.']);
+    if(st.clock_offset_s!=null && Math.abs(st.clock_offset_s)>1) items.push(['bad','The clock is '+st.clock_offset_s.toFixed(2)+' s off its source; receipts are declined beyond the link\'s tolerance.']);
+    if(st.disk_free_bytes!=null && st.disk_free_bytes<5e8) items.push(['bad','Only '+bytes(st.disk_free_bytes)+' of disk is free for the ledger.']);
+    var hours={}; X.S.forEach(function(s){ var w=Math.floor(s.t_first/H)*H; (hours[w]=hours[w]||[]).push(s); });
+    var committed={}; X.C.forEach(function(c){ committed[c.window]=c; });
+    var cur=Math.floor(now/H)*H;
+    Object.keys(hours).map(Number).sort().forEach(function(w){ if(w<cur && !committed[w] && now-w>H+300) items.push(['bad','The '+tstamp(w)+' hour has '+hours[w].length+' settlement'+(hours[w].length===1?'':'s')+' and no commitment.']); });
+    X.pending.forEach(function(p){ if(!p.ack && now-p.r.received_at>600) items.push(['warn','A receipt from '+esc(p.r.from)+' for the '+tstamp(p.r.receipt.t_first)+' window has waited '+ago(p.r.received_at, now).replace(' ago','')+' for the hop\'s countersignature.']); });
+    if(X.R.length && now-X.R[X.R.length-1].received_at>2*H) items.push(['warn','No receipt for '+ago(X.R[X.R.length-1].received_at, now).replace(' ago','')+'; one is due at the top of every hour.']);
+    if(st.last_report_at!=null && now-st.last_report_at>600) items.push(['warn','The public status was last posted '+ago(st.last_report_at, now)+'.']);
+    var inForce={}; (st.links||[]).forEach(function(l){ inForce[l.relay]=l; });
+    for(var k in X.links){ var l=X.links[k], W=sortBy(l.windows, function(s){ return s.t_first; }, true).slice(0,24); if(W.length<3) continue;
+      var m=inForce[l.hop]?inForce[l.hop].margin:0.01, gaps=W.map(function(s){ return s.payer_bytes?(s.hop_bytes-s.payer_bytes)/s.payer_bytes:0; }), mean=gaps.reduce(function(a,b){ return a+b; },0)/gaps.length;
+      var beyond=W.filter(function(s){ return s.status==='disputed'; }).length;
+      if(mean>m) items.push(['warn',esc(X.name(l.payer))+' → '+esc(X.name(l.hop))+': the gap runs at '+(mean>=0?'+':'')+pct(mean)+' over the last '+W.length+' windows against a margin of '+pct(m,0)+', so '+beyond+' of them settled disputed; raise the margin in the link\'s announcement or mend the path.']); }
+    var openFirst={}; (D.purchases||[]).forEach(function(p){ if(p.program==='first_link'&&p.deadline>=now){ openFirst[p.route.to]=(openFirst[p.route.to]||0)+1; } });
+    Object.keys(openFirst).forEach(function(k){ if(openFirst[k]>1) items.push(['warn',openFirst[k]+' first-link offers are open for '+esc(k)+'; the rule should hold one standing offer and top it up.']); });
+    if(!items.length) return '<h2>Attention</h2><div class="now"><div class="ok"><span class="k">nothing</span><span class="v">all clear</span><span class="s">every check this page knows passes</span></div></div>';
+    return '<h2>Attention <small>'+items.length+' item'+(items.length===1?'':'s')+'</small></h2><div class="cards">'+items.map(function(i){ return '<div class="card" style="border-left:4px solid var(--'+i[0]+')">'+i[1]+'</div>'; }).join('')+'</div>';
+  }
+
+  function pendingTable(X, now){
+    if(!X.pending.length) return '';
+    var rows=X.pending.map(function(p){ var r=p.r.receipt; return '<tr><td>'+tstamp(r.t_first)+'</td><td>'+esc(X.name(r.payer))+' → '+esc(X.name(r.hop))+'</td><td class="n">'+bytes(r.bytes)+'</td><td>'+(p.ack?'<span class="st pending">acked, not settled</span>':'<span class="st pending">no ack yet</span>')+'</td><td class="m">received '+ago(p.r.received_at, now)+'</td></tr>'; });
+    return '<h2>Open windows <small>received, not yet settled</small></h2><div class="tbl"><table><thead><tr><th>window</th><th>payer → hop</th><th class="n">payer signed</th><th>state</th><th></th></tr></thead><tbody>'+rows.join('')+'</tbody></table></div>';
+  }
+
+  function windowsTable(X){
+    var S=sortBy(X.S, function(s){ return s.t_first; }, true).slice(0, 48);
+    if(!S.length) return '<h2>Windows</h2><div class="empty">No window has settled yet.</div>';
+    var rows=S.map(function(s){
+      var gap = s.payer_bytes ? (s.hop_bytes - s.payer_bytes)/s.payer_bytes : 0;
+      var prem = s.premium_usd ? usd(s.premium_usd)+(s.refund_usd?' <span class="m">(−'+usd(s.refund_usd)+')</span>':'') : '';
+      return '<tr><td>'+tstamp(s.t_first)+'</td><td>'+esc(X.name(s.payer))+' → '+esc(X.name(s.hop))+'</td><td class="n">'+bytes(s.payer_bytes)+'</td><td class="n">'+bytes(s.hop_bytes)+'</td><td class="n">'+(gap>=0?'+':'')+pct(gap)+'</td><td><span class="st '+s.status+'">'+s.status+'</span>'+(s.margin!=null?' <span class="m">'+pct(s.margin,0)+'</span>':'')+'</td><td class="n">'+bytes(s.settled_bytes)+'</td><td class="n">'+usd(s.amount_usd)+'</td><td class="n">'+(s.fee_usd!=null?usd(s.fee_usd):'<span class="m">none</span>')+'</td><td class="n">'+prem+'</td><td class="m">'+(s.purchase?s.purchase.slice(0,8):'')+'</td></tr>';
+    });
+    return '<h2>Windows <small>newest first, the last '+S.length+'</small></h2><div class="tbl"><table><thead><tr><th>window</th><th>payer → hop</th><th class="n">payer</th><th class="n">hop</th><th class="n">gap</th><th>status · margin</th><th class="n">settled</th><th class="n">paid</th><th class="n">fee</th><th class="n">premium</th><th>purchase</th></tr></thead><tbody>'+rows.join('')+'</tbody></table></div>';
+  }
+
+  function linkStrips(X, now){
+    var out='';
+    for(var k in X.links){
+      var l=X.links[k], by={}; l.windows.forEach(function(s){ by[Math.floor(s.t_first/H)*H]=s; });
+      var end=Math.floor(now/H)*H, bars=[], max=1;
+      for(var h=end-47*H; h<=end; h+=H){ var s=by[h]; if(s&&s.settled_bytes>max) max=s.settled_bytes; bars.push(s||null); }
+      var gaps=l.windows.map(function(s){ return s.payer_bytes?(s.hop_bytes-s.payer_bytes)/s.payer_bytes:0; });
+      var mean=gaps.reduce(function(a,b){ return a+b; },0)/gaps.length, lo=Math.min.apply(null,gaps), hi=Math.max.apply(null,gaps);
+      var disputed=l.windows.filter(function(s){ return s.status==='disputed'; }).length;
+      var paid=l.windows.reduce(function(a,s){ return a+(s.amount_usd||0); },0), fee=l.windows.reduce(function(a,s){ return a+(s.fee_usd||0); },0);
+      out+='<div class="card"><h3>'+esc(X.name(l.payer))+' → '+esc(X.name(l.hop))+' <small class="note" style="margin:0">'+l.windows.length+' windows · '+disputed+' disputed · '+usd(paid)+' paid, '+usd(fee)+' of it the Steward\'s</small></h3>'+
+        '<div class="strip">'+bars.map(function(s){ return s ? '<i class="'+s.status+'" style="height:'+Math.max(4,Math.round(48*s.settled_bytes/max))+'px" title="'+tstamp(s.t_first)+' '+bytes(s.settled_bytes)+' '+s.status+'"></i>' : '<i class="none"></i>'; }).join('')+'</div>'+
+        '<p class="legend">the last 48 hours, settled bytes per window; orange is disputed · gap hop over payer: mean '+(mean>=0?'+':'')+pct(mean)+', from '+pct(lo)+' to '+pct(hi)+'</p></div>';
+    }
+    return out ? '<h2>Links <small>as settled</small></h2><div class="cards">'+out+'</div>' : '';
+  }
+
+  function commitmentsTable(X){
+    var C=sortBy(X.C, function(c){ return c.window; }, true).slice(0, 24);
+    if(!C.length) return '<h2>Commitments</h2><div class="empty">No hour has been committed yet.</div>';
+    var rows=C.map(function(c){ return '<tr><td>'+tstamp(c.window)+'</td><td class="n">'+c.count+'</td><td class="m">'+esc(String(c.root).slice(0,24))+'…</td><td class="m">'+(c.signature?'signed':'unsigned')+'</td><td class="m">'+tstamp(c.t)+'</td><td><a href="/proof?window='+c.window+'">proof</a></td></tr>'; });
+    return '<h2>Commitments <small>one signed Merkle root per hour · '+X.C.length+' so far</small></h2><div class="tbl"><table><thead><tr><th>hour</th><th class="n">settlements</th><th>root</th><th></th><th>signed at</th><th></th></tr></thead><tbody>'+rows.join('')+'</tbody></table></div>'+
+      '<p class="note">A proof document carries each settlement\'s path to the root; anyone can check it against this Mint\'s NYM, for example at bandwidthswap.com/docs/verify.html, with nothing sent anywhere.</p>';
+  }
+
+  function peersTable(X, now){
+    var P=Object.keys(X.peers).map(function(k){ return X.peers[k]; }); if(!P.length) return '';
+    P.sort(function(a,b){ return a.name<b.name?-1:1; });
+    var rows=P.map(function(p){ return '<tr><td>'+esc(p.name)+'</td><td>'+Object.keys(p.roles).join(', ')+'</td><td>'+esc(p.place||'–')+'</td><td class="m">'+esc(p.nym)+'</td><td class="n">'+p.windows+'</td><td class="m">'+ago(p.lastSeen, now)+'</td></tr>'; });
+    return '<h2>Peers <small>the NYMs this Mint accepts</small></h2><div class="tbl"><table><thead><tr><th>name</th><th>seen as</th><th>place</th><th>NYM</th><th class="n">windows</th><th>last heard</th></tr></thead><tbody>'+rows.join('')+'</tbody></table></div>';
+  }
+
+  function linksAnnounced(X){
+    var L=(X.st.links||[]); if(!L.length) return '<h2>Announcements</h2><div class="empty">No link is announced; windows settle on the pilot\'s defaults (one percent, ten cents a gigabyte, five seconds).</div>';
+    var rows=L.map(function(l){ return '<tr><td>'+esc(X.name(l.relay))+'</td><td>'+(l.payer==='*'?'any payer':esc(X.name(l.payer)))+'</td><td class="n">'+l.price+' '+esc(l.unit||'')+'</td><td class="n">'+pct(l.margin,0)+' / '+bytes(l.min_bytes)+'</td><td class="n">'+(l.patience_windows||0)+'</td><td class="n">'+l.clock_tolerance_s+' s</td><td>'+esc(l.medium)+' · '+esc(l.range_class)+'</td><td>'+esc(l.window)+(l.light_time_s?' · '+l.light_time_s+' s light':'')+'</td><td class="m">'+tstamp(l.since)+'</td></tr>'; });
+    return '<h2>Announcements <small>the link parameters in force</small></h2><div class="tbl"><table><thead><tr><th>relay</th><th>for</th><th class="n">price</th><th class="n">margin / min</th><th class="n">patience</th><th class="n">clock</th><th>medium</th><th>window</th><th>since</th></tr></thead><tbody>'+rows.join('')+'</tbody></table></div>';
+  }
+
+  function purchasesTable(X, now){
+    var P=D.purchases||[]; if(!P.length) return '<h2>Purchases</h2><div class="empty">No purchase has been posted.</div>';
+    var routeName=function(x){ if(x==null) return 'any'; return X.names[x]||(D.map&&D.map.places&&D.map.places[x]?D.map.places[x].name:x); };
+    var rows=sortBy(P, function(p){ return p.posted_at; }, true).map(function(p){
+      var paid=X.paidOn[p.id]||{premium:0,refund:0,windows:0,steward:0};
+      var closed = p.deadline<now || (p.windows && paid.windows>=p.windows);
+      return '<tr><td class="m">'+p.id.slice(0,8)+'</td><td>'+esc(p.program)+'</td><td>'+esc(routeName(p.poster))+'</td><td class="w">'+esc(routeName(p.route.from))+' → '+esc(routeName(p.route.to))+(p.route.not_via&&p.route.not_via.length?' <span class="m">not via '+esc(p.route.not_via.map(routeName).join(', '))+'</span>':'')+'</td><td class="n">'+(p.min_bytes?bytes(p.min_bytes):'any')+'</td><td class="n">'+usd(p.premium_per_gb)+'/GB</td><td class="n">'+usd(p.escrow)+'</td><td class="n">'+paid.windows+' / '+p.windows+'</td><td class="n">'+usd(paid.premium)+(paid.refund?' <span class="m">(−'+usd(paid.refund)+')</span>':'')+'</td><td><span class="st '+(closed?'closed':'open')+'">'+(closed?'closed':'open')+'</span></td><td class="m">'+tstamp(p.posted_at)+' → '+tstamp(p.deadline)+'</td></tr>';
+    });
+    var openFirst={}; P.forEach(function(p){ if(p.program==='first_link'&&p.deadline>=now){ var k=p.route.to; openFirst[k]=(openFirst[k]||0)+1; } });
+    var warn=Object.keys(openFirst).filter(function(k){ return openFirst[k]>1; }).map(function(k){ return openFirst[k]+' open first-link offers for '+esc(routeName(k))+' (the rule should top up one standing offer)'; });
+    return '<h2>Purchases <small>'+P.length+' posted</small></h2>'+(warn.length?'<div class="err">'+warn.join('; ')+'</div>':'')+'<div class="tbl"><table><thead><tr><th>id</th><th>program</th><th>poster</th><th>route</th><th class="n">min / window</th><th class="n">premium</th><th class="n">escrow</th><th class="n">windows</th><th class="n">premium paid</th><th></th><th>posted → deadline</th></tr></thead><tbody>'+rows.join('')+'</tbody></table></div>';
+  }
+
+  function stewardCard(X, now){
+    var s=D.steward; if(!s) return '';
+    var last=s.last_run; var runs=(D.ledgerSteward||[]);
+    return '<h2>The Steward <small>runs on this host after each hour\'s commitment</small></h2><div class="now">'+
+      [['income', usd(s.income_usd), 'f = '+pct(s.f,0)+' of every fee'],['in open offers', usd(s.in_offers_usd!=null?s.in_offers_usd:s.posted_usd), ''],['escrow', usd(s.escrow_usd), 'unposted'],['match reserve', usd(s.reserve_usd), 'm = '+pct(s.m,0)+' of income'],['paid out', usd(s.paid_usd), 'against receipts'],['returned', usd(s.refunded_usd), 'to the escrow'],['held by the cap', usd(s.held_by_cap_usd), 'f − '+pct(s.margin,0)+' per payer'],['last run', last?ago(last, now):'never', last?tstamp(last):'']]
+      .map(function(c){ return '<div><span class="k">'+c[0]+'</span><span class="v">'+esc(c[1])+'</span><span class="s">'+esc(c[2])+'</span></div>'; }).join('')+'</div>'+
+      (s.skipped&&s.skipped.length?'<p class="note">Last run skipped: '+s.skipped.map(esc).join('; ')+'.</p>':'')+
+      '<p class="note">NYM <code>'+esc(s.nym||'')+'</code> · the book in full: <code>bwkit steward book</code> on this host, and the public page at bandwidthswap.com/docs/steward.html.</p>';
+  }
+
+  function invoiceTable(X, now){
+    var d=new Date(now*1000), month=d.getFullYear()+'-'+pad(d.getMonth()+1), by={};
+    X.S.forEach(function(s){ var e=new Date(s.t_last*1000); if(e.getFullYear()+'-'+pad(e.getMonth()+1)!==month) return; var k=s.payer+'|'+s.hop; var o=by[k]=by[k]||{payer:s.payer,hop:s.hop,windows:0,disputed:0,bytes:0,amount:0,fee:0,premium:0,refund:0,fromSteward:0}; o.windows++; if(s.status==='disputed') o.disputed++; o.bytes+=s.settled_bytes; o.amount+=s.amount_usd||0; o.fee+=s.fee_usd||0; o.premium+=s.premium_usd||0; o.refund+=s.refund_usd||0; o.fromSteward+=s.from_steward_usd||0; });
+    var rows=Object.keys(by).map(function(k){ return by[k]; }); if(!rows.length) return '';
+    var tf=0,ta=0,tp=0;
+    var html=rows.map(function(o){ tf+=o.fee; ta+=o.amount; tp+=o.premium; var relay=o.amount-o.fee+o.premium; return '<tr><td>'+esc(X.name(o.payer))+' pays '+esc(X.name(o.hop))+'</td><td class="n">'+o.windows+' <span class="m">('+o.disputed+' disputed)</span></td><td class="n">'+bytes(o.bytes)+'</td><td class="n">'+usd(o.amount)+'</td><td class="n">'+usd(o.premium)+(o.refund?' <span class="m">(−'+usd(o.refund)+')</span>':'')+'</td><td class="n">'+usd(relay)+'</td><td class="n">'+usd(o.fee)+'</td></tr>'; });
+    html+='<tr class="sum"><td>'+month+'</td><td></td><td></td><td class="n">'+usd(ta)+'</td><td class="n">'+usd(tp)+'</td><td class="n">'+usd(ta-tf+tp)+'</td><td class="n">'+usd(tf)+'</td></tr>';
+    return '<h2>Invoice <small>'+month+', the month so far, as <code>bwkit invoice</code> sums it</small></h2><div class="tbl"><table><thead><tr><th>pair</th><th class="n">windows</th><th class="n">settled</th><th class="n">carriage</th><th class="n">premium</th><th class="n">the relay\'s</th><th class="n">the Steward\'s</th></tr></thead><tbody>'+html+'</tbody></table></div>';
+  }
+
+  function mapCard(){
+    var m=D.map; if(!m||!m.places) return '';
+    var byPlace={}; for(var n in (m.nodes||{})) (byPlace[m.nodes[n]]=byPlace[m.nodes[n]]||[]).push(n);
+    var rows=Object.keys(m.places).map(function(id){ var p=m.places[id]; return '<tr><td>'+esc(p.name||id)+' <span class="m">'+esc(id)+'</span></td><td>'+esc(p.domain)+'</td><td>'+esc(p.medium)+' · '+esc(p.range_class)+'</td><td>'+(p.mapped?'mapped':'proposed')+'</td><td>'+esc((byPlace[id]||[]).join(', ')||'none')+'</td></tr>'; });
+    return '<h2>The map <small>places by Mint consensus; here, the membership\'s file</small></h2><div class="tbl"><table><thead><tr><th>place</th><th>domain</th><th>medium</th><th></th><th>nodes</th></tr></thead><tbody>'+rows.join('')+'</tbody></table></div>';
+  }
+
+  // ------------------------------------------------------------------ draw
+  function draw(){
+    var now = D.snapshot ? D.fetchedAt : Math.floor(Date.now()/1000);
+    var X = derive(), st=X.st;
+    $('h-name').textContent = st.name||'bwkit'; $('h-role').textContent = st.role||'node'; $('h-nym').textContent = st.nym||''; $('h-ver').textContent = st.impl||(st.bwkit?'bwkit/'+st.bwkit:'');
+    $('h-at').textContent = (D.snapshot?'taken ':'read ')+tstamp(D.fetchedAt); $('h-snap').hidden = !D.snapshot;
+    document.title = (st.name||'bwkit')+' · '+(st.role||'node');
+    var parts=[nowStrip(X, now), attention(X, now), pendingTable(X, now), windowsTable(X), linkStrips(X, now), commitmentsTable(X), peersTable(X, now), linksAnnounced(X), purchasesTable(X, now), stewardCard(X, now), invoiceTable(X, now), mapCard()];
+    $('sections').innerHTML = parts.join('');
+  }
+
+  function start(){
+    if(loadSnapshot()){ draw(); return; }
+    loadLive().then(function(){ $('err').hidden=true; draw(); }, function(e){ $('err').hidden=false; $('err').textContent='Could not read the node: '+e.message+'. This page is served by bwkit itself; open it at the node\'s address and port.'; });
+    setInterval(function(){ loadLive().then(draw, function(){}); }, 60000);
+  }
+  start();
+})();
+</script>
+</body>
+</html>
