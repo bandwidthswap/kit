@@ -119,6 +119,7 @@ a{color:var(--accent)}
   }
 
   // ------------------------------------------------------------------ derived
+  var NOW=0;   // the moment the page is drawn for: the snapshot's time, or now
   function derive(){
     var st=D.status||{}, L=D.ledger;
     var names={};                                         // NYM -> name, from the records that carry both
@@ -133,7 +134,7 @@ a{color:var(--accent)}
     var key=function(r){ return r.payer+'|'+r.hop+'|'+r.t_first; };
     var acked={}; A.forEach(function(a){ acked[key(a.receipt)]=a; });
     var settledKey={}; S.forEach(function(s){ settledKey[key(s)]=s; });
-    var pending=R.filter(function(r){ return !settledKey[key(r.receipt)]; }).map(function(r){ return {r:r, ack:acked[key(r.receipt)]||null}; });
+    var pending=R.filter(function(r){ return !settledKey[key(r.receipt)]; }).map(function(r){ return {r:r, ack:acked[key(r.receipt)]||null, lost: (NOW-r.received_at)>2*H}; });
     var links={}; S.forEach(function(s){ var k=s.payer+'>'+s.hop; (links[k]=links[k]||{payer:s.payer,hop:s.hop,windows:[]}).windows.push(s); });
     var lastSeen={}; R.concat(A).forEach(function(e){ if(e.from&&e.received_at) lastSeen[e.from]=Math.max(lastSeen[e.from]||0, e.received_at); });
     var peers={};
@@ -150,8 +151,8 @@ a{color:var(--accent)}
     cells.push({k:'service', v: D.snapshot?'snapshot':(up!=null&&up<120?'up':'stale'), s: st.time?('answered '+ago(st.time, now)):'no status', cls: D.snapshot?'':(up!=null&&up<120?'ok':'bad')});
     var lastR = X.R.length ? X.R[X.R.length-1].received_at : 0;
     cells.push({k:'last receipt', v: lastR?hm(lastR):'–', s: lastR?(ago(lastR, now)+', from '+esc(X.R[X.R.length-1].from)):'none yet', cls: lastR&&(now-lastR)>2*H?'warn':''});
-    var pend = st.pending||{}; var rw = X.pending.filter(function(p){ return !p.ack; }).length;
-    cells.push({k:'waiting for an ack', v: String(rw), s: rw?('receipt'+(rw>1?'s':'')+' without a hop\'s countersignature'):'nothing pending', cls: rw>1?'warn':''});
+    var rw = X.pending.filter(function(p){ return !p.ack && !p.lost; }).length, lost = X.pending.filter(function(p){ return p.lost; }).length;
+    cells.push({k:'waiting for an ack', v: String(rw), s: (rw?('receipt'+(rw>1?'s':'')+' without a hop\'s countersignature'):'nothing pending')+(lost?' · '+lost+' lost window'+(lost>1?'s':''):''), cls: rw>1?'warn':''});
     var disputed = X.S.filter(function(s){ return s.status==='disputed'; }).length;
     cells.push({k:'windows settled', v: String(X.S.length), s: disputed+' disputed · '+X.C.length+' commitment'+(X.C.length===1?'':'s'), cls:''});
     var nextCommit = (Math.floor(now/H)+1)*H;
@@ -174,7 +175,7 @@ a{color:var(--accent)}
     var cur=Math.floor(now/H)*H;
     var firstC=X.C.length?Math.min.apply(null, X.C.map(function(c){ return c.window; })):Infinity;   // hours before the Mint began committing are not missing anything
     Object.keys(hours).map(Number).sort().forEach(function(w){ if(w>=firstC && w<cur && !committed[w] && now-w>H+300) items.push(['bad','The '+tstamp(w)+' hour has '+hours[w].length+' settlement'+(hours[w].length===1?'':'s')+' and no commitment.']); });
-    X.pending.forEach(function(p){ if(!p.ack && now-p.r.received_at>600) items.push(['warn','A receipt from '+esc(p.r.from)+' for the '+tstamp(p.r.receipt.t_first)+' window has waited '+ago(p.r.received_at, now).replace(' ago','')+' for the hop\'s countersignature.']); });
+    X.pending.forEach(function(p){ if(!p.ack && !p.lost && now-p.r.received_at>600) items.push(['warn','A receipt from '+esc(p.r.from)+' for the '+tstamp(p.r.receipt.t_first)+' window has waited '+ago(p.r.received_at, now).replace(' ago','')+' for the hop\'s countersignature.']); });
     if(X.R.length && now-X.R[X.R.length-1].received_at>2*H) items.push(['warn','No receipt for '+ago(X.R[X.R.length-1].received_at, now).replace(' ago','')+'; one is due at the top of every hour.']);
     if(st.last_report_at!=null && now-st.last_report_at>600) items.push(['warn','The public status was last posted '+ago(st.last_report_at, now)+'.']);
     var inForce={}; (st.links||[]).forEach(function(l){ inForce[l.relay]=l; });
@@ -190,8 +191,8 @@ a{color:var(--accent)}
 
   function pendingTable(X, now){
     if(!X.pending.length) return '';
-    var rows=X.pending.map(function(p){ var r=p.r.receipt; return '<tr><td>'+tstamp(r.t_first)+'</td><td>'+esc(X.name(r.payer))+' → '+esc(X.name(r.hop))+'</td><td class="n">'+bytes(r.bytes)+'</td><td>'+(p.ack?'<span class="st pending">acked, not settled</span>':'<span class="st pending">no ack yet</span>')+'</td><td class="m">received '+ago(p.r.received_at, now)+'</td></tr>'; });
-    return '<h2>Open windows <small>received, not yet settled</small></h2><div class="tbl"><table><thead><tr><th>window</th><th>payer → hop</th><th class="n">payer signed</th><th>state</th><th></th></tr></thead><tbody>'+rows.join('')+'</tbody></table></div>';
+    var rows=X.pending.map(function(p){ var r=p.r.receipt; return '<tr><td>'+tstamp(r.t_first)+'</td><td>'+esc(X.name(r.payer))+' → '+esc(X.name(r.hop))+'</td><td class="n">'+bytes(r.bytes)+'</td><td>'+(p.lost?'<span class="st declined">lost</span> <span class="m">the hop never countersigned; the window is unpaid</span>':p.ack?'<span class="st pending">acked, not settled</span>':'<span class="st pending">no ack yet</span>')+'</td><td class="m">received '+ago(p.r.received_at, now)+'</td></tr>'; });
+    return '<h2>Open windows <small>received, not settled</small></h2><div class="tbl"><table><thead><tr><th>window</th><th>payer → hop</th><th class="n">payer signed</th><th>state</th><th></th></tr></thead><tbody>'+rows.join('')+'</tbody></table></div>';
   }
 
   function windowsTable(X){
@@ -284,7 +285,7 @@ a{color:var(--accent)}
   // ------------------------------------------------------------------ draw
   function draw(){
     var now = D.snapshot ? D.fetchedAt : Math.floor(Date.now()/1000);
-    var X = derive(), st=X.st;
+    NOW=now; var X = derive(), st=X.st;
     $('h-name').textContent = st.name||'bwkit'; $('h-role').textContent = st.role||'node'; $('h-nym').textContent = st.nym||''; $('h-ver').textContent = st.impl||(st.bwkit?'bwkit/'+st.bwkit:'');
     $('h-at').textContent = (D.snapshot?'taken ':'read ')+tstamp(D.fetchedAt); $('h-snap').hidden = !D.snapshot;
     document.title = (st.name||'bwkit')+' · '+(st.role||'node');
