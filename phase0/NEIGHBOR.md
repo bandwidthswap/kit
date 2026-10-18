@@ -81,6 +81,10 @@ ssh bw-neighbor-away
 
 The first receipt comes at the top of the next hour. `sudo -u bwkit bwkit ledger` on `bw-mint` shows the windows; the status page draws them.
 
+## What the first hour showed (Oct 18, 00:23 CDT)
+
+The first receipt across the link settled as a dispute: the house signed 21.99 MB for the window, the neighbor's Pi signed 24.12 MB, and the Mint paid the smaller count, $0.0022 at ten cents a gigabyte, and committed the hour. The gap is about ten percent and it is real: a 10 MB purchase measured on both ends crossed `tailscale0` as 10.65 MB received at the house and 11.73 MB sent by the neighbor, the retransmissions of a relayed path with an 87 ms round trip. The bench's one-percent agreement margin (paper, Section 3.6) was set on a wire; on this link every window will be marked disputed and settle at the payer's count, which is the rule doing exactly what it was written to do, and a number for the backlog.
+
 ## What to watch for a month
 
 - The clock: `chronyc tracking` on both ends, and whether the hop ever declines a receipt (its journal says so since bwkit 0.1.1). Section 10 lists drift between sites as unmeasured; this is the measurement.
