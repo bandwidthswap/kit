@@ -75,6 +75,7 @@ svg .tick{stroke:var(--fg);stroke-width:2} svg .tick.steward{stroke:var(--info)}
 svg .span{fill:var(--accent);opacity:.25} svg .span.after{fill:var(--info);opacity:.15}
 svg .block{fill:var(--accent)} svg .block.missing{fill:none;stroke:var(--bad);stroke-width:1.5} svg .block.none{fill:var(--line)}
 svg .seg.relay{fill:var(--accent)} svg .seg.fee{fill:var(--warn)} svg .seg.premium{fill:var(--info)}
+svg .chip rect{fill:var(--panel);stroke:var(--line);stroke-width:1} svg .chip text{font-size:11px;font-family:var(--mono);fill:var(--fg)} svg .chip.offer rect{stroke:var(--info);stroke-dasharray:4 3} svg .chip.offer text{fill:var(--info)}
 .legend i{display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:-1px;margin:0 4px 0 10px}
 .pb{height:6px;background:var(--line);border-radius:3px;overflow:hidden;min-width:80px;margin-top:3px} .pb i{display:block;height:100%;background:var(--accent)}
 @media (max-width:640px){ .bar .name{font-size:16px} .now .v{font-size:17px} }
@@ -412,33 +413,51 @@ svg .seg.relay{fill:var(--accent)} svg .seg.fee{fill:var(--warn)} svg .seg.premi
     return '<div class="chart" style="margin-bottom:10px">'+out+'<p class="cap legend"><i style="background:var(--accent)"></i>committed hour, with its settlement count when more than one <i style="background:transparent;border:1.5px solid var(--bad)"></i>settled but not committed <i style="background:var(--line)"></i>nothing settled</p></div>';
   }
 
-  // The map: places with their nodes, the links that have settled, and the offers the Steward and payers have open.
+  // The map: each place is a card holding its nodes; the settled links run between the cards with their labels in chips;
+  // the offers the Steward and payers have open sit below the row, where nothing else is drawn.
+  function chip(x, y, text, cls, anchor){                                   // a label on a small plate, so lines never run through it
+    var w=text.length*6.6+14, h=18, left=anchor==='start'?x:anchor==='end'?x-w:x-w/2;
+    return '<g class="chip '+(cls||'')+'"><rect x="'+left.toFixed(1)+'" y="'+(y-13)+'" width="'+w.toFixed(1)+'" height="'+h+'" rx="4"/><text x="'+(left+w/2).toFixed(1)+'" y="'+y+'" text-anchor="middle">'+esc(text)+'</text></g>';
+  }
   function mapChart(X, now){
     var m=D.map; if(!m||!m.places) return '';
-    var ids=Object.keys(m.places), n=ids.length, W=960, Hh=250, cx=function(i){ return W*(i+0.5)/n; }, cy=140, r=36;
+    var ids=Object.keys(m.places), n=ids.length, W=960;
     var byPlace={}; for(var nd in (m.nodes||{})) (byPlace[m.nodes[nd]]=byPlace[m.nodes[nd]]||[]).push(nd);
+    var maxNodes=Math.max(1, Math.max.apply(null, ids.map(function(id){ return (byPlace[id]||[]).length; })));
+    var cw=Math.min(230, W/n-36), ch=60+18*maxNodes, top=84, cy=top+ch/2, bottom=top+ch;
+    var cx=function(i){ return W*(i+0.5)/n; }, pos={}; ids.forEach(function(id,i){ pos[id]=i; });
     var placeOfNym=function(nym){ var nm=X.names[nym]; return nm && m.nodes ? m.nodes[nm] : null; };
-    var pos={}; ids.forEach(function(id,i){ pos[id]=i; });
-    var out=svgo(W,Hh), P=D.purchases||[];
+    var P=(D.purchases||[]).filter(function(p){ return (!p.kind||p.kind==='purchase')&&p.deadline>=now&&!(X.closedAt&&X.closedAt[p.id]!=null&&X.closedAt[p.id]<=now); });   // open purchases only: not top-ups, closes or withdrawn ones
+    var firstLinks={}; P.forEach(function(p){ if(p.program==='first_link') firstLinks[p.route.to]=(firstLinks[p.route.to]||0)+1; });
+    var Hh=bottom+128, out=svgo(W,Hh), links='', labels='', offers='';
+    // the settled links
     linkOrder(X).forEach(function(k,i){
       var l=X.links[k], a=placeOfNym(l.payer), b=placeOfNym(l.hop); if(a==null||b==null||pos[a]==null||pos[b]==null) return;
-      var gb=l.windows.reduce(function(s,w){ return s+w.settled_bytes; },0), sw=Math.max(2, Math.min(12, 2+Math.log10(1+gb/1e6)*2.5)), label=esc(X.name(l.payer))+' → '+esc(X.name(l.hop))+' · '+bytes(gb);
-      if(a===b){ var x=cx(pos[a]); out+='<path class="link" d="M'+(x-18)+' '+(cy-r+6)+' C '+(x-30)+' '+(cy-r-40)+', '+(x+30)+' '+(cy-r-40)+', '+(x+18)+' '+(cy-r+6)+'" stroke-width="'+sw.toFixed(1)+'" stroke="'+col(i)+'"><title>'+label+', inside '+esc(m.places[a].name)+'</title></path><text class="ax" x="'+x+'" y="'+(cy-r-40)+'" text-anchor="middle">'+label+'</text>'; }
-      else { var x1=cx(pos[a])+(pos[a]<pos[b]?r:-r), x2=cx(pos[b])+(pos[a]<pos[b]?-r:r); out+='<line class="link" x1="'+x1+'" y1="'+cy+'" x2="'+x2+'" y2="'+cy+'" stroke-width="'+sw.toFixed(1)+'" stroke="'+col(i)+'"><title>'+label+'</title></line><text class="ax" x="'+((x1+x2)/2)+'" y="'+(cy-12)+'" text-anchor="middle">'+label+'</text>'; }
+      var gb=l.windows.reduce(function(s,w){ return s+w.settled_bytes; },0), sw=Math.max(2, Math.min(10, 2+Math.log10(1+gb/1e6)*2)), text=X.name(l.payer)+' → '+X.name(l.hop)+' · '+bytes(gb);
+      var pur=P.filter(function(p){ return p.program==='payer' && p.route.from===l.payer && p.route.to===l.hop; })[0];
+      if(a===b){ var x=cx(pos[a]); links+='<path class="link" d="M'+(x-22)+' '+top+' C '+(x-34)+' '+(top-52)+', '+(x+34)+' '+(top-52)+', '+(x+22)+' '+top+'" stroke-width="'+sw.toFixed(1)+'" stroke="'+col(i)+'"><title>'+esc(text)+', inside '+esc(m.places[a].name)+'</title></path>'; labels+=chip(x, top-48, text+' · inside the place'); }
+      else { var l0=Math.min(pos[a],pos[b]), l1=Math.max(pos[a],pos[b]), x1=cx(l0)+cw/2, x2=cx(l1)-cw/2, xm=(x1+x2)/2;
+        if(l1-l0===1){ links+='<line class="link" x1="'+x1+'" y1="'+cy+'" x2="'+x2+'" y2="'+cy+'" stroke-width="'+sw.toFixed(1)+'" stroke="'+col(i)+'"><title>'+esc(text)+'</title></line>'; labels+=chip(xm, cy-16, text); if(pur) labels+=chip(xm, cy+22, 'purchase · ≥ '+bytes(pur.min_bytes)+' a window · '+usd(pur.premium_per_gb)+'/GB · '+usd(pur.escrow)+' escrow', 'offer'); }
+        else { var xa=cx(l0), xb=cx(l1), ya=top-10; links+='<path class="link" d="M'+xa+' '+top+' C '+xa+' '+(top-70)+', '+xb+' '+(top-70)+', '+xb+' '+top+'" stroke-width="'+sw.toFixed(1)+'" stroke="'+col(i)+'"><title>'+esc(text)+'</title></path>'; labels+=chip((xa+xb)/2, top-58, text); }
+        if(pos[a]>pos[b]) links+='<text class="ax" x="'+(x1+6)+'" y="'+(cy+4)+'">◀</text>'; else links+='<text class="ax" x="'+(x2-14)+'" y="'+(cy+4)+'">▶</text>';
+      }
     });
-    P.filter(function(p){ return p.deadline>=now; }).forEach(function(p){
+    // the offers, below the row
+    P.forEach(function(p){
       var from = p.route.from==null ? null : (m.places[p.route.from]?p.route.from:placeOfNym(p.route.from)), to = m.places[p.route.to]?p.route.to:placeOfNym(p.route.to);
-      if(p.program==='second_bridge' && from!=null && to!=null && pos[from]!=null && pos[to]!=null){ var xa=cx(pos[from]), xb=cx(pos[to]); out+='<path class="offer" d="M'+xa+' '+(cy+r)+' C '+xa+' '+(cy+r+70)+', '+xb+' '+(cy+r+70)+', '+xb+' '+(cy+r)+'"><title>'+esc(p.id.slice(0,8))+': second path wanted, not via '+esc(p.route.not_via.join(', '))+', '+usd(p.premium_per_gb)+'/GB, '+usd(p.escrow)+' escrow</title></path><text class="ax" x="'+((xa+xb)/2)+'" y="'+(cy+r+66)+'" text-anchor="middle">second path wanted, through a third place · '+usd(p.escrow)+' at '+usd(p.premium_per_gb)+'/GB</text>'; }
-      else if(p.program==='payer' && from!=null && to!=null && from!==to && pos[from]!=null && pos[to]!=null){ var xm=(cx(pos[from])+cx(pos[to]))/2; out+='<text class="ax" x="'+xm+'" y="'+(cy+20)+'" text-anchor="middle">purchase: ≥ '+bytes(p.min_bytes)+' a window at '+usd(p.premium_per_gb)+'/GB · '+usd(p.escrow)+'</text>'; }
+      if(p.program==='second_bridge' && from!=null && to!=null && pos[from]!=null && pos[to]!=null){ var xa=cx(pos[from]), xb=cx(pos[to]), dip=bottom+84; offers+='<path class="offer" d="M'+xa+' '+(bottom+2)+' C '+xa+' '+dip+', '+xb+' '+dip+', '+xb+' '+(bottom+2)+'"><title>'+esc(p.id.slice(0,8))+': not via '+esc(p.route.not_via.join(', '))+'</title></path>'; offers+=chip((xa+xb)/2, bottom+74, 'second path wanted, through a third place · '+usd(p.escrow)+' at '+usd(p.premium_per_gb)+'/GB', 'offer'); }
     });
-    var firstLinks={}; P.forEach(function(p){ if(p.program==='first_link'&&p.deadline>=now) firstLinks[p.route.to]=(firstLinks[p.route.to]||0)+1; });
-    ids.forEach(function(id,i){ var pl=m.places[id], x=cx(i);
-      if(firstLinks[id]) out+='<circle class="place wanted" cx="'+x+'" cy="'+cy+'" r="'+(r+9)+'" fill="none"><title>first link wanted'+(firstLinks[id]>1?' ('+firstLinks[id]+' offers open)':'')+'</title></circle>';
-      out+='<circle class="place" cx="'+x+'" cy="'+cy+'" r="'+r+'"/><text class="lbl" x="'+x+'" y="'+(cy+r+24)+'" text-anchor="middle" font-weight="600">'+esc(pl.name||id)+'</text><text class="ax" x="'+x+'" y="'+(cy+r+40)+'" text-anchor="middle">'+esc(pl.medium)+' · '+esc(pl.range_class)+(firstLinks[id]?' · first link wanted'+(firstLinks[id]>1?' ×'+firstLinks[id]:''):'')+'</text>';
-      (byPlace[id]||[]).forEach(function(nd,j,arr){ var yy=cy-((arr.length-1)*14)/2+j*14; out+='<circle class="node" cx="'+(x-24)+'" cy="'+yy+'" r="4"/><text class="lbl m" x="'+(x-16)+'" y="'+(yy+4)+'">'+esc(nd)+'</text>'; });
+    // the cards
+    var cards='';
+    ids.forEach(function(id,i){ var pl=m.places[id], x=cx(i)-cw/2, nodes=byPlace[id]||[];
+      cards+='<rect class="place'+(firstLinks[id]?' wanted':'')+'" x="'+x.toFixed(1)+'" y="'+top+'" width="'+cw.toFixed(1)+'" height="'+ch+'" rx="8"/>';
+      cards+='<text class="lbl" x="'+(x+12)+'" y="'+(top+22)+'" font-weight="600">'+esc(pl.name||id)+'</text><text class="ax" x="'+(x+12)+'" y="'+(top+38)+'">'+esc(pl.medium)+' · '+esc(pl.range_class)+(pl.mapped?'':' · proposed')+'</text>';
+      if(!nodes.length) cards+='<text class="ax" x="'+(x+12)+'" y="'+(top+60)+'">no node here yet</text>';
+      nodes.forEach(function(nd,j){ var yy=top+60+j*18; cards+='<circle class="node" cx="'+(x+17)+'" cy="'+(yy-4)+'" r="4"/><text class="lbl m" x="'+(x+27)+'" y="'+yy+'">'+esc(nd)+'</text>'; });
+      if(firstLinks[id]) cards+=chip(cx(i), bottom+22, 'first link wanted'+(firstLinks[id]>1?' · '+firstLinks[id]+' offers open':''), 'offer');
     });
-    out+='</svg>';
-    return '<h2>The map <small>places, the links that have settled, and the offers open on them</small></h2><div class="chart">'+out+'<p class="cap legend"><i style="background:var(--accent)"></i>a link, width by bytes carried <i style="background:transparent;border:2px dashed var(--info)"></i>an offer the Steward has open · places are accepted by Mint consensus, here the membership\'s file</p></div>';
+    out+=links+offers+cards+labels+'</svg>';
+    return '<h2>The map <small>places, the links that have settled, and the offers open on them</small></h2><div class="chart">'+out+'<p class="cap legend"><i style="background:var(--accent)"></i>a link, width by bytes carried <i style="background:transparent;border:2px dashed var(--info)"></i>an offer open on the map · places are accepted by Mint consensus, here the membership\'s file</p></div>';
   }
 
   // Money: the month so far per pair as a stacked bar, and the month's cumulative line by day.
