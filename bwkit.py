@@ -129,6 +129,8 @@ DEFAULT_STEWARD = {                     # the Steward's parameters (paper, Secti
     "min_payer_age_s": 86400, "bounty_deadline_s": 7 * 86400,
 }
 DEFAULT_MAP_PATH = "/etc/bwkit/map.json"   # BWKIT_MAP: the membership's map of domains, places and which node is where
+DASHBOARD_PATHS = ("/usr/local/share/bwkit/dashboard.html",   # the node's own page (dashboard/dashboard.html), served at /
+                   os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard", "dashboard.html"))
 DECLINE_WORDS = ("clock", "patience", "since", "domain", "profile", "replay", "route")   # 409 reasons, the word before the colon
 TOKEN_RE = re.compile(r"^[a-z0-9-]{1,32}$")   # a medium or range class
 HTTP_TIMEOUT_S = 10
@@ -2061,13 +2063,105 @@ class Node:
         assert_public(text)
         if len(text) > REPORT_MAX:
             raise ValueError("the report is %d bytes; the status Worker takes at most %d" % (len(text), REPORT_MAX))
-        return http_post(url, rep, timeout=STATUS_TIMEOUT_S, headers={"Authorization": "Bearer " + token})
+        status, body = http_post(url, rep, timeout=STATUS_TIMEOUT_S, headers={"Authorization": "Bearer " + token})
+        if 200 <= status < 300:
+            st = self.state()
+            st["last_report_at"] = int(now if now is not None else time.time())
+            self.write_json("state.json", st)
+        return status, body
+
+    # the node's own page
+
+    def clock(self):
+        """(offset in seconds, positive when this clock is ahead of its source; stratum) from chronyc, or (None, None)."""
+        try:
+            out = subprocess.run(["chronyc", "-c", "tracking"], capture_output=True, text=True, timeout=3).stdout.strip().split(",")
+            return -float(out[4]), int(out[2])            # chronyc's field is positive when the clock is slow
+        except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
+            return None, None
+
+    def disk_free(self):
+        try:
+            v = os.statvfs(self.dir)
+            return v.f_bavail * v.f_frsize
+        except OSError:
+            return None
+
+    def status_dict(self):
+        """What GET /status answers on this role: the node, its clock and disk, and what it holds."""
+        offset, stratum = self.clock()
+        st = {"name": self.name, "role": self.role, "nym": self.nym, "bwkit": VERSION, "impl": IMPL, "proto": list(PROTOS),
+              "time": int(time.time()), "clock_offset_s": offset, "stratum": stratum, "disk_free_bytes": self.disk_free(),
+              "last_report_at": self.state().get("last_report_at")}
+        if self.role == "mint":
+            if self.index is None:
+                self.load_index()
+            no_ack, no_receipt = self.pending()
+            st["ledger_lines"] = self.index["lines"]
+            st["settlements"] = len(self.index["settled"])
+            st["commitments"] = len(self.index["commitments"])
+            st["disputed"] = sum(1 for x in self.index["settled"].values() if x["status"] == "disputed")
+            st["pending"] = {"receipts_without_ack": len(no_ack), "acks_without_receipt": len(no_receipt)}
+            st["links"] = self.index["links"]
+            st["purchases"] = len(self.index["book"].order)
+            st["steward"] = self.index["steward_nym"]
+        else:
+            st["sample"] = self.state().get("sample")
+            st["outbox"] = len(os.listdir(self.path("outbox")))
+            if self.role == "hop":
+                st["link"] = self.my_link()
+                st["patience"] = self.patience_state()
+            else:
+                st["purchases"] = sum(1 for r in self.load_purchases(skip_partial=True) if r.get("kind") == "purchase")
+        return st
+
+    def dashboard_path(self):
+        for p in ((self.config.get("dashboard"),) if self.config.get("dashboard") else ()) + DASHBOARD_PATHS:
+            if p and os.path.exists(p):
+                return p
+        return None
+
+    def dashboard(self, snapshot=False):
+        """The node's page (dashboard/dashboard.html), as served at /; with snapshot, the node's data embedded so the file stands alone."""
+        p = self.dashboard_path()
+        if p is None:
+            return None
+        with open(p, encoding="utf-8") as f:
+            html = f.read()
+        if not snapshot:
+            return html
+        st = self.status_dict()
+        snap = {"taken_at": st["time"], "status": st,
+                "ledger": open(self.path("ledger.jsonl")).read() if self.role == "mint" and os.path.exists(self.path("ledger.jsonl")) else "",
+                "commitments": self.commitments() if self.role == "mint" else [],
+                "purchases": open(self.path("purchases.jsonl")).read() if os.path.exists(self.path("purchases.jsonl")) else "",
+                "steward": self.steward_view() if self.role == "mint" else None,
+                "map": self.load_map() if self.map_path_exists() else None}
+        marker = '<script id="snapshot" type="application/json"></script>'
+        filled = '<script id="snapshot" type="application/json">%s</script>' % json.dumps(snap).replace("</", "<\\/")
+        return html.replace(marker, filled, 1) if marker in html else html
+
+    def map_path_exists(self):
+        return os.path.exists(os.environ.get("BWKIT_MAP") or self.config.get("map") or DEFAULT_MAP_PATH)
+
+    def steward_view(self):
+        """GET /steward: the feed's steward object with the latest run's `skipped`, or None without a Steward key."""
+        if self.role != "mint" or not self.steward_nym():
+            return None
+        try:
+            st = Steward(self)
+            fd = st.feed()
+            last = st.last_run()
+            fd["skipped"] = last["skipped"] if last else []
+            fd["adjusted"] = last.get("adjusted", []) if last else []
+            return fd
+        except (SystemExit, ValueError, OSError):
+            return None
 
     # the server
 
     def serve(self, host="0.0.0.0", port=None, block=True):
-        if self.role not in ("hop", "mint"):
-            raise SystemExit("only the hop and the mint serve")
+        """Serve HTTP: the Mint's and the hop's endpoints, and on every role the node's own page at / (GET only on a payer)."""
         if self.role == "mint":
             self.load_index()
         node = self
@@ -2087,43 +2181,47 @@ class Node:
                 self.end_headers()
                 self.wfile.write(data)
 
+            def raw(self, data, ctype, filename=None):
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                if filename:
+                    self.send_header("Content-Disposition", 'inline; filename="%s"' % filename)
+                self.end_headers()
+                self.wfile.write(data)
+
             def do_GET(self):
                 url = urlparse.urlsplit(self.path)
+                if url.path in ("/", "/index.html", "/snapshot"):
+                    with node.lock:
+                        html = node.dashboard(snapshot=url.path == "/snapshot")
+                    if html is None:
+                        return self.reply(404, {"error": "no dashboard: dashboard.html is not installed (config `dashboard`, or /usr/local/share/bwkit)"})
+                    return self.raw(html.encode("utf-8"), "text/html; charset=utf-8",
+                                    "%s-snapshot-%s.html" % (node.name, time.strftime("%Y%m%dT%H%M")) if url.path == "/snapshot" else None)
                 if url.path == "/status":
-                    st = {"name": node.name, "role": node.role, "nym": node.nym, "bwkit": VERSION, "impl": IMPL,
-                          "proto": list(PROTOS), "time": int(time.time())}
-                    if node.role == "mint":
-                        no_ack, no_receipt = node.pending()
-                        st["ledger_lines"] = node.index["lines"]
-                        st["settlements"] = len(node.index["settled"])
-                        st["commitments"] = len(node.index["commitments"])
-                        st["disputed"] = sum(1 for s in node.index["settled"].values() if s["status"] == "disputed")
-                        st["pending"] = {"receipts_without_ack": len(no_ack), "acks_without_receipt": len(no_receipt)}
-                        st["links"] = node.index["links"]
-                        st["purchases"] = len(node.index["book"].order)
-                        st["steward"] = node.index["steward_nym"]
-                    else:
-                        st["sample"] = node.state().get("sample")
-                        st["outbox"] = len(os.listdir(node.path("outbox")))
-                        st["link"] = node.my_link()
-                        st["patience"] = node.patience_state()
-                    return self.reply(200, st)
+                    with node.lock:
+                        return self.reply(200, node.status_dict())
                 if url.path == "/ledger" and node.role == "mint":
                     p = node.path("ledger.jsonl")
-                    data = open(p, "rb").read() if os.path.exists(p) else b""
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/x-ndjson")
-                    self.send_header("Content-Length", str(len(data)))
-                    self.end_headers()
-                    self.wfile.write(data)
-                    return
+                    return self.raw(open(p, "rb").read() if os.path.exists(p) else b"", "application/x-ndjson")
+                if url.path == "/purchases":
+                    p = node.path("purchases.jsonl")
+                    return self.raw(open(p, "rb").read() if os.path.exists(p) else b"", "application/x-ndjson")
                 if url.path == "/commitments" and node.role == "mint":
                     return self.reply(200, node.commitments())
                 if url.path == "/links" and node.role == "mint":
                     return self.reply(200, node.index["links"])
-                if url.path == "/purchases" and node.role == "mint":
-                    book = node.index["book"]
-                    return self.reply(200, [book.purchases[pid] for pid in book.order])
+                if url.path == "/steward" and node.role == "mint":
+                    with node.lock:
+                        view = node.steward_view()
+                    if view is None:
+                        return self.reply(404, {"error": "this Mint has no Steward key"})
+                    return self.reply(200, view)
+                if url.path == "/map":
+                    if not node.map_path_exists():
+                        return self.reply(404, {"error": "no map on this node"})
+                    return self.reply(200, node.load_map())
                 if url.path == "/proof" and node.role == "mint":
                     q = urlparse.parse_qs(url.query).get("window", [""])[0]
                     if not q.isdigit():
@@ -2144,6 +2242,8 @@ class Node:
                 except ValueError:
                     return self.reply(400, {"error": "bad JSON"})
                 try:
+                    if node.role == "payer":
+                        return self.reply(404, {"error": "a payer takes no records; its page is at /"})
                     if self.path == "/ack" and node.role == "hop":
                         return self.reply(200, node.ack(body))
                     if self.path == "/receipt" and node.role == "mint":
@@ -2512,7 +2612,7 @@ def main(argv=None):
     an.add_argument("--print", dest="print_only", action="store_true", help="print the signed announcement instead of posting it")
     pt = sub.add_parser("patience", help="hop: the payers it has counted short, and whether it has stopped serving one")
     pt.add_argument("--reset", metavar="NYM", help="clear the count for this payer and serve it again")
-    sv = sub.add_parser("serve", help="hop or mint: serve HTTP")
+    sv = sub.add_parser("serve", help="serve HTTP: the hop's and the Mint's endpoints, and the node's own page at / on every role")
     sv.add_argument("--host", default="0.0.0.0")
     sv.add_argument("--port", type=int, default=None)
     sub.add_parser("status", help="what this node knows")

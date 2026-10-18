@@ -20,6 +20,8 @@ install -d -o bwkit -g bwkit -m 0750 /var/lib/bwkit
 install -d -m 0755 /etc/bwkit
 install -m 0755 "$here/bwkit.py" /usr/local/bin/bwkit
 install -m 0644 "$here/steward_rules.py" /usr/local/bin/steward_rules.py   # imported by bwkit from its own directory
+install -d -m 0755 /usr/local/share/bwkit
+install -m 0644 "$here/dashboard/dashboard.html" /usr/local/share/bwkit/dashboard.html   # the node's own page, served at /
 install -m 0644 "$here"/systemd/*.service "$here"/systemd/*.timer /etc/systemd/system/
 systemctl daemon-reload
 

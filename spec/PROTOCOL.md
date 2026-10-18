@@ -217,6 +217,12 @@ HTTP, JSON bodies, on a private network; the signatures are what protect the rec
 | `GET /links` | the announcements it holds, a JSON list in registration order |
 | `GET /commitments` | the current commitment of every hour, a JSON list, oldest first (Section 10) |
 | `GET /proof?window=<time>` | the proof document for the hour containing that time (Section 10); 404 when the hour has no commitment |
+| `GET /purchases` | the purchase registry as `application/x-ndjson`: purchases, top-ups and closes in registration order (Section 15) |
+| `GET /steward` | the Steward's book as the status report carries it, with the latest run's `skipped` and `adjusted`; 404 without a Steward key |
+| `GET /map` | the map file; 404 on a node without one |
+| `GET /`, `GET /snapshot` | the node's own page (every role serves it); `/snapshot` is the same page with the node's data embedded in its `snapshot` element (`taken_at`, `status`, `ledger` and `purchases` as JSONL strings, `commitments`, `steward`, `map`), one self-contained file |
+
+Every role's `GET /status` also carries `clock_offset_s` (this clock less its time source, in seconds, positive when ahead, from chrony; null when unknown), `stratum`, `disk_free_bytes` (the ledger's filesystem) and `last_report_at` (when `bwkit report` last posted; null before the first). A payer serves `GET /`, `/snapshot`, `/status` and `/purchases` (its own copies) and takes no records (404 on POST).
 
 **The hop.**
 

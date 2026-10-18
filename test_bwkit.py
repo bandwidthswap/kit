@@ -1340,7 +1340,7 @@ class Purchases(unittest.TestCase):
         self.assertTrue(bwkit.verify_purchase(rec))
         bwkit.check_purchase(rec)
         self.assertEqual((lab.payer.load_purchases(), lab.mint.load_purchases()), ([rec], [rec]))
-        self.assertEqual(json.loads(bwkit.http_get(lab.mint_url + "/purchases")[1]), [rec])
+        self.assertEqual([json.loads(line) for line in bwkit.http_get(lab.mint_url + "/purchases")[1].splitlines() if line], [rec])
         self.assertEqual(json.loads(bwkit.http_get(lab.mint_url + "/status")[1])["purchases"], 1)
         lab.hour(200_000_000, 200_000_000)                        # running when the purchase was posted: governed, 100 MB above the 50 MB minimum
         s = self.settlements()[-1]
@@ -1760,6 +1760,114 @@ class StewardRole(unittest.TestCase):
         st = bwkit.Steward(other)
         with self.assertRaises(SystemExit):
             st.nym   # noqa: B018
+
+
+class Dashboard(unittest.TestCase):
+    """The node's own page at /, its snapshot, and the endpoints the page reads, on every role."""
+
+    def setUp(self):
+        self.lab = Lab()
+        self.map_path = os.path.join(self.lab.root, "map.json")
+        with open(self.map_path, "w") as f:
+            json.dump({"domains": {"earth": {"name": "Earth", "unit": "USD", "mint": "bw-mint"}},
+                       "places": {"house": {"name": "the house", "domain": "earth", "medium": "wire", "range_class": "building", "mapped": True},
+                                  "the-cabin": {"name": "the cabin", "domain": "earth", "medium": "lora", "range_class": "hill", "mapped": True}},
+                       "nodes": {"bw-house": "house", "bw-mint": "house", "bw-forest": "house"}}, f)
+        self.lab.mint.config["map"] = self.map_path
+        self.lab.mint.config["steward_mint"] = self.lab.mint_url
+        self.payer_srv = self.lab.payer.serve("127.0.0.1", 0, block=False)
+        self.payer_url = "http://127.0.0.1:%d" % self.payer_srv.server_address[1]
+
+    def tearDown(self):
+        self.payer_srv.shutdown()
+        self.payer_srv.server_close()
+        self.lab.close()
+
+    @staticmethod
+    def snapshot_of(html):
+        a = html.index('<script id="snapshot" type="application/json">') + len('<script id="snapshot" type="application/json">')
+        b = html.index("</script>", a)
+        return json.loads(html[a:b].replace("<\\/", "</"))
+
+    def test_every_role_serves_the_page_and_the_mint_its_data(self):
+        lab = self.lab
+        lab.hour(100_000_000, 100_000_000)
+        rec, pid = lab.payer.purchase_post("bw-forest", 50_000_000, 0.02, 168, 1.0, lab.t + 7 * 86400, now=lab.t + 1)
+        st = bwkit.Steward(lab.mint)
+        st.keygen()
+        lab.mint.load_index()
+        st.run(lab.t + 300)
+        for url, role in ((lab.mint_url, "mint"), (lab.hop_url, "hop"), (self.payer_url, "payer")):
+            status, html = bwkit.http_get(url + "/")
+            self.assertEqual(status, 200)
+            self.assertIn('<script id="snapshot" type="application/json"></script>', html)   # the live page: empty, it fetches
+            self.assertIn("function derive()", html)
+            sd = json.loads(bwkit.http_get(url + "/status")[1])
+            self.assertEqual(sd["role"], role)
+            for k in ("clock_offset_s", "stratum", "disk_free_bytes", "last_report_at"):
+                self.assertIn(k, sd, (role, k))
+            self.assertTrue(sd["disk_free_bytes"] is None or sd["disk_free_bytes"] > 0)
+            self.assertIsNone(sd["last_report_at"])
+            status, html = bwkit.http_get(url + "/snapshot")
+            self.assertEqual(status, 200)
+            snap = self.snapshot_of(html)
+            self.assertEqual(set(snap), {"taken_at", "status", "ledger", "commitments", "purchases", "steward", "map"})
+            self.assertEqual((snap["status"]["role"], snap["taken_at"]), (role, snap["status"]["time"]))
+        # the Mint's snapshot carries its ledger, commitments, purchases, the Steward's book and the map, all self-contained
+        snap = self.snapshot_of(bwkit.http_get(lab.mint_url + "/snapshot")[1])
+        self.assertIn('"kind": "settlement"', snap["ledger"])
+        self.assertEqual(len(snap["commitments"]), 1)
+        recs = [json.loads(line) for line in snap["purchases"].splitlines() if line]
+        self.assertEqual(recs[0]["id"], pid)
+        self.assertEqual({r["program"] for r in recs}, {"payer", "match", "first_link"})   # the house's purchase, its match, the cabin's offer
+        self.assertEqual(snap["steward"]["nym"], st.nym)
+        self.assertIn("skipped", snap["steward"])
+        self.assertIn("the-cabin", snap["map"]["places"])
+        # the endpoints the page reads live
+        text = bwkit.http_get(lab.mint_url + "/purchases")[1]
+        self.assertEqual([json.loads(line)["id"] for line in text.splitlines() if line][0], pid)      # JSONL, the file itself
+        own = [json.loads(line) for line in bwkit.http_get(self.payer_url + "/purchases")[1].splitlines() if line]
+        self.assertEqual([r["id"] for r in own], [pid])                                                # the payer's own copies
+        view = json.loads(bwkit.http_get(lab.mint_url + "/steward")[1])
+        self.assertEqual((view["nym"], view["last_run"], view["skipped"] is not None, "adjusted" in view), (st.nym, lab.t + 300, True, True))
+        self.assertIn("the-cabin", json.loads(bwkit.http_get(lab.mint_url + "/map")[1])["places"])
+        for path in ("/steward", "/map", "/ledger", "/commitments"):
+            with self.assertRaises(bwkit.urlerror.HTTPError) as cm:
+                bwkit.http_get(lab.hop_url + path)
+            self.assertEqual(cm.exception.code, 404, path)
+        self.assertEqual(bwkit.http_post(self.payer_url + "/receipt", {"kind": "receipt"})[0], 404)    # a payer takes no records
+        # a successful report leaves last_report_at behind
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                data = b'{"stored": true}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            lab.mint.report("http://127.0.0.1:%d/status" % srv.server_address[1], "tok", now=lab.t + 9)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+        self.assertEqual(json.loads(bwkit.http_get(lab.mint_url + "/status")[1])["last_report_at"], lab.t + 9)
+        # without the page installed, / says so
+        with mock.patch.object(bwkit, "DASHBOARD_PATHS", ()):
+            with self.assertRaises(bwkit.urlerror.HTTPError) as cm:
+                bwkit.http_get(lab.hop_url + "/")
+            self.assertEqual(cm.exception.code, 404)
+        lab.hop.config["dashboard"] = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard", "dashboard.html")
+        with mock.patch.object(bwkit, "DASHBOARD_PATHS", ()):
+            self.assertEqual(bwkit.http_get(lab.hop_url + "/")[0], 200)                                # the config's path
 
 
 class Rules(unittest.TestCase):

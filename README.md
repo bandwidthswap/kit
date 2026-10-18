@@ -8,6 +8,7 @@ The code for the Phase 0 lab: three Raspberry Pi 3 B nodes on a home LAN that ke
 | `spec/PROTOCOL.md`, `spec/CONFORMANCE.md`, `spec/vectors/` | The Bandwidth Swap Protocol, pilot profile 1 (`bsp/1`), written from what the kit does; what a second implementation must reproduce; the test vectors it reproduces, from published test-only keys. "The specification" below. |
 | `tools/vectors.py`, `tools/conform.py` | Write the vectors from the kit; check a directory in their layout. |
 | `steward_rules.py` | The Network Steward's sizes and cap as pure functions, imported by `bwkit.py` and by `sim/steward.py`, so the simulator and the Mint run one rule. Installed beside `bwkit`. |
+| `dashboard/dashboard.html` | The node's own page, one file for every role, served by `bwkit` at `/` (installed to `/usr/local/share/bwkit/`): what the node sees now, what needs attention, the windows, links, commitments, peers, announcements, purchases, the Steward and the month's invoice, read from its own origin; `/snapshot` is the same page with the node's data embedded, a self-contained file to save and send. |
 | `phase0/map.json` | The lab's map for the Steward: domain `earth` (USD, `bw-mint`), places `house`, `next-door` and `the-cabin`, and which node is at which place. Installed as `/etc/bwkit/map.json` on `bw-mint`. |
 | `test_bwkit.py` | Runs a payer, a hop and a Mint in one process. `python3 test_bwkit.py` (on the Mac: `python3 -m venv venv && venv/bin/pip install cryptography`, then `venv/bin/python`; `venv/` is ignored) |
 | `install.sh` | Installs `bwkit` on one node: `sudo ./install.sh payer\|hop\|mint` |
@@ -65,6 +66,10 @@ sudo -u bwkit bwkit steward map        # the map, and which node is where
 ```
 
 The status report carries the same book as `steward` (names and places only), the Mint's NYM as `mint`, and the committed hour's proof as `proof`, so the site's Steward's book page and its verifier draw from the feed. The Steward's parameters are the Mint's config: `steward: {m, margin, program_window_s, first_link_usd, first_link_premium, min_payer_age_s, bounty_deadline_s}`, defaults `0.04`, `0.01`, a week, `1.00`, `0.05`, a day and a week.
+
+## The node's dashboard
+
+Every node serves its own page at `http://<node>:8710/`: the payer too, whose service does nothing else (`bwkit.service` on `bw-house`). It reads `/status`, `/ledger`, `/commitments`, `/purchases`, `/steward` and `/map` from its own origin and draws what the node sees now (service, last receipt, windows waiting for an ack, the clock against its source, disk, when the status was last posted), what needs attention (a stale service, an uncommitted hour, a receipt waiting on its ack, a link whose gap runs past its margin, duplicate standing offers), the open and settled windows, each link's last 48 hours, the commitments with a link to each proof, the peers, the announcements, the purchases with their top-ups and closes, the Steward's book and the month's invoice. `/snapshot` is the same page with the node's current data embedded in it, one file an operator can save and send. `/status` now also carries `clock_offset_s` and `stratum` from chrony, `disk_free_bytes` and `last_report_at`.
 
 ## The specification
 
