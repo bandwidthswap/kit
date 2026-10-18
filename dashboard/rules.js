@@ -41,7 +41,7 @@ window.BW = window.BW || {};
   BW.attention=function(X, now){
     var D=BW.D, st=X.st, items=[], live=D.mode!=='snapshot', role=X.role;
     var add=function(level, text){ items.push({level:level, text:text}); };
-    ((st.health&&st.health.items)||[]).forEach(function(i){ add(i.level||'warn', i.text); });
+    ((st.health&&st.health.items)||[]).forEach(function(i){ add(i.level||'warn', F.esc(i.text)); });   // bwkit's texts are plain; the page's own are HTML
     var have={}; items.forEach(function(i){ have[i.text]=1; });
     if(live && st.time && now-st.time>120 && !D.asOf) add('bad','The node\'s status is '+F.ago(st.time, now)+'; the service may be down.');
     if(st.clock_offset_s!=null && Math.abs(st.clock_offset_s)>1) add('bad','The clock is '+st.clock_offset_s.toFixed(2)+' s off its source; receipts are declined beyond the link\'s tolerance.');
@@ -56,7 +56,7 @@ window.BW = window.BW || {};
     var lastR=(X.R.length?X.R[X.R.length-1].received_at:0)||(X.myR.length?X.myR[X.myR.length-1].receipt.t_last:0);
     if(lastR && now-lastR>2*H) add('warn','No receipt for '+F.dur(now-lastR)+'; one is due at the top of every hour.');
     if(st.last_report_at!=null && role==='mint' && now-st.last_report_at>600) add('warn','The public status was last posted '+F.ago(st.last_report_at, now)+'.');
-    if(st.outbox && st.outbox>0 && role!=='mint') add(st.outbox>2?'bad':'warn', st.outbox+' record'+(st.outbox===1?'':'s')+' wait in the outbox for the Mint; nothing is lost, they go when it answers.');
+    if(st.outbox && st.outbox>0 && role!=='mint') add(st.outbox>2?'bad':'warn', st.outbox+(st.outbox===1?' record waits':' records wait')+' in the outbox for the Mint; nothing is lost, they go when it answers.');
     if(role==='hop' && st.patience) for(var p in st.patience){ var ps=st.patience[p]; if(ps.declined) add('bad','Payer '+F.esc(X.name(p))+' is declined since '+F.tstamp(ps.declined_at)+' after '+ps.short+' short windows; service to it has stopped.'); else if(ps.short>0) add('info','Payer '+F.esc(X.name(p))+' has '+ps.short+' window'+(ps.short===1?'':'s')+' short beyond the margin against a patience of '+((st.link&&st.link.patience_windows)||0)+'.'); }
     // the margin against the gap, and the baselines
     var inForce={}; (st.links||[]).forEach(function(l){ inForce[l.relay]=l; }); if(st.link&&st.nym) inForce[st.nym]=st.link;

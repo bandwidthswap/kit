@@ -1762,6 +1762,141 @@ class StewardRole(unittest.TestCase):
             st.nym   # noqa: B018
 
 
+class Health(unittest.TestCase):
+    """/status.health on every role: the node's own verdicts in the page's wording (dashboard/PLAN.md 1.3)."""
+
+    def setUp(self):
+        self.lab = Lab()
+        self.payer_srv = self.lab.payer.serve("127.0.0.1", 0, block=False)
+        self.payer_url = "http://127.0.0.1:%d" % self.payer_srv.server_address[1]
+
+    def tearDown(self):
+        self.payer_srv.shutdown()
+        self.payer_srv.server_close()
+        self.lab.close()
+
+    def test_every_role_serves_health_and_a_quiet_lab_has_no_items(self):
+        lab = self.lab
+        lab.hour(100_000_000, 100_000_000)
+        lab.hop.flush()                                                                   # the hop's own copy of its ack, which it sends 5 s later
+        for url in (lab.mint_url, lab.hop_url, self.payer_url):
+            st = json.loads(bwkit.http_get(url + "/status")[1])
+            self.assertEqual(set(st["health"]), {"items", "checked_at"})
+            self.assertEqual(st["health"]["checked_at"], st["time"])
+            for i in st["health"]["items"]:
+                self.assertEqual(set(i), {"level", "text", "since"})
+        for node in (lab.mint, lab.hop, lab.payer):
+            self.assertEqual(node.health({"clock_offset_s": 0.0004, "disk_free_bytes": 50_000_000_000}, lab.t + 10),
+                             {"items": [], "checked_at": lab.t + 10})
+
+    def test_the_clock_and_the_disk(self):
+        h = self.lab.hop.health({"clock_offset_s": -1.5, "disk_free_bytes": 400_000_000}, self.lab.t)
+        self.assertEqual([(i["level"], i["text"], i["since"]) for i in h["items"]],
+                         [("bad", "The clock is -1.50 s off its source; receipts are declined beyond the link's tolerance.", None),
+                          ("bad", "Only 400.00 MB of disk is free for the ledger.", None)])
+        self.assertEqual(self.lab.hop.health({"clock_offset_s": 0.99, "disk_free_bytes": 500_000_000}, self.lab.t)["items"], [])
+
+    def test_a_receipt_waiting_for_its_ack_and_then_lost(self):
+        lab = self.lab
+        lab.payer.config["hop_url"] = "http://127.0.0.1:1"          # the hop does not answer; the receipt reaches the Mint alone
+        out = lab.hour(100_000_000, 100_000_000)
+        self.assertIsNone(out["ack"])
+        t_first = lab.t - 3600
+        waiting = "A receipt from bw-house for the %s window has waited 12 min for the hop's countersignature." % bwkit.page_tstamp(t_first)
+        lost = "The %s window from bw-house is lost: two windows have passed and the hop never countersigned, so it is unpaid." % bwkit.page_tstamp(t_first)
+        received = lab.mint.index["by_sig"][out["receipt"]["sig"]]["received_at"]   # the Mint's clock; the payer counts from the window's end
+        for node, t0 in ((lab.mint, received), (lab.payer, lab.t)):
+            self.assertEqual(node.health({}, t0 + 599)["items"], [], node.role)
+            self.assertEqual(node.health({}, t0 + 720)["items"], [{"level": "warn", "text": waiting, "since": t0}], node.role)
+            self.assertEqual(node.health({}, t0 + 7201)["items"], [{"level": "warn", "text": lost, "since": t0}], node.role)
+            self.assertEqual(node.health({}, t0 + 8 * 86400)["items"], [], node.role)   # after a week the books hold it
+        self.assertEqual(lab.hop.health({}, lab.t + 720)["items"], [])                   # the hop never saw it
+
+    def test_the_outbox_and_the_hops_patience(self):
+        lab = self.lab
+        port = lab.mint_srv.server_address[1]
+        lab.mint_srv.shutdown()
+        lab.mint_srv.server_close()
+        lab.hour(5_000_000, 5_000_000)                                                     # receipt and ack wait on the payer, the ack on the hop
+        self.assertEqual(lab.payer.health({}, lab.t + 5)["items"],
+                         [{"level": "warn", "text": "2 records wait in the outbox for the Mint; nothing is lost, they go when it answers.", "since": lab.t}])
+        self.assertEqual(lab.hop.health({}, lab.t + 5)["items"],
+                         [{"level": "warn", "text": "1 record waits in the outbox for the Mint; nothing is lost, they go when it answers.", "since": lab.t}])
+        first = lab.t
+        lab.hour(10_000_000, 10_000_000)
+        self.assertEqual([(i["level"], i["since"]) for i in lab.payer.health({}, lab.t + 5)["items"]], [("bad", first)])
+        self.assertIn("4 records wait", lab.payer.health({}, lab.t + 5)["items"][0]["text"])
+        lab.mint_srv = lab.mint.serve("127.0.0.1", port, block=False)
+        lab.payer.flush()
+        lab.hop.flush()
+        self.assertEqual(lab.payer.health({}, lab.t + 5)["items"], [])
+        # patience: a payer counted short is information, a declined one is bad
+        st = lab.hop.state()
+        st["patience"] = {lab.payer.nym: {"short": 2, "declined": False, "declined_at": None}}
+        lab.hop.write_json("state.json", st)
+        self.assertEqual(lab.hop.health({}, lab.t + 5)["items"],
+                         [{"level": "info", "text": "Payer bw-house has 2 windows short beyond the margin against a patience of 0.", "since": None}])
+        st["patience"][lab.payer.nym].update({"declined": True, "declined_at": lab.t + 1})
+        lab.hop.write_json("state.json", st)
+        self.assertEqual(lab.hop.health({}, lab.t + 5)["items"],
+                         [{"level": "bad", "text": "Payer bw-house is declined since %s after 2 short windows; service to it has stopped." % bwkit.page_tstamp(lab.t + 1),
+                           "since": lab.t + 1}])
+
+    def test_an_hour_settled_and_not_committed_and_the_public_status(self):
+        lab = self.lab
+        lab.hour(100_000_000, 100_000_000)
+        lab.hour(200_000_000, 200_000_000)
+        w = bwkit.commit_hour(sorted(lab.mint.index["settled"].values(), key=lambda s: s["t_first"])[-1])
+        self.assertEqual(lab.mint.health({}, w + 3600 + 301)["items"], [])
+        del lab.mint.index["commitments"][w]                                              # as if the Mint had settled and not signed
+        self.assertEqual(lab.mint.health({}, w + 3600 + 299)["items"], [])               # five minutes of slack after the hour closes
+        self.assertEqual(lab.mint.health({}, w + 3600 + 301)["items"],
+                         [{"level": "bad", "text": "The %s hour has 1 settlement and no commitment." % bwkit.page_tstamp(w), "since": w + 3600}])
+        lab.mint.load_index()                                                             # the ledger has the commitment; the index again
+        self.assertEqual(lab.mint.health({}, w + 3600 + 301)["items"], [])
+        self.assertEqual(lab.mint.health({"last_report_at": lab.t}, lab.t + 599)["items"], [])
+        self.assertEqual(lab.mint.health({"last_report_at": lab.t}, lab.t + 601)["items"],
+                         [{"level": "warn", "text": "The public status was last posted 10 min ago.", "since": lab.t}])
+        self.assertEqual(lab.payer.health({"last_report_at": lab.t}, lab.t + 601)["items"], [])   # only the Mint posts
+
+    def test_a_link_whose_gap_runs_past_its_margin(self):
+        lab = self.lab
+        lab.hour(100_000_000, 120_000_000)                                                # the hop counts a fifth more, every window
+        lab.hour(200_000_000, 240_000_000)
+        self.assertEqual(lab.mint.health({}, lab.t + 5)["items"], [])                    # not before three windows
+        lab.hour(300_000_000, 360_000_000)
+        text = ("bw-house → bw-forest: the gap runs at +20.0% over the last 3 windows against a margin of 1%, so 3 of them settled disputed; "
+                "raise the margin in the link's announcement or mend the path.")
+        self.assertEqual(lab.mint.health({}, lab.t + 5)["items"], [{"level": "warn", "text": text, "since": None}])
+        self.assertEqual(lab.payer.health({}, lab.t + 5)["items"], [{"level": "warn", "text": text, "since": None}])   # from its own receipts and acks
+        self.assertEqual(json.loads(bwkit.http_get(self.payer_url + "/status")[1])["health"]["items"][0]["text"], text)
+
+    def test_more_than_one_open_first_link_offer_for_a_place(self):
+        lab = self.lab
+        map_path = os.path.join(lab.root, "map.json")
+        with open(map_path, "w") as f:
+            json.dump({"domains": {"earth": {"name": "Earth", "unit": "USD", "mint": "bw-mint"}},
+                       "places": {"house": {"name": "the house", "domain": "earth", "medium": "wire", "range_class": "building", "mapped": True},
+                                  "the-cabin": {"name": "the cabin", "domain": "earth", "medium": "lora", "range_class": "hill", "mapped": True}},
+                       "nodes": {"bw-house": "house", "bw-mint": "house", "bw-forest": "house"}}, f)
+        lab.mint.config["map"] = map_path
+        lab.mint.config["steward_mint"] = lab.mint_url
+        st = bwkit.Steward(lab.mint)
+        st.keygen()
+        lab.mint.load_index()
+        week = lab.t + 7 * 86400
+        for i in range(2):
+            st.node.purchase_post("the-cabin", 0, 0.05, 168, 0.0001, week, now=lab.t + 10 + i, poster_priv=st.priv,
+                                  program="first_link", route_from=None, mint_url=lab.mint_url, keep=False)
+        self.assertEqual(lab.mint.health({}, lab.t + 20)["items"],
+                         [{"level": "warn", "text": "2 first-link offers are open for the-cabin; the rule should hold one standing offer and top it up.",
+                           "since": lab.t + 11}])
+        self.assertEqual(lab.mint.health({}, week + 1)["items"], [])                     # past the deadline
+        pid = lab.mint.index["book"].order[0]
+        st.node.purchase_adjust("close", pid, now=lab.t + 30, poster_priv=st.priv, mint_url=lab.mint_url, keep=False)
+        self.assertEqual(lab.mint.health({}, lab.t + 40)["items"], [])
+
+
 class Dashboard(unittest.TestCase):
     """The node's own page at /, its snapshot, and the endpoints the page reads, on every role."""
 

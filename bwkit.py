@@ -141,6 +141,17 @@ STATUS_TIMEOUT_S = 10                   # posting the status report
 HISTORY_HOURS = 12                      # the status report carries each node's windows of the last twelve hours
 HISTORY_MAX = 36                        # at most this many per node (the forced tests made several in one hour)
 REPORT_MAX = 64 * 1024                  # the status Worker refuses a larger body
+HEALTH = {                              # the checks every view shows (dashboard/PLAN.md 1.3), as /status.health
+    "clock_s": 1.0,                     # a clock this far from its source is bad: receipts fail the link's tolerance soon after
+    "disk_bytes": 500_000_000,          # less free disk than this for the ledger is bad
+    "ack_wait_s": 600,                  # a receipt without its ack for this long needs attention
+    "lost_after_s": 7200,               # two windows without an ack: the hop never countersigned, the window is lost
+    "lost_shown_s": 7 * 86400,          # a lost window is listed for a week; after that the books hold it
+    "commit_slack_s": 300,              # an hour is committed within five minutes of closing
+    "report_s": 600,                    # the public status is posted every two minutes; ten without one is a warning
+    "gap_windows": 24,                  # the gap is judged as the median over this many of a link's newest windows
+    "gap_min_windows": 3,               # and not before this many
+}
 PRIVATE_PATTERNS = (                    # what a status report may never carry
     re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b"),               # an IPv4 address
     re.compile(r"\b[0-9a-f]{2}(?::[0-9a-f]{2}){5}\b", re.I),  # a MAC address
@@ -999,6 +1010,56 @@ def rebuild(receipts, acks, links=(), price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB,
 
 def plural(n, word):
     return "%d %s%s" % (n, word, "" if n == 1 else "s")
+
+
+# The health texts are the page's own wording (dashboard/rules.js, attention), so a verdict reads the same wherever it is
+# shown and the page can drop its own copy of one the node already made. These format as the page's F.* do.
+
+def page_tstamp(t):
+    return time.strftime("%m-%d %H:%M", time.localtime(t)) if t else "–"
+
+
+def page_dur(s):
+    s = max(0, int(round(s)))
+    if s < 90:
+        return "%d s" % s
+    if s < 5400:
+        return "%d min" % int(s / 60.0 + 0.5)
+    if s < 172800:
+        return "%.1f h" % (s / 3600.0)
+    return "%d d" % int(s / 86400.0 + 0.5)
+
+
+def page_ago(t, now):
+    return page_dur(now - t) + " ago" if t else "never"
+
+
+def page_bytes(n):
+    if n is None:
+        return "–"
+    if n >= 1e9:
+        return "%.2f GB" % (n / 1e9)
+    if n >= 1e6:
+        return "%.2f MB" % (n / 1e6)
+    if n >= 1e3:
+        return "%.1f kB" % (n / 1e3)
+    return "%d B" % n
+
+
+def page_pct(x, d=1):
+    return "%.*f%%" % (d, 100 * x)
+
+
+def gap_of(payer_bytes, hop_bytes):
+    return (hop_bytes - payer_bytes) / float(payer_bytes) if payer_bytes else 0.0
+
+
+def median(xs):
+    """The page's F.median: the middle of the sorted list, the upper one of an even count."""
+    if not xs:
+        return 0.0
+    s = sorted(xs)
+    return s[len(s) // 2]
 
 
 def compare(rebuilt, mint_entries):
@@ -2113,7 +2174,165 @@ class Node:
                 st["patience"] = self.patience_state()
             else:
                 st["purchases"] = sum(1 for r in self.load_purchases(skip_partial=True) if r.get("kind") == "purchase")
+        st["health"] = self.health(st, st["time"])
         return st
+
+    # health: the checks every view shows, computed once here (dashboard/PLAN.md 1.3)
+
+    def own_pairs(self):
+        """A payer's or a hop's own windows, oldest first: (the receipt envelope, the ack envelope or None).
+
+        From receipts.jsonl and acks.jsonl: a payer holds what it signed and
+        what the hop answered; a hop holds what it countersigned and its
+        acks. An ack pairs with its receipt by prev_sig.
+        """
+        acks = {a["receipt"]["prev_sig"]: a for a in self.read_lines("acks.jsonl", skip_partial=True) if a.get("receipt")}
+        pairs = [(r, acks.get(r["sig"])) for r in self.read_lines("receipts.jsonl", skip_partial=True) if r.get("receipt")]
+        pairs.sort(key=lambda p: (p[0]["receipt"]["t_first"], p[0]["receipt"]["t_last"]))
+        return pairs
+
+    def link_terms(self):
+        """The margin and min_bytes a hop's or a payer's windows settle under: the hop's own link; for a payer, the newest
+        settlement the Mint returned to it (sent.jsonl), else the pilot's defaults."""
+        if self.role == "hop":
+            link = self.my_link()
+            return link["margin"], link["min_bytes"]
+        newest = None
+        for e in self.read_lines("sent.jsonl", skip_partial=True):
+            for s in (e.get("mint") or {}).get("settlements") or []:
+                if s.get("margin") is not None and (newest is None or s["t_first"] >= newest["t_first"]):
+                    newest = s
+        if newest:
+            return newest["margin"], newest.get("min_bytes", PILOT_LINK["min_bytes"])
+        return PILOT_LINK["margin"], PILOT_LINK["min_bytes"]
+
+    def health(self, st=None, now=None):
+        """The node's own verdict on itself: `{items: [{level, text, since}], checked_at}`, as /status.health.
+
+        Computed from the node's own records, so the node's page, a fleet
+        page and a timer without a browser read the same checks; the page
+        adds its own on top (dashboard/rules.js). `level` is bad, warn or
+        info; `text` is plain, in the page's wording; `since` is when the
+        condition began where that is known, else None. `st` is the status
+        dict the clock and disk are read from (status_dict passes its own).
+        The checks: a clock off its source beyond a second; disk under 500
+        MB; a receipt waiting more than ten minutes for its ack; a receipt
+        two windows old without one (a lost window, listed for a week); an
+        hour with settlements and no commitment (the Mint, since
+        commitments began); the public status not posted in ten minutes
+        (the Mint); an outbox not empty (a hop, a payer); a payer declined
+        or counted short (a hop); a link whose median gap over its last 24
+        windows exceeds its margin; more than one open first-link offer for
+        a place (the Mint).
+        """
+        now = int(now if now is not None else time.time())
+        st = st or {}
+        items = []
+
+        def add(level, text, since=None):
+            items.append({"level": level, "text": text, "since": since})
+
+        peers = self.peers()
+        me = self.nym if self.priv else None
+
+        def name(nym):
+            return self.name if nym == me else peers.get(nym) or (str(nym).split(":", 1)[-1][:8] + "…")
+
+        def waiting(frm, r, t0):
+            """A receipt (from `frm`, for window r) with no ack since t0."""
+            waited = now - t0
+            if waited > HEALTH["lost_after_s"]:
+                if waited <= HEALTH["lost_shown_s"]:
+                    add("warn", "The %s window%s is lost: two windows have passed and the hop never countersigned, so it is unpaid." % (
+                        page_tstamp(r["t_first"]), " from " + frm if frm else ""), t0)
+            elif waited > HEALTH["ack_wait_s"]:
+                add("warn", "A receipt%s for the %s window has waited %s for the hop's countersignature." % (
+                    " from " + frm if frm else "", page_tstamp(r["t_first"]), page_dur(waited)), t0)
+
+        def gap(payer, hop, windows, margin, min_bytes):
+            """windows: (payer_bytes, hop_bytes, disputed) newest first; the median gap over the last 24 against the margin."""
+            w = windows[:HEALTH["gap_windows"]]
+            if len(w) < HEALTH["gap_min_windows"]:
+                return
+            med = median([gap_of(p, h) for p, h, _ in w])
+            if med > margin:
+                add("warn", "%s → %s: the gap runs at %s%s over the last %d windows against a margin of %s, so %d of them settled disputed; "
+                    "raise the margin in the link's announcement or mend the path." % (
+                        name(payer), name(hop), "+" if med >= 0 else "", page_pct(med), len(w), page_pct(margin, 0), sum(1 for x in w if x[2])))
+
+        offset = st.get("clock_offset_s")
+        if offset is not None and abs(offset) > HEALTH["clock_s"]:
+            add("bad", "The clock is %.2f s off its source; receipts are declined beyond the link's tolerance." % offset)
+        free = st.get("disk_free_bytes")
+        if free is not None and free < HEALTH["disk_bytes"]:
+            add("bad", "Only %s of disk is free for the ledger." % page_bytes(free))
+
+        if self.role == "mint":
+            if self.index is None:
+                self.load_index(skip_partial=True)
+            ix = self.index
+            no_ack, _ = self.pending()
+            for e in sorted(no_ack, key=lambda e: e["received_at"]):
+                waiting(e.get("from"), e["receipt"], e["received_at"])
+            hours = {}
+            for s in ix["settled"].values():
+                hours.setdefault(commit_hour(s), []).append(s)
+            first = min(ix["commitments"]) if ix["commitments"] else None
+            cur = now // 3600 * 3600
+            for w in sorted(hours):
+                if first is not None and first <= w < cur and w not in ix["commitments"] and now - w > 3600 + HEALTH["commit_slack_s"]:
+                    add("bad", "The %s hour has %s and no commitment." % (page_tstamp(w), plural(len(hours[w]), "settlement")), w + 3600)
+            last = st.get("last_report_at", self.state().get("last_report_at"))
+            if last is not None and now - last > HEALTH["report_s"]:
+                add("warn", "The public status was last posted %s." % page_ago(last, now), last)
+            links = {}
+            for s in ix["settled"].values():
+                links.setdefault((s["payer"], s["hop"]), []).append(s)
+            for (payer, hop), ss in sorted(links.items()):
+                ss.sort(key=lambda s: (s["t_first"], s["t_last"]), reverse=True)
+                rec = link_in_force(ix["links"], payer, hop, now)
+                margin = link_params(rec)["margin"] if rec else (ss[0]["margin"] if ss[0].get("margin") is not None else PILOT_LINK["margin"])
+                gap(payer, hop, [(s["payer_bytes"], s["hop_bytes"], s["status"] == "disputed") for s in ss], margin, None)
+            book, open_first = ix["book"], {}
+            for pid in book.order:
+                p = book.purchases[pid]
+                if p["program"] == "first_link" and p["deadline"] >= now and pid not in book.closed:
+                    open_first.setdefault(p["route"]["to"], []).append(p["posted_at"])
+            for place, posted in sorted(open_first.items()):
+                if len(posted) > 1:
+                    add("warn", "%d first-link offers are open for %s; the rule should hold one standing offer and top it up." % (
+                        len(posted), place), sorted(posted)[1])
+        else:
+            names = sorted(os.listdir(self.path("outbox")))
+            if names:
+                oldest = int(names[0].split("-")[0]) if names[0].split("-")[0].isdigit() else None
+                add("bad" if len(names) > 2 else "warn", "%s wait%s in the outbox for the Mint; nothing is lost, they go when it answers." % (
+                    plural(len(names), "record"), "s" if len(names) == 1 else ""), oldest)
+            if self.role == "hop":
+                patience = self.my_link()["patience_windows"]
+                for payer, ps in sorted(self.patience_state().items()):
+                    if ps.get("declined"):
+                        add("bad", "Payer %s is declined since %s after %d short windows; service to it has stopped." % (
+                            name(payer), page_tstamp(ps.get("declined_at")), ps.get("short", 0)), ps.get("declined_at"))
+                    elif ps.get("short", 0) > 0:
+                        add("info", "Payer %s has %s short beyond the margin against a patience of %d." % (
+                            name(payer), plural(ps["short"], "window"), patience), None)
+            pairs = self.own_pairs()
+            if self.role == "payer":
+                for r, a in pairs:
+                    if a is None:
+                        waiting(r.get("from"), r["receipt"], r["receipt"]["t_last"])
+            margin, min_bytes = self.link_terms()
+            links = {}
+            for r, a in pairs:
+                if a is not None:
+                    x, y = r["receipt"]["bytes"], a["receipt"]["bytes"]
+                    links.setdefault((r["receipt"]["payer"], r["receipt"]["hop"]), []).append((x, y, abs(x - y) > max(min_bytes, margin * max(x, y))))
+            for (payer, hop), ws in sorted(links.items()):
+                gap(payer, hop, list(reversed(ws)), margin, min_bytes)
+        order = {"bad": 0, "warn": 1, "info": 2}
+        items.sort(key=lambda i: order.get(i["level"], 3))
+        return {"items": items, "checked_at": now}
 
     def dashboard_path(self):
         for p in ((self.config.get("dashboard"),) if self.config.get("dashboard") else ()) + DASHBOARD_PATHS:
