@@ -6,15 +6,20 @@
 Covers: signing and tamper detection, the agreeing window, the two kinds of
 disagreement and the rule that settles them, the clock rule, unknown and
 badly signed senders, the outbox when the Mint is down, offline resolution
-with `settle`, and the monthly invoice.
+with `settle`, the monthly invoice, the status report, the hourly commitment
+(the Merkle root, the ledger entry, /commitments, the report, `prove` and
+`verify-proof`) and the rebuild of the ledger from the parties' copies.
 """
 
+import contextlib
+import io
 import json
 import os
 import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import bwkit  # noqa: E402
@@ -66,6 +71,13 @@ class Lab:
         self._patch_hop_clock(self.t)
         return self.payer.receipt_run(self.t + skew)
 
+    def step(self, seconds, payer_total, hop_total):
+        """A window shorter than an hour, as the forced tests make them: several in one hour."""
+        self.meters(payer_total, hop_total)
+        self.t += seconds
+        self._patch_hop_clock(self.t)
+        return self.payer.receipt_run(self.t)
+
     def _patch_hop_clock(self, t):
         self.hop_now = t
 
@@ -86,7 +98,8 @@ class Signing(unittest.TestCase):
         self.assertTrue(bwkit.verify_receipt(nym, r, sig))
         r2 = dict(r, bytes=12346)
         self.assertFalse(bwkit.verify_receipt(nym, r2, sig))
-        self.assertFalse(bwkit.verify_receipt(nym, r, sig[:-2] + "AA"))
+        bent = ("B" if sig[0] != "B" else "C") + sig[1:]      # one character changed, never the same bytes
+        self.assertFalse(bwkit.verify_receipt(nym, r, bent))
         # the canonical form is the Figure 2 tuple in order, so field order in the dict is irrelevant
         shuffled = {k: r[k] for k in reversed(bwkit.FIELDS)}
         self.assertEqual(bwkit.canon(r), bwkit.canon(shuffled))
@@ -123,7 +136,7 @@ class Windows(unittest.TestCase):
         self.assertEqual(s[0]["settled_bytes"], 1_000_000)
         self.assertAlmostEqual(s[0]["amount_usd"], 0.0001)
         kinds = [e["kind"] for e in self.lab.mint.ledger_lines()]
-        self.assertEqual(kinds, ["receipt", "ack", "settlement"])
+        self.assertEqual(kinds, ["receipt", "ack", "settlement", "commitment"])
 
     def test_small_skew_still_agrees(self):
         out = self.lab.hour(100_000_000, 100_000_000 - 500_000)   # half a megabyte of in-flight packets
@@ -403,6 +416,362 @@ class StatusReport(unittest.TestCase):
         with self.assertRaises(ValueError):
             bwkit.assert_public('{"note": "b8:27:eb:6b:1b:09"}')
         bwkit.assert_public('{"bwkit": "0.1.2", "amount_usd": 0.002195, "t": 1792186147, "name": "bw-house"}')
+
+
+class Merkle(unittest.TestCase):
+    """The hourly commitment's parts, with no node: leaves, roots, paths, signatures and proofs."""
+
+    def settlement(self, i, **kw):
+        s = {"kind": "settlement", "t": 1_800_000_000 + i, "payer": "ed25519:p", "hop": "ed25519:h", "hop_index": 1,
+             "t_first": 1_800_000_000 + 60 * i, "t_last": 1_800_000_000 + 60 * i + 60,
+             "payer_bytes": 1000 * i, "hop_bytes": 1000 * i, "settled_bytes": 1000 * i, "status": "settled",
+             "rule": "r", "receipt_sig": "sig%d" % i, "ack_sig": "ack%d" % i, "price_usd_per_gb": 0.1, "amount_usd": 0.0}
+        s.update(kw)
+        return s
+
+    def test_one_leaf_root_is_its_own_hash(self):
+        s = self.settlement(1)
+        leaf = bwkit.leaf_of(s)
+        self.assertEqual(len(leaf), 32)
+        self.assertEqual(bwkit.merkle_root([leaf]), leaf)
+        self.assertEqual(bwkit.merkle_path([leaf], 0), [])
+        self.assertTrue(bwkit.merkle_check(leaf, [], leaf.hex()))
+        # the leaf is over the entry without t (the Mint's own clock), whatever the field order
+        self.assertEqual(bwkit.leaf_of(dict(s, t=5)), leaf)
+        self.assertEqual(bwkit.leaf_of({k: s[k] for k in reversed(list(s))}), leaf)
+        self.assertNotEqual(bwkit.leaf_of(dict(s, settled_bytes=1001)), leaf)
+        with self.assertRaises(ValueError):
+            bwkit.merkle_root([])
+
+    def test_several_leaves_and_their_paths(self):
+        for n in (2, 3, 4, 5, 7, 8):
+            ss, leaves = bwkit.hour_leaves([self.settlement(i) for i in reversed(range(n))])
+            self.assertEqual([s["t_first"] for s in ss], sorted(s["t_first"] for s in ss))   # leaves go by window start
+            root = bwkit.merkle_root(leaves).hex()
+            for i, leaf in enumerate(leaves):
+                path = bwkit.merkle_path(leaves, i)
+                self.assertTrue(path)
+                self.assertTrue(bwkit.merkle_check(leaf, path, root), (n, i))
+                # a byte changed in the settlement, a byte changed in the path, the sides swapped
+                changed = bwkit.leaf_of(dict(ss[i], settled_bytes=ss[i]["settled_bytes"] + 1))
+                self.assertFalse(bwkit.merkle_check(changed, path, root), (n, i))
+                bent = [[side, ("1" if h[0] == "0" else "0") + h[1:]] for side, h in path]
+                self.assertFalse(bwkit.merkle_check(leaf, bent, root), (n, i))
+                swapped = [["L" if side == "R" else "R", h] for side, h in path]
+                self.assertFalse(bwkit.merkle_check(leaf, swapped, root), (n, i))
+            # the root depends on the set and the order
+            self.assertNotEqual(bwkit.merkle_root(leaves[:-1] + [bwkit.leaf_of(self.settlement(99))]).hex(), root)
+            self.assertNotEqual(bwkit.merkle_root(list(reversed(leaves))).hex(), root)
+            self.assertNotEqual(bwkit.merkle_root(leaves[:-1]).hex() if n > 2 else None, root)
+
+    def test_commitment_signature(self):
+        priv = bwkit.Ed25519PrivateKey.generate()
+        ss = [self.settlement(1), self.settlement(2)]
+        c = bwkit.make_commitment(priv, ss, 1_800_000_000, now=7)
+        self.assertEqual((c["kind"], c["window"], c["count"], c["t"]), ("commitment", 1_800_000_000, 2, 7))
+        self.assertEqual(c["mint"], bwkit.nym_of_pub(priv.public_key()))
+        self.assertEqual(c["root"], bwkit.merkle_root([bwkit.leaf_of(s) for s in ss]).hex())
+        self.assertTrue(bwkit.verify_commitment(c))
+        other = bwkit.nym_of_pub(bwkit.Ed25519PrivateKey.generate().public_key())
+        for bad in (dict(c, count=1), dict(c, window=c["window"] + 3600), dict(c, root="0" * 64),
+                    dict(c, signature=c["signature"][:-2] + "AA"), dict(c, mint=other), dict(c, signature=None)):
+            self.assertFalse(bwkit.verify_commitment(bad))
+        unsigned = bwkit.make_commitment(None, ss, 1_800_000_000, now=7)    # what a rebuild makes
+        self.assertEqual(unsigned["root"], c["root"])
+        self.assertEqual((unsigned["mint"], unsigned["signature"]), (None, None))
+        self.assertFalse(bwkit.verify_commitment(unsigned))
+
+    def test_proof_verifies_and_fails_after_a_changed_byte(self):
+        priv = bwkit.Ed25519PrivateKey.generate()
+        ss = [self.settlement(i) for i in range(3)]
+        c = bwkit.make_commitment(priv, ss, 1_800_000_000, now=7)
+        doc = bwkit.make_proof(c, ss)
+        self.assertEqual((doc["kind"], doc["window"], doc["count"], len(doc["settlements"])), ("proof", 1_800_000_000, 3, 3))
+        ok, lines = bwkit.check_proof(doc)
+        self.assertTrue(ok, lines)
+        self.assertEqual(len(lines), 4)
+        self.assertIn("signature ok", lines[0])
+        self.assertTrue(all("included" in line for line in lines[1:]), lines)
+        self.assertTrue(bwkit.check_proof(doc, mint=c["mint"])[0])
+        doc2 = json.loads(json.dumps(doc))                   # through a file and back
+        self.assertTrue(bwkit.check_proof(doc2)[0])
+        doc2["settlements"][1]["settlement"]["settled_bytes"] += 1
+        ok, lines = bwkit.check_proof(doc2)
+        self.assertFalse(ok)
+        self.assertIn("included", lines[1])
+        self.assertIn("NOT in the commitment", lines[2])
+        doc3 = json.loads(json.dumps(doc))
+        doc3["root"] = "f" * 64                               # a root the Mint never signed
+        ok, lines = bwkit.check_proof(doc3)
+        self.assertFalse(ok)
+        self.assertIn("signature BAD", lines[0])
+        ok, lines = bwkit.check_proof(doc, mint="ed25519:" + "A" * 43)
+        self.assertFalse(ok)
+        self.assertIn("not ed25519:AAAA", lines[0])
+        self.assertFalse(bwkit.check_proof({"kind": "receipt"})[0])
+        with self.assertRaises(ValueError):
+            bwkit.make_proof(c, ss[:2])                       # not the settlements the commitment is over
+
+
+class Commitments(unittest.TestCase):
+    """The Mint's hourly commitment: on the ledger, at /commitments, in the report, proved and verified."""
+
+    def setUp(self):
+        self.lab = Lab()
+
+    def tearDown(self):
+        self.lab.close()
+
+    def test_each_settlement_appends_a_signed_commitment(self):
+        self.lab.hour(1_000_000, 1_000_000)
+        self.lab.step(600, 3_000_000, 2_000_000)
+        entries = self.lab.mint.ledger_lines()
+        self.assertEqual([e["kind"] for e in entries], ["receipt", "ack", "settlement", "commitment"] * 2)
+        s1, s2 = [e for e in entries if e["kind"] == "settlement"]
+        c1, c2 = [e for e in entries if e["kind"] == "commitment"]
+        self.assertEqual((c1["window"], c2["window"]), (s1["t_first"], s2["t_first"]))   # the hour the window started in
+        self.assertEqual((c1["window"] % 3600, c2["window"] - c1["window"]), (0, 3600))
+        self.assertEqual((c1["count"], c2["count"]), (1, 1))
+        self.assertEqual((c1["mint"], c1["t"]), (self.lab.mint.nym, s1["t"]))
+        self.assertTrue(bwkit.verify_commitment(c1) and bwkit.verify_commitment(c2))
+        self.assertEqual(c1["root"], bwkit.leaf_of(s1).hex())          # one leaf: its own hash
+        # the endpoint: the current commitment of every hour, oldest first
+        status, body = bwkit.http_get(self.lab.mint_url + "/commitments")
+        self.assertEqual(status, 200)
+        self.assertEqual([(c["window"], c["root"], c["signature"], c["count"]) for c in json.loads(body)],
+                         [(c["window"], c["root"], c["signature"], c["count"]) for c in (c1, c2)])
+        # a second window in the same hour, as the forced tests make them: a new commitment over both
+        self.lab.step(600, 3_500_000, 2_500_000)
+        entries = self.lab.mint.ledger_lines()
+        s3, c3 = entries[-2], entries[-1]
+        self.assertEqual((s3["kind"], c3["kind"], c3["window"], c3["count"]), ("settlement", "commitment", c2["window"], 2))
+        self.assertEqual(c3["root"], bwkit.merkle_root([bwkit.leaf_of(s2), bwkit.leaf_of(s3)]).hex())
+        self.assertTrue(bwkit.verify_commitment(c3))
+        got = json.loads(bwkit.http_get(self.lab.mint_url + "/commitments")[1])
+        self.assertEqual([(c["window"], c["count"], c["signature"]) for c in got],
+                         [(c1["window"], 1, c1["signature"]), (c2["window"], 2, c3["signature"])])
+        st = json.loads(bwkit.http_get(self.lab.mint_url + "/status")[1])
+        self.assertEqual((st["commitments"], st["settlements"], st["ledger_lines"]), (2, 3, 12))
+        # the payer's own record of the Mint's answers carries the Mint's signed commitment
+        with open(self.lab.payer.path("sent.jsonl")) as f:
+            sent = [json.loads(line) for line in f]
+        self.assertEqual(sent[-1]["mint"]["commitments"], [c3])
+        # the ledger listing names it
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), mock.patch.dict(os.environ, self.mint_env()):
+            self.assertEqual(bwkit.main(["ledger"]), 0)
+        self.assertEqual(sum(1 for line in out.getvalue().splitlines() if "COMMIT" in line), 3)
+
+    def test_report_carries_the_latest_root_and_nothing_else_new(self):
+        self.assertIsNone(self.lab.mint.status_report(now=self.lab.t)["commitment"])
+        self.lab.hour(1_000_000, 1_000_000)
+        self.lab.hour(2_000_000, 2_000_000)
+        rep = self.lab.mint.status_report(now=self.lab.t + 60, service=True)
+        self.assertEqual(set(rep), {"v", "generated_at", "bwkit", "phase", "window_s", "since", "service", "ledger", "nodes", "commitment"})
+        c = self.lab.mint.ledger_lines()[-1]
+        self.assertEqual(rep["commitment"], {"t": c["t"], "window": self.lab.t - 3600, "root": c["root"], "count": 1, "signature": c["signature"]})
+        self.assertTrue(bwkit.verify_commitment(dict(rep["commitment"], mint=self.lab.mint.nym)))
+        for n in rep["nodes"]:
+            self.assertEqual(set(n), {"name", "role", "last_receipt", "window_bytes", "window_t_first", "window_t_last",
+                                      "receipts", "windows", "disputed", "total_bytes", "history"})
+        text = json.dumps(rep)
+        self.assertNotIn("ed25519:", text)                   # the Mint's NYM stays out
+        bwkit.assert_public(text)
+
+    def test_a_ledger_from_before_commitments_starts_with_the_next_window(self):
+        self.lab.hour(1_000_000, 1_000_000)
+        self.lab.step(600, 2_000_000, 2_000_000)
+        hour_a, hour_b = self.lab.t - 3600 - 600, self.lab.t - 600
+        with open(self.lab.mint.path("ledger.jsonl")) as f:
+            lines = [line for line in f if '"kind": "commitment"' not in line]
+        with open(self.lab.mint.path("ledger.jsonl"), "w") as f:
+            f.writelines(lines)
+        self.lab.mint.load_index()                           # a Mint upgraded with two settled windows and no commitment
+        self.assertEqual(json.loads(bwkit.http_get(self.lab.mint_url + "/commitments")[1]), [])
+        self.assertIsNone(self.lab.mint.status_report(now=self.lab.t)["commitment"])
+        with self.assertRaises(SystemExit):
+            self.lab.mint.proof(hour_a)
+        self.lab.step(600, 3_000_000, 3_000_000)             # the next settled window, in hour B
+        got = json.loads(bwkit.http_get(self.lab.mint_url + "/commitments")[1])
+        self.assertEqual([(c["window"], c["count"]) for c in got], [(hour_b, 2)])   # over both of hour B's, none for hour A
+        with self.assertRaises(SystemExit):
+            self.lab.mint.proof(hour_a)
+        doc = self.lab.mint.proof(hour_b)
+        self.assertEqual(doc["count"], 2)
+        self.assertTrue(bwkit.check_proof(doc, mint=self.lab.mint.nym)[0])
+        self.assertEqual(self.lab.mint.status_report(now=self.lab.t)["commitment"]["window"], hour_b)
+
+    def mint_env(self):
+        cfg = os.path.join(self.lab.root, "mint-config.json")
+        with open(cfg, "w") as f:
+            json.dump(self.lab.mint.config, f)
+        return {"BWKIT_DIR": self.lab.mint.dir, "BWKIT_CONFIG": cfg}
+
+    def test_prove_and_verify_proof_from_the_command_line(self):
+        import time
+        self.lab.hour(1_000_000, 1_000_000)
+        self.lab.step(600, 3_000_000, 2_000_000)
+        self.lab.step(600, 4_000_000, 4_000_000)
+        hour = self.lab.t - 1200
+        doc = self.lab.mint.proof(hour)
+        self.assertEqual((doc["window"], doc["count"], doc["mint"]), (hour, 2, self.lab.mint.nym))
+        self.assertTrue(bwkit.check_proof(doc, mint=self.lab.mint.nym)[0])
+        self.assertEqual(bwkit.parse_hour(str(hour + 1799)), hour)
+        self.assertEqual(bwkit.parse_hour(time.strftime("%Y-%m-%dT%H", time.localtime(hour))), hour)
+        self.assertEqual(bwkit.parse_hour(time.strftime("%Y-%m-%dT%H:%M", time.localtime(hour + 60))), hour)
+        with self.assertRaises(SystemExit):
+            bwkit.parse_hour("tomorrow")
+        # the command line, with the Mint's directory and config in the environment as the service has them
+        with mock.patch.dict(os.environ, self.mint_env()):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                self.assertEqual(bwkit.main(["prove", str(hour + 1800)]), 0)    # any moment in the hour
+            printed = json.loads(out.getvalue())
+            self.assertEqual(printed, doc)
+            with self.assertRaises(SystemExit):
+                bwkit.main(["prove", str(hour + 7200)])                          # nothing settled in that hour
+        path = os.path.join(self.lab.root, "proof.json")
+        with open(path, "w") as f:
+            json.dump(printed, f)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(bwkit.main(["verify-proof", path]), 0)
+            self.assertEqual(bwkit.main(["verify-proof", path, "--mint", self.lab.mint.nym]), 0)
+            self.assertEqual(bwkit.main(["verify-proof", path, "--mint", self.lab.payer.nym]), 1)
+            printed["settlements"][0]["settlement"]["hop_bytes"] += 1
+            with open(path, "w") as f:
+                json.dump(printed, f)
+            self.assertEqual(bwkit.main(["verify-proof", path]), 1)
+        self.assertIn("NOT in the commitment", out.getvalue())
+
+
+class Rebuild(unittest.TestCase):
+    """The ledger from the parties' signed copies alone, compared with the Mint's."""
+
+    def setUp(self):
+        self.lab = Lab()
+        self.lab.hour(1_000_000, 1_000_000)                  # agreeing
+        self.lab.hour(3_000_000, 2_000_000)                  # the hop under-counts: disputed, settled at 1 MB
+        self.lab.hour(4_000_000, 3_000_000, skew=12)         # the hop declines: a receipt without ack
+        self.lab.step(600, 5_000_000, 4_000_000)             # the hop's count covers both windows: disputed
+        self.lab.step(600, 5_500_000, 4_500_000)             # a second window in that hour, agreeing
+        self.receipts = os.path.join(self.lab.root, "receipts.jsonl")
+        self.acks = os.path.join(self.lab.root, "acks.jsonl")
+        shutil.copy(self.lab.payer.path("receipts.jsonl"), self.receipts)   # bw-house's copy
+        shutil.copy(self.lab.hop.path("acks.jsonl"), self.acks)             # bw-forest's copy
+        self.ledger = self.lab.mint.path("ledger.jsonl")
+
+    def tearDown(self):
+        self.lab.close()
+
+    def rebuild(self):
+        return bwkit.rebuild(bwkit.read_jsonl(self.receipts)[0], bwkit.read_jsonl(self.acks)[0], now=self.lab.t + 9)
+
+    def run_cli(self, *args):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            rc = bwkit.main(["rebuild", self.receipts, self.acks] + list(args))
+        return rc, out.getvalue().splitlines()
+
+    def test_rebuild_agrees_with_the_mint(self):
+        entries, rep = self.rebuild()
+        self.assertEqual(rep, {"receipts": 5, "acks": 4, "settlements": 4, "disputed": 2, "hours": 3,
+                               "receipts_without_ack": 1, "acks_without_receipt": 0, "bad": []})
+        self.assertEqual([e["kind"] for e in entries],
+                         ["receipt", "ack", "settlement", "commitment"] * 2 + ["receipt"] + ["receipt", "ack", "settlement"] * 2 + ["commitment"])
+        mint = self.lab.mint.ledger_lines()
+        mine = {e["receipt_sig"]: e for e in entries if e["kind"] == "settlement"}
+        theirs = {e["receipt_sig"]: e for e in mint if e["kind"] == "settlement"}
+        self.assertEqual(set(mine), set(theirs))
+        for sig in mine:                                      # the same settlement but for t, the Mint's clock
+            self.assertEqual({k: v for k, v in mine[sig].items() if k != "t"}, {k: v for k, v in theirs[sig].items() if k != "t"})
+        my_c = {e["window"]: e for e in entries if e["kind"] == "commitment"}
+        their_c = {}
+        for e in mint:
+            if e["kind"] == "commitment":
+                their_c[e["window"]] = e
+        self.assertEqual({w: (c["root"], c["count"]) for w, c in my_c.items()}, {w: (c["root"], c["count"]) for w, c in their_c.items()})
+        self.assertEqual({c["signature"] for c in my_c.values()}, {None})   # only the Mint can sign
+        agree, verdict, lines = bwkit.compare(entries, mint)
+        self.assertTrue(agree, (verdict, lines))
+        self.assertEqual(verdict, "AGREE: 4 settlements in 3 hours rebuilt from the parties' copies match the Mint's ledger and its 3 commitments")
+        self.assertEqual(lines, [])
+        # the command line: the comparison, and a ledger a fresh Mint can load
+        rc, out = self.run_cli("--compare", self.ledger)
+        self.assertEqual(rc, 0)
+        self.assertTrue(out[0].startswith("rebuilt 5 receipts and 4 acks into 4 settlements (2 disputed) in 3 hours"), out)
+        self.assertTrue(out[1].startswith("AGREE"), out)
+        path = os.path.join(self.lab.root, "rebuilt.jsonl")
+        rc, out = self.run_cli("--ledger", path)
+        self.assertEqual(rc, 0)
+        fresh_dir = os.path.join(self.lab.root, "mint2")
+        os.makedirs(fresh_dir)
+        shutil.copy(path, os.path.join(fresh_dir, "ledger.jsonl"))
+        shutil.copy(self.lab.mint.path("peers.json"), os.path.join(fresh_dir, "peers.json"))
+        fresh = bwkit.Node(fresh_dir, self.lab.mint.config)
+        fresh.load_index()
+        self.assertEqual((len(fresh.index["settled"]), len(fresh.index["commitments"])), (4, 3))
+        self.assertIsNone(fresh.index["last_commitment"]["signature"])
+        no_ack, no_receipt = fresh.pending()
+        self.assertEqual((len(no_ack), len(no_receipt)), (1, 0))
+        rep2 = fresh.status_report(now=self.lab.t)
+        self.assertEqual((rep2["ledger"]["settlements"], rep2["ledger"]["receipts_without_ack"]), (4, 1))
+        self.assertEqual(bwkit.compare(fresh.ledger_lines(), mint)[0], True)
+
+    def test_rebuild_disagrees_when_the_mint_alters_a_settlement(self):
+        mint = self.lab.mint.ledger_lines()
+        s2 = [e for e in mint if e["kind"] == "settlement"][1]
+        altered = [dict(e, settled_bytes=2_000_000, amount_usd=0.0002) if e is s2 else e for e in mint]
+        with open(self.ledger, "w") as f:
+            for e in altered:
+                f.write(json.dumps(e, sort_keys=True) + "\n")
+        entries, rep = self.rebuild()
+        agree, verdict, lines = bwkit.compare(entries, altered)
+        self.assertFalse(agree)
+        self.assertEqual(verdict, "DIFFER in window %d..%d and hour %d" % (s2["t_first"], s2["t_last"], s2["t_first"]))
+        self.assertEqual(len(lines), 2, lines)
+        self.assertIn("window %d..%d: amount_usd 0.0001 here, 0.0002 on the Mint; settled_bytes 1000000 here, 2000000 on the Mint" % (
+            s2["t_first"], s2["t_last"]), lines[0])
+        self.assertEqual(lines[1], "hour %d: the Mint's own ledger no longer matches the commitment it signed" % s2["t_first"])
+        rc, out = self.run_cli("--compare", self.ledger)
+        self.assertEqual(rc, 1)
+        self.assertTrue(out[1].startswith("DIFFER in window"), out)
+        self.assertEqual(len(out), 4)
+
+    def test_rebuild_sees_an_omitted_window_and_a_forged_copy(self):
+        mint = self.lab.mint.ledger_lines()
+        s1, s2 = [e for e in mint if e["kind"] == "settlement"][:2]
+        # the Mint drops a settlement and its commitment, as if the window had never settled
+        without = [e for e in mint if not (e["kind"] == "settlement" and e["receipt_sig"] == s2["receipt_sig"])
+                   and not (e["kind"] == "commitment" and e["window"] == s2["t_first"])]
+        entries, rep = self.rebuild()
+        agree, verdict, lines = bwkit.compare(entries, without)
+        self.assertFalse(agree)
+        self.assertEqual(verdict, "DIFFER in window %d..%d" % (s2["t_first"], s2["t_last"]))
+        self.assertEqual(lines, ["window %d..%d: settled from the parties' copies, not on the Mint's ledger" % (s2["t_first"], s2["t_last"]),
+                                 "hour %d: no commitment on the Mint's ledger (1 settlement rebuilt)" % s2["t_first"]])
+        # the hop's copy carries an ack that was changed after signing: left out, so that window is the Mint's word alone
+        with open(self.acks) as f:
+            acks = [json.loads(line) for line in f]
+        acks[0]["receipt"]["bytes"] += 1
+        with open(self.acks, "w") as f:
+            for a in acks:
+                f.write(json.dumps(a) + "\n")
+        entries, rep = self.rebuild()
+        self.assertEqual(rep["bad"], ["acks.jsonl line 1: bad signature"])
+        self.assertEqual((rep["settlements"], rep["receipts_without_ack"]), (3, 2))
+        agree, verdict, lines = bwkit.compare(entries, mint)
+        self.assertFalse(agree)
+        self.assertEqual(verdict, "DIFFER in window %d..%d and hour %d" % (s1["t_first"], s1["t_last"], s1["t_first"]))
+        self.assertEqual(lines, ["window %d..%d: on the Mint's ledger, not in the parties' copies" % (s1["t_first"], s1["t_last"]),
+                                 "hour %d: the Mint committed to 1 settlement; the parties' copies have none in that hour" % s1["t_first"]])
+        rc, out = self.run_cli("--compare", self.ledger)
+        self.assertEqual(rc, 1)
+        self.assertIn("1 lines left out", out[0])
+        # a ledger the Mint never had: the rebuild alone, printed
+        rc, out = self.run_cli()
+        self.assertEqual(rc, 1)                               # the forged line
+        self.assertEqual(sum(1 for line in out if '"kind": "settlement"' in line), 3)
 
 
 if __name__ == "__main__":
