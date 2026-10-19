@@ -24,8 +24,8 @@ The first two are the month's tests from `phase0/NEIGHBOR.md`, not run yet. The 
 The plan is `radio/PLAN.md` (Oct 19, 2026); the codec and its tests are written. In the plan's order, what is open:
 
 - **The radios on the desk** (steps 1 and 2): region, names, the private channel, broadcasts off; then RSSI and SNR for an hour next door and at the cabin spot through the trees, at LongFast and at MediumFast, written into the plan. Hands-on; no code.
-- **The Pis** (step 3): the udev rule, `dialout`, the venv with `meshtastic`, as `phase0/provision.sh radio`, not yet written; `bw-cabin` (Pi 5) flashed and provisioned as a hop on the bench, added to the peer lists and the map's `nodes`.
-- **The carrier** (step 6): `radio/bwradio.py` against a fake mesh in `radio/test_radio.py`, then on the bench with the IP path forced off.
+- **The Pis** (step 3): `phase0/provision.sh radio` is written (udev rule, `dialout`, the venv with `meshtastic`, `bwradio` and its unit; a second run with `RADIO_IDS` writes the configs); `bw-cabin` (Pi 5) and `bw-mint2` (Pi 6) still to be flashed (the cards, with the house Wi-Fi and the tailnet, from the Mac's `~/.config/bwkit/` env files as the neighbor's was) and provisioned, `bw-cabin` as a hop on the bench, added to the peer lists and the map's `nodes`.
+- **The carrier** (step 6): written against the fake mesh (7 scenarios pass). Left: the Meshtastic adapter against a board, then a real window by radio on the bench with the tunnel cut. The hop's link should announce `clock_tolerance_s: 15` first (radio/PLAN.md, Section 3).
 - **The test** (step 7), the HaLow pair (step 8) and `bw-mint2` (step 9, Pi 6) follow.
 
 ## Kit fixes

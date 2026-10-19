@@ -1,0 +1,20 @@
+[Unit]
+Description=bwkit: the radio carrier (receipts, acknowledgements and liveness over LoRa)
+After=network-online.target bwkit.service
+Wants=network-online.target
+# The T-Beam on USB, named by the udev rule provision.sh radio installs; without it there is nothing to carry.
+ConditionPathExists=/dev/bwradio
+
+[Service]
+Type=simple
+User=bwkit
+Group=bwkit
+Environment=PYTHONUNBUFFERED=1
+Environment=BWRADIO_LIB=/usr/local/lib/bwradio
+Environment=BWKIT_PATH=/usr/local/bin/bwkit
+ExecStart=/opt/bwradio/bin/python /usr/local/bin/bwradio run
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

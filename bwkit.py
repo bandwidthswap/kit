@@ -1637,6 +1637,9 @@ class Node:
             raise ValueError("this receipt names another hop")
         if signer not in self.peers():
             raise Decline("unknown payer %s" % signer)
+        held = self.held_ack(env["sig"])
+        if held:
+            return held                             # asked twice (a retry, or once by HTTP and once by radio): the same ack, not a second one
         link = self.my_link()
         tol = link["clock_tolerance_s"]
         if abs(now - r["t_last"]) > tol:
@@ -1668,6 +1671,24 @@ class Node:
         if self.config.get("mint"):
             self.flush_later(HOP_FLUSH_DELAY_S)   # our own copy, in case the payer drops an ack it dislikes
         return ack
+
+    def held_ack(self, receipt_sig):
+        """Hop: the acknowledgement this node already signed for the receipt with this signature, or None."""
+        p = self.path("acks.jsonl")
+        if not os.path.exists(p):
+            return None
+        with open(p) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    a = json.loads(line)
+                except ValueError:
+                    continue
+                if a.get("kind") == "ack" and a.get("receipt", {}).get("prev_sig") == receipt_sig:
+                    return a
+        return None
 
     def announce(self, now=None, since=None, post=True):
         """Hop: sign this link's parameters and register them with the Mint (spec, Section 7). Returns (record, hash)."""

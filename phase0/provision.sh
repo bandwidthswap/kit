@@ -13,6 +13,12 @@
 #                                  removed, the ten-minute timer enabled and a signed report sent
 #   phase0/provision.sh map        bw-mint: sign the membership's map and post it to the feed (bwkit map post), which
 #                                  then lists the Mint
+#   phase0/provision.sh radio      the radio carrier (radio/PLAN.md) on RADIO_NODES (default: bw-house bw-neighbor), each
+#                                  with a T-Beam on USB: the udev rule for /dev/bwradio, the bwkit user in dialout, the
+#                                  venv at /opt/bwradio with the Meshtastic API, bwradio and its unit; prints each board's
+#                                  radio id. With RADIO_IDS="bw-house=!a1b2c3d4 bw-neighbor=!e5f6a7b8 ..." it also writes
+#                                  the `radio` object into each node's config (the gateway is RADIO_GATEWAY, bw-house) and
+#                                  starts the carrier
 #   phase0/provision.sh steward    bw-mint: the Network Steward (PLAN.md 2.4): the map (phase0/map.json to /etc/bwkit/map.json),
 #                                  the Steward's key, the Mint restarted so it accepts the Steward's postings, and the hourly
 #                                  bwkit-steward.timer (five past the hour, after the commitment); run once at the end
@@ -229,6 +235,46 @@ PY"
   check_status
 }
 
+step_radio() {
+  nodes="${RADIO_NODES:-bw-house bw-neighbor}"
+  gateway="${RADIO_GATEWAY:-bw-house}"
+  say "the radio carrier on $nodes"
+  for h in $nodes; do
+    COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - radio/bwradio.py radio/wire.py systemd/bwkit-radio.service | ssh_to "$h" 'mkdir -p ~/kit && tar -C ~/kit -xf - && sudo install -d -m 0755 /usr/local/lib/bwradio && sudo install -m 0644 ~/kit/radio/wire.py /usr/local/lib/bwradio/wire.py && sudo install -m 0755 ~/kit/radio/bwradio.py /usr/local/bin/bwradio && sudo install -m 0644 ~/kit/systemd/bwkit-radio.service /etc/systemd/system/ && sudo usermod -aG dialout bwkit && (test -x /opt/bwradio/bin/python || sudo python3 -m venv /opt/bwradio) && sudo /opt/bwradio/bin/pip install -q --upgrade meshtastic && sudo systemctl daemon-reload && echo "'"$h"': bwradio installed, meshtastic $(/opt/bwradio/bin/pip show meshtastic 2>/dev/null | sed -n "s/^Version: //p")"'
+    # The T-Beam Supreme is an ESP32-S3 on native USB (Espressif 303a:1001). Another board: `udevadm info -q property -n /dev/ttyACM0 | grep ID_`
+    sudo_sh "$h" <<'EOS'
+set -e
+cat > /etc/udev/rules.d/80-bwradio.rules <<'RULE'
+# bwkit: the node's LoRa board (LILYGO T-Beam Supreme, ESP32-S3 native USB) as /dev/bwradio
+SUBSYSTEM=="tty", ATTRS{idVendor}=="303a", ATTRS{idProduct}=="1001", SYMLINK+="bwradio", MODE="0660", GROUP="dialout"
+RULE
+udevadm control --reload-rules && udevadm trigger --subsystem-match=tty
+sleep 1
+if [ -e /dev/bwradio ]; then echo "$(hostname): /dev/bwradio -> $(readlink /dev/bwradio)"; else echo "$(hostname): no /dev/bwradio yet (is the board plugged in? its ids: udevadm info -q property -n /dev/ttyACM0 | grep ID_)"; fi
+EOS
+    run "$h" 'test -e /dev/bwradio && sudo -u bwkit /opt/bwradio/bin/meshtastic --port /dev/bwradio --info 2>/dev/null | grep -E "^Owner|myNodeNum|"id": "!" | head -3 || true'
+  done
+  if [ -n "${RADIO_IDS:-}" ]; then
+    say "the radio object in each node's config"
+    for h in $nodes; do
+      gw=false; [ "$h" = "$gateway" ] && gw=true
+      run "$h" "sudo python3 - <<'PY'
+import json, os
+ids = dict(x.split('=', 1) for x in '$RADIO_IDS'.split())
+p = '/etc/bwkit/config.json'; c = json.load(open(p))
+peers = json.load(open('/var/lib/bwkit/peers.json')) if os.path.exists('/var/lib/bwkit/peers.json') else {}
+radio = c.get('radio') or {}
+radio.update({'port': '/dev/bwradio', 'gateway': $gw, 'peers': {nym: ids[name] for nym, name in peers.items() if name in ids}})
+if not $gw: radio['gateway_id'] = ids.get('$gateway')
+c['radio'] = radio; json.dump(c, open(p, 'w'), indent=2); print('$h: radio', json.dumps(radio))
+PY"
+      run "$h" 'sudo systemctl enable -q --now bwkit-radio && sleep 2 && systemctl is-active bwkit-radio && journalctl -u bwkit-radio -n 2 --no-pager -o cat'
+    done
+  else
+    echo "no RADIO_IDS given: the configs are untouched; run again with RADIO_IDS="bw-house=!... bw-neighbor=!..." from the ids printed above"
+  fi
+}
+
 step_map() {
   say "the membership's map, signed by bw-mint, posted to the feed"
   run bw-mint 'sudo -u bwkit bwkit map post'
@@ -257,8 +303,9 @@ case "${1:-}" in
   update) step_update ;;
   status) step_status ;;
   map) step_map ;;
+  radio) step_radio ;;
   steward) step_steward ;;
   check) check_time; check_tunnel; check_kit; check_status ;;
   all) step_upgrade; step_time; step_tunnel; step_logs; step_kit ;;
-  *) sed -n '2,20p' "$0"; exit 2 ;;
+  *) sed -n '2,26p' "$0"; exit 2 ;;
 esac

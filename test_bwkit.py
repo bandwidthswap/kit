@@ -306,6 +306,31 @@ class Windows(unittest.TestCase):
         self.assertEqual(fresh.pending(), ([], []))
 
 
+class RepeatedAsk(unittest.TestCase):
+    def setUp(self):
+        self.lab = Lab()
+
+    def tearDown(self):
+        self.lab.close()
+
+    def test_a_repeated_ack_request_returns_the_held_ack(self):
+        """A receipt presented twice (a retry over HTTP, or once by HTTP and once by radio) gets the one ack the hop
+        signed, not a second one with a second count, which the Mint would refuse as a replay."""
+        self.lab.hour(1_000, 1_000)
+        env = json.loads(open(self.lab.payer.path("receipts.jsonl")).read().splitlines()[-1])
+        first = json.loads(open(self.lab.hop.path("acks.jsonl")).read().splitlines()[-1])
+        again = self.lab.hop.ack(env)
+        self.assertEqual(again["sig"], first["sig"])
+        self.assertEqual(len(open(self.lab.hop.path("acks.jsonl")).read().splitlines()), 1)
+        status, body = bwkit.http_post(self.lab.hop_url + "/ack", env)      # over HTTP too
+        self.assertEqual((status, body["sig"]), (200, first["sig"]))
+        self.lab.meters(5_000, 5_000)
+        self.lab.t += 3600
+        self.lab._patch_hop_clock(self.lab.t)
+        self.lab.payer.receipt_run(self.lab.t)                                # the next window is new and gets its own ack
+        self.assertEqual(len(open(self.lab.hop.path("acks.jsonl")).read().splitlines()), 2)
+
+
 class StatusReport(unittest.TestCase):
     """The Mint's summary for the status page: names and roles, nothing about the network."""
 
