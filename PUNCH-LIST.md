@@ -19,6 +19,15 @@ The first two are the month's tests from `phase0/NEIGHBOR.md`, not run yet. The 
 
 - **DHCP reservations on the gateway** for the three bench nodes, so the addresses in the site repo's `PHASE0-SETUP.md` stay true. Open since Oct 16 and never recorded as done. It is hands-on; the clicks are in that file, under "DHCP reservations on the gateway".
 
+## Phase 1: the radios
+
+The plan is `radio/PLAN.md` (Oct 19, 2026); the codec and its tests are written. In the plan's order, what is open:
+
+- **The radios on the desk** (steps 1 and 2): region, names, the private channel, broadcasts off; then RSSI and SNR for an hour next door and at the cabin spot through the trees, at LongFast and at MediumFast, written into the plan. Hands-on; no code.
+- **The Pis** (step 3): the udev rule, `dialout`, the venv with `meshtastic`, as `phase0/provision.sh radio`, not yet written; `bw-cabin` (Pi 5) flashed and provisioned as a hop on the bench, added to the peer lists and the map's `nodes`.
+- **The carrier** (step 6): `radio/bwradio.py` against a fake mesh in `radio/test_radio.py`, then on the bench with the IP path forced off.
+- **The test** (step 7), the HaLow pair (step 8) and `bw-mint2` (step 9, Pi 6) follow.
+
 ## Kit fixes
 
 - **The page cannot verify a proof when it is opened at a node's tailnet address.** On Oct 18, "verify here" on the Mint's page and "verify the latest hour here" on bw-neighbor's both said "the signature does not verify" for every hour. The proofs are good. `bwkit verify-proof` passes them, and the same page passes them in two other places: at `http://localhost:8711/` through `ssh -N -L 8711:127.0.0.1:8710 bw-mint-ts` (13:00, 14:00 and 15:00 verified), and in a saved `/snapshot` opened as a file. The cause is the browser. A plain-http page at an address other than localhost is not a secure context, so it has no `crypto.subtle`. `dashboard/bsp.js` needs it for SHA-256 (the leaves) and for Ed25519. Its fallback, noble, needs it for SHA-512. The resulting error is caught and reported as a bad signature. Until it is fixed, verify through the tunnel or from a saved snapshot. To pick it up:

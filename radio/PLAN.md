@@ -1,0 +1,87 @@
+# Phase 1: the control plane on LoRa, a plan
+
+Written Oct 19, 2026, against bwkit 0.5.0, whitepaper v0.6 Section 9 and the site's roadmap. Phase 1 is the offline-settlement test: receipts, acknowledgements and liveness move onto a low-rate radio channel, a radio link replaces the bench cable to the forest node, and the test is to cut the house's internet mid-window and show the window still settles. The radios are on the desk: three LILYGO T-Beam Supreme boards (915 MHz, SX1262, Meshtastic preloaded, GPS), antennas and cables; the Heltec Wi-Fi HaLow pair for the data plane; and two more Raspberry Pi 3 B boards, which this plan makes nodes. Section 6 asks whether this is the best we can do.
+
+## 0. Where we stand
+
+The kit speaks HTTP over IP and nothing else. A payer's hourly job (`receipt_run`) builds and signs the receipt, posts it to the hop's `/ack` and posts both copies to the Mint's `/receipt`; everything meant for the Mint is written to the outbox first and retried every five minutes, so a Mint that is away receives the window later. Nothing of that survives the payer losing its path to the hop: the hop is next door over a tunnel that a third party's server relays, and when the house's internet is cut there is no tunnel, no acknowledgement, and the window is lost by the rule in spec Section 6. That is the gap Phase 1 closes, and it is the claim in the paper's Section 1.
+
+What the radios are and are not for: LoRa carries kilobits a second, a few kilobytes a minute at the most forgiving settings. It carries receipts, acknowledgements, liveness and (later) announcements. It never carries the bytes that are paid for; those cross the data plane (today the tunnel, in Phase 1 the HaLow pair to the forest node), and when the data plane is down there is nothing to settle anyway. The receipt that proves a window was carried must reach the hop and the Mint even when the internet that carried it is gone, and that is a hundred-odd bytes an hour.
+
+## 1. Nodes and radios
+
+| Node | Role | Where | Radio | Reaches the Mint |
+|---|---|---|---|---|
+| `bw-house` | payer; the Mint's radio gateway | the house, wired | T-Beam 1 on USB | on the LAN |
+| `bw-mint` | Mint, Steward | the house, wired | none | is the Mint |
+| `bw-neighbor` | hop (the link in use) | next door, their Wi-Fi | T-Beam 2 on USB | by radio to `bw-house` |
+| `bw-forest` | hop, idle; the bench reference | the bench | none | on the LAN |
+| **`bw-cabin`** (new, Pi 5) | hop at `the-cabin`, the third mapped place | the cabin, through trees; the bench first | T-Beam 3 on USB | by radio to `bw-house` |
+| **`bw-mint2`** (new, Pi 6) | a second Mint, when Phase 1's test has passed; the cabin's cold spare until then | the bench | none (or T-Beam 4, if a fourth is bought) | is a Mint |
+
+The two new boards take the two roles the lab has been missing. `bw-cabin` is the Phase 1 forest node the roadmap always meant: the map has had `the-cabin` as a mapped place with no link since Oct 17, and the Steward's first-link offer has been standing for it; the day `bw-cabin` settles its first window, the Steward's program 3 pays its first bounty, which is the Phase 2 rule running for the first time. `bw-mint2` is the second Mint the spec marks as not in profile 1: the feed, the map and the Worker take any number of Mints since Oct 19, so the first reconciliation between two Mints (whitepaper A.5) can be built on the bench without a second operator. Until the cabin link is proven, Pi 6 is the cabin's spare, flashed identically, since an outdoor node fails in ways a bench node does not. Both need what Phase 0's shopping list gives a node: a 2.5 A supply, an A1 card, a case with a heatsink for the cabin.
+
+The Mint has no radio. `bw-house` is the gateway: whatever reaches its radio for the Mint goes to `bw-mint` over the LAN, which is up when the internet is down. If the house LAN itself is down the Mint is unreachable by design, and the outbox holds everything until it is back, as it does today.
+
+## 2. The wire format: `bwl/1`
+
+A Meshtastic data packet carries at most 237 bytes of payload (`DATA_PAYLOAD_LEN`; confirm the constant on the bench). The kit's records are JSON: the receipt envelope of the spec's vectors is 580 bytes, 464 without `meter`; the acknowledgement 557. Neither fits, and a two-packet message with reassembly over a lossy link is the first thing not to build. So the radio carries a binary form of the signed tuple, and the receiver rebuilds the JSON envelope the Mint and the hop already understand, byte for byte where the signature cares.
+
+Every packet is one byte of magic, one of type, and a fixed body; integers are big-endian.
+
+| Type | Body | Size |
+|---|---|---|
+| 1 receipt | payer fp 8 · hop fp 8 · hop_index 1 · merkle_root 32 · bytes 8 · t_first 4 · t_last 4 · sig 64 | 131 |
+| 2 ack | the same, with prev_sig 64 before sig | 195 |
+| 3 delivered | the first 8 bytes of the record's sig · status 1 (0 stored, 1 duplicate, 2 refused) · reason 1 | 12 |
+| 4 beacon | fp 8 · time 4 · flags 1 · outbox count 1 · last t_last 4 | 20 |
+
+**Fingerprints, not NYMs.** A NYM is 32 bytes; two of them plus a 64-byte signature and a 64-byte `prev_sig` make an acknowledgement 243 bytes, six over the limit. An 8-byte fingerprint (the first 8 bytes of the public key) names a peer the receiver already holds in its peer list, which every node has (spec Section 2: a Mint and a hop check signatures and their peer list and nothing else). The receiver maps the fingerprint back to the full NYM, rebuilds the eight-field tuple, and verifies the signature over the spec's canonical array exactly as it does for an envelope that came over HTTP. A fingerprint that matches no peer, or two, is refused before anything is verified. Nothing cryptographic rests on the fingerprint: it is a lookup key, and the Ed25519 signature over the full NYMs is what is checked.
+
+**What is left behind.** `meter` (the payer's readings behind the root; informational, spec Section 4) is not carried, and the rebuilt envelope has `meter: null`; the readings reach the Mint later over IP or not at all, and the receipt commits to them through `merkle_root` either way. `from` is set from the peer list, `impl` to `bwl/1`, `proto` to 1. The Mint stores what it rebuilt; a later arrival of the same record over IP is a 409 `duplicate`, which the outbox treats as sent.
+
+**Why fixed fields.** Varints would save twenty bytes and cost a parser; the fixed layout leaves 42 bytes of headroom on the acknowledgement and is the same in Python on a Pi and in anything else. `bytes` is 64 bits (a window of the data plane can exceed 4 GB), times are 32 bits (good until 2106), `hop_index` is 1 byte (profile 1 has one hop).
+
+`radio/wire.py` is the codec, dependency-free: `encode(envelope)` and `decode(packet, peers)`, with `beacon` and `delivered` beside them. `radio/test_wire.py` runs the spec's vectors through it and verifies the rebuilt envelopes with `bwkit.check_envelope`, so the radio form and the HTTP form are the same record.
+
+## 3. The carrier: `bwradio`
+
+A sidecar, not a change to `bwkit.py`. `bwkit.py` stays one file with no dependencies; the radio needs the Meshtastic Python API (`meshtastic`, which brings `pyserial`, `protobuf` and `pypubsub`), so it lives in its own virtualenv on the nodes that have a radio and runs as `bwkit-radio.service`. It imports `bwkit` as a module for the record checks and the outbox, and talks to the local node over the loopback HTTP the node already serves.
+
+What it does, by role:
+
+- **Payer (`bw-house`).** Watches the outbox. A receipt that has sat there past a short grace (the HTTP path gets the first try, as today) is sent by radio to the hop's node, so the hop can acknowledge, and to the Mint's gateway. An acknowledgement arriving by radio is checked (`check_envelope`, the hop's NYM, `prev_sig` equal to the receipt's signature), appended to `acks.jsonl` and put in the outbox, exactly as `receipt_run` does with one that came over HTTP. A `delivered` from the Mint's gateway moves the outbox file to `sent/`.
+- **Hop (`bw-neighbor`, `bw-cabin`).** A receipt arriving by radio is posted to the node's own `/ack` on loopback; the acknowledgement that comes back is sent by radio to the payer and to the Mint's gateway (the hop's own copy, spec Section 5). The hop's outbox is watched the same way for the copy, so a declined or late radio send is retried.
+- **The Mint's gateway (`bw-house`, since the Mint has no radio).** A receipt or acknowledgement arriving by radio for the Mint is rebuilt and posted to `bw-mint`'s `/receipt` over the LAN; the answer becomes a `delivered` back to the sender: stored, duplicate, or refused with the reason code. A node that is both payer and gateway (as `bw-house` is) short-circuits its own records over the LAN and never puts them on the air.
+- **Every node with a radio** sends a beacon every ten minutes: its fingerprint, its time, flags (serving, outbox non-empty), how many records wait, and the `t_last` of its latest window. The Mint's gateway writes the beacons it hears to a small file the Mint's report can carry as `radio: {node: {heard, outbox, ...}}`, so the page can say "heard by radio 3 min ago" about a node whose IP path is down. That is the liveness the roadmap names, and it is informational.
+
+Addressing: Meshtastic names a radio by its node number; `bwradio`'s config maps each peer's NYM to its radio (`radio.peers: {"<NYM>": "!a1b2c3d4"}`) and names the gateway's. The LoRa channel is private (a Meshtastic channel with its own PSK, AES-256), which keeps the packets from being read on the air; the protocol's signatures are what make them trustworthy, and the Mint's uniqueness rule (spec Section 6) is what stops a replay. Hop limit stays at Meshtastic's default so a third radio can relay for two that cannot hear each other, which is how the cabin may reach the house through the neighbor.
+
+Airtime: at the LongFast preset a 195-byte packet is on the air for about two seconds; a window costs one receipt, one acknowledgement, two deliveries and four beacons an hour per link, under a minute of airtime in the hour at the lab's two links. `MediumFast` halves that at the cost of range and is the setting to try once the cabin link is measured.
+
+## 4. The bench, in order
+
+Each step ends with its check. The first four need no code from this plan.
+
+1. **The radios, on the desk.** Power each T-Beam from a Pi's USB (a data cable, the 1 ft ones). The Meshtastic CLI on the Mac or a Pi (`pip install meshtastic` in a venv): `meshtastic --port <dev> --info` shows the firmware; update with the web flasher if it is older than 2.5. Set, per board: `--set lora.region US`, the long name (`bw-house`, `bw-neighbor`, `bw-cabin`) and a four-letter short name, `--set device.role CLIENT`, `--set position.gps_mode ENABLED` on the cabin board only (the GPS is the cabin's clock in Section 5; off elsewhere, it is airtime), telemetry and position broadcasts off (`--set telemetry.device_update_interval 0`, `--set position.position_broadcast_secs 0` or the largest value allowed), and one private channel: `--ch-set name bwlab --ch-set psk random` on the first board, then the same PSK on the others (`--ch-set psk base64:<key>`); delete the default public channel's primary role so the lab's channel is index 0. Check: `--nodes` on one board lists the other two, and `--sendtext ping` arrives.
+2. **Range before code.** With one board at the house and one next door, read RSSI and SNR from `--nodes` for an hour of pings; then the house to the cabin spot, through the trees, at LongFast and at MediumFast. Write the numbers into this file. If the cabin cannot hear the house directly, the neighbor's board relays (hop limit 3) and the numbers say so.
+3. **The Pis.** On `bw-house`, `bw-neighbor` and the new `bw-cabin`: a udev rule that names the board `/dev/bwradio` by its USB serial, the `bwkit` user in `dialout`, a venv at `/opt/bwradio` with `meshtastic` installed, and `meshtastic --port /dev/bwradio --info` as `bwkit`. `phase0/provision.sh radio` does this, and `bw-cabin` is flashed and provisioned as a hop with `provision.sh` like the bench's, on the bench first.
+4. **The map.** `the-cabin` is already a mapped place; `bw-cabin` joins the peer lists (`bwkit peer add`) and the map's `nodes`, and the Steward's first-link offer is already waiting for its first settled window.
+5. **The codec.** `radio/wire.py` and its tests (Section 2). Done when the vectors' receipt and acknowledgement round-trip and verify, and every packet type fits in 237 bytes.
+6. **The carrier.** `radio/bwradio.py` against a fake radio in `radio/test_radio.py` (an in-memory mesh that delivers packets between fake nodes, drops some, and duplicates some), covering: a receipt sent and acknowledged by radio with the IP path down, both copies at the Mint, `delivered` moving the outbox file, a duplicate over IP afterwards, a refused record, an unknown fingerprint, and beacons heard. Then on the bench with the IP path forced off (`BWRADIO_FORCE=1` makes the payer skip HTTP), a real window by radio between the bench nodes.
+7. **The test.** At five to the hour, pull the house's uplink. At the hour `bw-house` cannot reach `bw-neighbor` over the tunnel; the receipt goes by radio next door, the acknowledgement comes back by radio, both reach `bw-mint` over the LAN through `bw-house`, and the Mint settles the window and commits the hour while the internet is still down. Plug the uplink back in: the next heartbeat posts the report, the feed shows the window, the proof verifies on the page. The paper's Section 1 claim, on the bench, with the numbers written here.
+8. **The data plane.** The HaLow pair replaces the bench cable to the forest node: AP at the house (the outdoor box, PoE), STA at the cabin on `bw-cabin`'s Ethernet; `bw-house` meters the interface that carries it. No kit code; the site's shopping list has the mounting. Then the cabin's first window, and the first-link bounty.
+9. **`bw-mint2`.** After the test: a second Mint on the bench with its own key and peer list, posting to the feed under its own NYM, listed by the map; the reconciliation record between two Mints is the next plan.
+
+## 5. Clocks
+
+The hop's clock rule is five seconds. With the house's internet cut, `bw-house` loses its time source (chrony from the pool) and free-runs on a crystal: tens of parts per million, a fraction of a second over the hours an outage lasts, inside the rule. `bw-neighbor` keeps its own source. The cabin has no internet ever, and the T-Beam Supreme's GPS is why it was chosen over the Heltec: Meshtastic serves the GPS time to the host, and chrony on `bw-cabin` takes it (a `refclock SHM` from a small reader, or the board's NMEA over the serial API), so the one node that is off the grid has the best clock of the four. The drift item in the paper's Section 10 gets its first off-grid reading from this.
+
+## 6. Is this the best we can do?
+
+- **Why not the full JSON over several packets?** Reassembly over a lossy link needs sequence numbers, timeouts and retransmission, which is a transport, and the records are small enough not to need one. One record, one packet; the mesh's own acknowledgements and the `delivered` reply are the whole retry story.
+- **Why fingerprints and not a numbered peer table?** A table needs agreeing on numbers; a fingerprint is derived from the key both ends already hold, and any node that knows the peer can decode.
+- **Why a sidecar and not a transport inside bwkit?** The kit's rule is one file and no dependencies, which is what let it be installed on four boards with `install.sh` and read by a second implementer. The radio brings a library and a serial port; both belong beside the kit, not in it, and the sidecar's only contract with it is the outbox directory, the loopback HTTP and the envelope format, all of which are already specified.
+- **Why the house as the Mint's gateway?** A fourth radio on `bw-mint` would be cleaner and costs one more board and one more airtime share; the LAN is up whenever the house's power is, and the gateway is one function in the same sidecar. If `bw-mint` moves out of the house, it gets a radio.
+- **What this does not do.** Announcements and purchases over LoRa (the hop's link terms, the payer's offers) stay on IP for Phase 1; the window is settled by the receipt and the acknowledgement alone, under terms announced before the outage. The status report never goes by radio: it is 15 KB. Both are Phase 2's.
+- **The Meshtastic dependency.** The firmware and its Python API are what make three boards a working mesh in an evening; the price is their packet size, their airtime scheduling and their update cadence. The wire format assumes nothing of Meshtastic but "237 bytes, delivered or not", so a plain SX1262 driver could carry it later.
