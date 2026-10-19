@@ -24,6 +24,7 @@ config.json:  "radio": {"port": "/dev/bwradio", "gateway": false, "gateway_id": 
                         "peers": {"<NYM>": "!a1b2c3d4", ...}, "self_url": "http://127.0.0.1:8710"}
 """
 
+import importlib.machinery
 import importlib.util
 import json
 import os
