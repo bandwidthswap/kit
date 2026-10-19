@@ -240,7 +240,7 @@ step_radio() {
   gateway="${RADIO_GATEWAY:-bw-house}"
   say "the radio carrier on $nodes"
   for h in $nodes; do
-    COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - radio/bwradio.py radio/wire.py systemd/bwkit-radio.service | ssh_to "$h" 'mkdir -p ~/kit && tar -C ~/kit -xf - && sudo install -d -m 0755 /usr/local/lib/bwradio && sudo install -m 0644 ~/kit/radio/wire.py /usr/local/lib/bwradio/wire.py && sudo install -m 0755 ~/kit/radio/bwradio.py /usr/local/bin/bwradio && sudo install -m 0644 ~/kit/systemd/bwkit-radio.service /etc/systemd/system/ && sudo usermod -aG dialout bwkit && (test -x /opt/bwradio/bin/python || sudo python3 -m venv /opt/bwradio) && sudo /opt/bwradio/bin/pip install -q --upgrade meshtastic && sudo systemctl daemon-reload && echo "'"$h"': bwradio installed, meshtastic $(/opt/bwradio/bin/pip show meshtastic 2>/dev/null | sed -n "s/^Version: //p")"'
+    COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - radio/bwradio.py radio/wire.py systemd/bwkit-radio.service | ssh_to "$h" 'mkdir -p ~/kit && tar -C ~/kit -xf - && sudo install -d -m 0755 /usr/local/lib/bwradio && sudo install -m 0644 ~/kit/radio/wire.py /usr/local/lib/bwradio/wire.py && sudo install -m 0755 ~/kit/radio/bwradio.py /usr/local/bin/bwradio && sudo install -m 0644 ~/kit/systemd/bwkit-radio.service /etc/systemd/system/ && sudo usermod -aG dialout bwkit && (test -x /opt/bwradio/bin/python || sudo python3 -m venv /opt/bwradio || (sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 install -y -q python3-venv >/dev/null && sudo python3 -m venv /opt/bwradio)) && sudo /opt/bwradio/bin/pip install -q --upgrade meshtastic 2>&1 | grep -vi 'notice' | tail -2 && sudo systemctl daemon-reload && echo "'"$h"': bwradio installed, meshtastic $(/opt/bwradio/bin/pip show meshtastic 2>/dev/null | sed -n "s/^Version: //p")"'
     # The T-Beam Supreme is an ESP32-S3 on native USB (Espressif 303a:1001). Another board: `udevadm info -q property -n /dev/ttyACM0 | grep ID_`
     sudo_sh "$h" <<'EOS'
 set -e
@@ -252,7 +252,8 @@ udevadm control --reload-rules && udevadm trigger --subsystem-match=tty
 sleep 1
 if [ -e /dev/bwradio ]; then echo "$(hostname): /dev/bwradio -> $(readlink /dev/bwradio)"; else echo "$(hostname): no /dev/bwradio yet (is the board plugged in? its ids: udevadm info -q property -n /dev/ttyACM0 | grep ID_)"; fi
 EOS
-    run "$h" 'test -e /dev/bwradio && sudo -u bwkit /opt/bwradio/bin/meshtastic --port /dev/bwradio --info 2>/dev/null | grep -E "^Owner|myNodeNum|"id": "!" | head -3 || true'
+    run "$h" 'test -e /dev/bwradio && sudo -u bwkit /opt/bwradio/bin/meshtastic --port /dev/bwradio --info 2>/dev/null | grep -E "^Owner|myNodeNum" | head -2 | sed "s/^/$(hostname): /" || true'
+    # the radio id is !<myNodeNum in hex>: RADIO_IDS takes it as "bw-house=!a1b2c3d4"
   done
   if [ -n "${RADIO_IDS:-}" ]; then
     say "the radio object in each node's config"
