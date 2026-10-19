@@ -2,6 +2,10 @@
 
 Written Oct 19, 2026, against bwkit 0.5.0, whitepaper v0.6 Section 9 and the site's roadmap. Phase 1 is the offline-settlement test: receipts, acknowledgements and liveness move onto a low-rate radio channel, a radio link replaces the bench cable to the forest node, and the test is to cut the house's internet mid-window and show the window still settles. The radios are on the desk: three LILYGO T-Beam Supreme boards (915 MHz, SX1262, Meshtastic preloaded, GPS), antennas and cables; the Heltec Wi-Fi HaLow pair for the data plane; and two more Raspberry Pi 3 B boards, which this plan makes nodes. Section 6 asks whether this is the best we can do.
 
+## Status, Oct 19, 2026, 17:45 UTC (the handoff)
+
+Steps 1, 3, 5 and 6 are partly done: `bw-house`'s board is on the private channel `bwlab` (radio id `!435b0188`); the carrier, the codec and the Meshtastic tool are installed on `bw-house`, `bw-neighbor` and `bw-cabin`; the carrier passes its fake-mesh tests and its adapter opened a real board. The other two boards are on no Pi yet, no carrier runs, and the hop needs bwkit 0.5.0 first. The kit's `PUNCH-LIST.md`, "Phase 1: the radios", and the site repo's `CLAUDE.md`, "Pick up here", list the steps in order.
+
 ## 0. Where we stand
 
 The kit speaks HTTP over IP and nothing else. A payer's hourly job (`receipt_run`) builds and signs the receipt, posts it to the hop's `/ack` and posts both copies to the Mint's `/receipt`; everything meant for the Mint is written to the outbox first and retried every five minutes, so a Mint that is away receives the window later. Nothing of that survives the payer losing its path to the hop: the hop is next door over a tunnel that a third party's server relays, and when the house's internet is cut there is no tunnel, no acknowledgement, and the window is lost by the rule in spec Section 6. That is the gap Phase 1 closes, and it is the claim in the paper's Section 1.

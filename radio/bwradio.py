@@ -34,7 +34,10 @@ import sys
 import time
 from urllib import error as urlerror
 
-sys.path.insert(0, os.environ.get("BWRADIO_LIB", os.path.dirname(os.path.abspath(__file__))))
+# wire.py: beside this file in the repo, in /usr/local/lib/bwradio where provision.sh radio installs it, or BWRADIO_LIB
+for _d in (os.path.dirname(os.path.abspath(__file__)), "/usr/local/lib/bwradio", os.environ.get("BWRADIO_LIB")):
+    if _d and _d not in sys.path:
+        sys.path.insert(0, _d)
 import wire  # noqa: E402
 
 
