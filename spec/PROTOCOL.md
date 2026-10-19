@@ -44,6 +44,8 @@ Which numbers are doubles is fixed by the field, not by the value: in a settleme
 | receipt, acknowledgement | `bandwidthswap/receipt/v1` | the eight values of Section 4 as a JSON array, in field order |
 | commitment | `bandwidthswap/commitment/v1` | `[mint, window, root, count]` as a JSON array |
 | link announcement | `bandwidthswap/link/v1` | the canonical JSON of the record without `sig` |
+| status record (informative, Section 9) | `bandwidthswap/status/v1` | the canonical JSON of the record without `sig` |
+| map record (informative, Section 9) | `bandwidthswap/map/v1` | the canonical JSON of the record without `sig` |
 
 The arrays use the canonical separators and escaping above.
 
@@ -234,6 +236,8 @@ Every role's `GET /status` also carries `clock_offset_s` (this clock less its ti
 **Codes.** 400: the body is not JSON, a record is malformed, or a signature fails. 403: the signer, or the payer an acknowledgement names, is not in the peer list. 404: no such path, or nothing to prove. 409: a protocol decline, with `error` one of `duplicate`, `replay`, `clock`, `patience`, `since`, `domain`, `profile`, or another short reason, and `detail` saying why. 413: too large. Every write is a signed record, so the Mint authenticates nothing but signatures and the peer list.
 
 **The outbox.** A node writes every envelope it means to send to the Mint before sending it, and keeps trying; a Mint that was unreachable receives the window later and settles it then (its `t` is then, its commitment lands in the hour the window started in). A node keeps its own signed copies regardless: the payer its receipts and the acknowledgements it received, the hop its acknowledgements, both the Mint's answers.
+
+**The status record** (informative; outside the profile). A Mint that publishes its ledger's public summary through a relay, as the pilot's Mint does through the status feed at `status.bandwidthswap.com`, posts the summary as a signed record: names, roles, times and byte counts, each node's recent windows, the latest commitment with its proof and the Steward's book, with `kind: "status"`, `proto: 1`, `mint` (the Mint's NYM), `generated_at` and `sig`, Ed25519 by the Mint over the domain string `bandwidthswap/status/v1`, a newline and the canonical JSON of the record without `sig`. The relay verifies the signature under `mint` and asks for nothing else; it stores the bytes it received and serves them with `received_at` added, so it can delay or drop a report and cannot alter one, and a reader removes `received_at` and `sig` and verifies under `mint`. Which Mints the relay lists is a second signed record, `{"kind": "map", "proto": 1, "by": <NYM>, "at": <time>, "map": {"mints": [{"nym", "name", "domain"}], …}, "sig"}` over `bandwidthswap/map/v1`, posted by a Mint the relay's operator names; until Mints reconcile the map among themselves (paper, A.5) that is the pilot membership's file. The reference implementation posts both (`bwkit report`, `bwkit map post`); the relay's side is `worker/README.md` in the site repository.
 
 ## 10. The hourly commitment and its proof
 

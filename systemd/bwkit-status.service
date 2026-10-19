@@ -1,14 +1,12 @@
 [Unit]
-Description=bwkit: post the ledger's public summary to the status page
+Description=bwkit: post the ledger's public summary, signed, to the status feed
 After=network-online.target bwkit.service
 Wants=network-online.target
-# The URL and the token live in a root-only file; without it this is a no-op.
-ConditionPathExists=/etc/bwkit/status.env
 
 [Service]
 Type=oneshot
 User=bwkit
 Group=bwkit
-EnvironmentFile=/etc/bwkit/status.env
+# Where it posts is `status_url` in /etc/bwkit/config.json; without one this logs a line and exits 0.
 ExecStart=/usr/local/bin/bwkit report
 Environment=PYTHONUNBUFFERED=1

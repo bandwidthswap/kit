@@ -8,9 +8,11 @@
 #   phase0/provision.sh logs       journald in RAM on all three
 #   phase0/provision.sh kit        install bwkit, exchange NYMs, baseline, enable the services
 #   phase0/provision.sh update     copy a newer bwkit.py and units to the nodes and restart the services
-#   phase0/provision.sh status     bw-mint: the status reporter (bwkit report, every two minutes) with its
-#                                  token from $BWKIT_STATUS_TOKEN, written to the root-only /etc/bwkit/status.env;
-#                                  with no token given, the file already there is kept and only the code is updated
+#   phase0/provision.sh status     bw-mint: the status reporter: status_url in the Mint's config (the feed's /report;
+#                                  BWKIT_STATUS_URL overrides the pilot's), the code and units, the old token file
+#                                  removed, the ten-minute timer enabled and a signed report sent
+#   phase0/provision.sh map        bw-mint: sign the membership's map and post it to the feed (bwkit map post), which
+#                                  then lists the Mint
 #   phase0/provision.sh steward    bw-mint: the Network Steward (PLAN.md 2.4): the map (phase0/map.json to /etc/bwkit/map.json),
 #                                  the Steward's key, the Mint restarted so it accepts the Steward's postings, and the hourly
 #                                  bwkit-steward.timer (five past the hour, after the commitment); run once at the end
@@ -22,8 +24,8 @@
 #   SSH_SUFFIX=-ts FOREST_JUMP=bw-house-ts phase0/provision.sh update
 #
 # Nothing here prints or copies a private key: WireGuard keys are made on the
-# nodes and only the public halves cross the LAN. The status token travels once,
-# inside the script on stdin of `status`, and is never echoed.
+# nodes and only the public halves cross the LAN. Since bwkit 0.5.0 there is no
+# status token: the Mint signs its reports with its own key.
 set -eu
 kit="$(cd "$(dirname "$0")/.." && pwd)"
 HOSTS="bw-house bw-forest bw-mint"
@@ -216,28 +218,18 @@ check_kit() {
 
 step_status() {
   say "status reporter on bw-mint"
-  if [ -z "${BWKIT_STATUS_TOKEN:-}" ]; then
-    if run bw-mint 'sudo test -s /etc/bwkit/status.env'; then
-      echo "no BWKIT_STATUS_TOKEN given; keeping the /etc/bwkit/status.env already on bw-mint"
-    else
-      echo "set BWKIT_STATUS_TOKEN to the token the Worker was given (the site repo's worker/README.md has the steps)" >&2
-      exit 2
-    fi
-  fi
-  url="${BWKIT_STATUS_URL:-https://status.bandwidthswap.com/status}"
-  COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py steward_rules.py install.sh systemd dashboard phase0/map.json | ssh_to bw-mint 'mkdir -p ~/kit && tar -C ~/kit -xf - && sudo install -m 0755 ~/kit/bwkit.py /usr/local/bin/bwkit && sudo install -m 0644 ~/kit/steward_rules.py /usr/local/bin/steward_rules.py && sudo install -d -m 0755 /usr/local/share/bwkit/dashboard && sudo install -m 0644 ~/kit/dashboard/index.html ~/kit/dashboard/*.css ~/kit/dashboard/*.js /usr/local/share/bwkit/dashboard/ && sudo rm -f /usr/local/share/bwkit/dashboard.html /usr/local/share/bwkit/dashboard/dashboard.html && sudo install -m 0644 ~/kit/systemd/*.service ~/kit/systemd/*.timer /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl restart bwkit && sleep 1 && echo "bw-mint: bwkit $(grep -m1 "^VERSION" /usr/local/bin/bwkit | cut -d\" -f2), server $(systemctl is-active bwkit)"'
-  if [ -n "${BWKIT_STATUS_TOKEN:-}" ]; then
-    sudo_sh bw-mint <<EOS
-set -e
-umask 077
-printf 'BWKIT_STATUS_URL=%s\nBWKIT_STATUS_TOKEN=%s\n' '$url' '$BWKIT_STATUS_TOKEN' > /etc/bwkit/status.env
-chown root:root /etc/bwkit/status.env
-chmod 0600 /etc/bwkit/status.env
-echo "bw-mint: /etc/bwkit/status.env written (root only)"
-EOS
-  fi
-  run bw-mint 'sudo systemctl enable -q --now bwkit-status.timer && sudo systemctl start bwkit-status.service && echo "bw-mint: bwkit-status.timer enabled, a report sent"'
+  url="${BWKIT_STATUS_URL:-https://status.bandwidthswap.com/report}"
+  run bw-mint "sudo python3 - <<'PY'
+import json; p='/etc/bwkit/config.json'; c=json.load(open(p)); c['status_url']='$url'; json.dump(c,open(p,'w'),indent=2); print('bw-mint: status_url', c['status_url'])
+PY"
+  COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py steward_rules.py install.sh systemd dashboard phase0/map.json | ssh_to bw-mint 'mkdir -p ~/kit && tar -C ~/kit -xf - && sudo install -m 0755 ~/kit/bwkit.py /usr/local/bin/bwkit && sudo install -m 0644 ~/kit/steward_rules.py /usr/local/bin/steward_rules.py && sudo install -d -m 0755 /usr/local/share/bwkit/dashboard && sudo install -m 0644 ~/kit/dashboard/index.html ~/kit/dashboard/*.css ~/kit/dashboard/*.js /usr/local/share/bwkit/dashboard/ && sudo rm -f /usr/local/share/bwkit/dashboard.html /usr/local/share/bwkit/dashboard/dashboard.html && sudo install -m 0644 ~/kit/systemd/*.service ~/kit/systemd/*.timer /etc/systemd/system/ && sudo rm -f /etc/bwkit/status.env && sudo systemctl daemon-reload && sudo systemctl restart bwkit && sleep 1 && echo "bw-mint: bwkit $(grep -m1 "^VERSION" /usr/local/bin/bwkit | cut -d\" -f2), server $(systemctl is-active bwkit), the token file is gone"'
+  run bw-mint 'sudo systemctl enable -q --now bwkit-status.timer && sudo systemctl start bwkit-status.service && echo "bw-mint: bwkit-status.timer enabled (every ten minutes, five past), a signed report sent"'
   check_status
+}
+
+step_map() {
+  say "the membership's map, signed by bw-mint, posted to the feed"
+  run bw-mint 'sudo -u bwkit bwkit map post'
 }
 
 step_steward() {
@@ -262,8 +254,9 @@ case "${1:-}" in
   kit) step_kit ;;
   update) step_update ;;
   status) step_status ;;
+  map) step_map ;;
   steward) step_steward ;;
   check) check_time; check_tunnel; check_kit; check_status ;;
   all) step_upgrade; step_time; step_tunnel; step_logs; step_kit ;;
-  *) sed -n '2,18p' "$0"; exit 2 ;;
+  *) sed -n '2,20p' "$0"; exit 2 ;;
 esac

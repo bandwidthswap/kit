@@ -1,9 +1,10 @@
 [Unit]
-Description=bwkit: status report every two minutes
+Description=bwkit: status report every ten minutes, five past
 
 [Timer]
-# Two minutes, not one: the Worker's KV allows 1,000 writes a day on the free plan.
-OnCalendar=*:0/2
+# The heartbeat. The serving Mint also posts right after each hour's commitment, which lands just after the
+# hour, so the heartbeat sits five minutes off the hour and the two never meet the feed's one-a-minute rate.
+OnCalendar=*:5/10
 AccuracySec=5s
 Persistent=false
 

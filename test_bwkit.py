@@ -91,6 +91,32 @@ class Lab:
         shutil.rmtree(self.root)
 
 
+def feed_server():
+    """A stand-in for the status feed: records every POST (path, headers, parsed body) and answers 200 stored."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+    seen = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers["Content-Length"]))
+            seen.append({"path": self.path, "auth": self.headers.get("Authorization"), "agent": self.headers.get("User-Agent"),
+                         "text": raw.decode(), "body": json.loads(raw)})
+            data = b'{"stored": true, "received_at": 1}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, seen, "http://127.0.0.1:%d" % srv.server_address[1]
+
+
 class Signing(unittest.TestCase):
     def test_sign_verify_and_tamper(self):
         priv = bwkit.Ed25519PrivateKey.generate()
@@ -372,46 +398,114 @@ class StatusReport(unittest.TestCase):
         with self.assertRaises(ValueError):
             bwkit.Node(self.lab.mint.dir, self.lab.mint.config).load_index()
 
-    def test_report_posts_with_the_bearer_token(self):
-        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-        seen = {}
+    def test_status_record_is_signed_by_the_mint(self):
+        self.lab.hour(1_000, 1_000)
+        rec = self.lab.mint.status_record(now=self.lab.t + 60, service=True)
+        self.assertEqual((rec["kind"], rec["proto"], rec["mint"]), ("status", 1, self.lab.mint.nym))
+        self.assertEqual(len(rec["sig"]), 86)
+        self.assertTrue(bwkit.verify_status(rec))
+        self.assertTrue(bwkit.status_canon(rec).startswith(b"bandwidthswap/status/v1\n{"))
+        self.assertNotIn(b'"sig"', bwkit.status_canon(rec))
+        body = {k: v for k, v in rec.items() if k != "sig"}
+        self.assertEqual(rec["sig"], bwkit.sign_status(self.lab.mint.priv, body))
+        # what JSON carries round-trips: the signature holds on the parsed text, floats and all
+        self.assertTrue(bwkit.verify_status(json.loads(json.dumps(rec))))
+        for tamper in ({"generated_at": rec["generated_at"] + 1}, {"mint": self.lab.hop.nym}, {"sig": rec["sig"][:-2] + "AA"}):
+            bad = dict(rec)
+            bad.update(tamper)
+            self.assertFalse(bwkit.verify_status(bad), tamper)
+        with self.assertRaises(SystemExit):
+            self.lab.payer.status_record()          # only the Mint reports
 
-        class Handler(BaseHTTPRequestHandler):
-            def log_message(self, *a):
-                pass
-
-            def do_POST(self):
-                seen["auth"] = self.headers.get("Authorization")
-                seen["agent"] = self.headers.get("User-Agent")
-                seen["path"] = self.path
-                seen["body"] = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                data = b'{"stored": true, "received_at": 1}'
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(data)))
-                self.end_headers()
-                self.wfile.write(data)
-
-        srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        import threading
-        threading.Thread(target=srv.serve_forever, daemon=True).start()
+    def test_report_posts_the_signed_record_without_a_token(self):
+        srv, seen, base = feed_server()
         try:
             self.lab.hour(1_000, 1_000)
-            url = "http://127.0.0.1:%d/status" % srv.server_address[1]
-            status, body = self.lab.mint.report(url, "tok-123", now=self.lab.t)
-            self.assertEqual(status, 200)
-            self.assertEqual(body, {"stored": True, "received_at": 1})
-            self.assertEqual(seen["auth"], "Bearer tok-123")
-            self.assertEqual(seen["agent"], "bwkit/" + bwkit.VERSION)   # Python's default is refused at the edge
-            self.assertEqual(seen["path"], "/status")
-            self.assertEqual(seen["body"]["generated_at"], self.lab.t)
-            self.assertEqual(len(seen["body"]["nodes"]), 3)
-            self.assertIn(seen["body"]["service"], (True, False))   # the test Mint serves on a port, so it was checked
+            status, body = self.lab.mint.report(base + "/report", now=self.lab.t)
+            self.assertEqual((status, body), (200, {"stored": True, "received_at": 1}))
+            self.assertEqual(len(seen), 1)
+            self.assertEqual(seen[0]["path"], "/report")
+            self.assertIsNone(seen[0]["auth"])                               # the record is its own credential
+            self.assertEqual(seen[0]["agent"], "bwkit/" + bwkit.VERSION)     # Python's default is refused at the edge
+            posted = seen[0]["body"]
+            self.assertTrue(bwkit.verify_status(posted))
+            self.assertEqual(posted["generated_at"], self.lab.t)
+            self.assertEqual(len(posted["nodes"]), 3)
+            self.assertIn(posted["service"], (True, False))                  # the test Mint serves on a port, so it was checked
+            self.assertEqual(self.lab.mint.state()["last_report_at"], self.lab.t)
+            # the URL from the config, and from the environment over it
+            self.lab.mint.config["status_url"] = base + "/report"
+            self.assertEqual(self.lab.mint.report(now=self.lab.t + 1)[0], 200)
+            with mock.patch.dict(os.environ, {"BWKIT_STATUS_URL": base + "/env"}):
+                self.assertEqual(self.lab.mint.report(now=self.lab.t + 2)[0], 200)
+            self.assertEqual([r["path"] for r in seen], ["/report", "/report", "/env"])
         finally:
+            del self.lab.mint.config["status_url"]
             srv.shutdown()
             srv.server_close()
         with self.assertRaises(SystemExit):
-            self.lab.payer.report("http://127.0.0.1:1/status", "tok")   # only the Mint reports
+            self.lab.payer.report("http://127.0.0.1:1/report")   # only the Mint reports
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("BWKIT_STATUS_URL", None)
+            with self.assertRaises(SystemExit):
+                self.lab.mint.report()                            # no URL anywhere
+
+    def test_a_commitment_posts_a_report_after_a_delay(self):
+        srv, seen, base = feed_server()
+        self.lab.mint.config["status_url"] = base + "/report"
+        try:
+            with mock.patch.object(bwkit, "REPORT_AFTER_COMMIT_S", 0.3):
+                self.lab.hour(1_000, 1_000)                       # settles, commits, and schedules a report
+                self.assertIsNotNone(self.lab.mint._report_timer)
+                self.lab.step(600, 2_000, 2_000)                  # a second commitment while the first report is pending: coalesced
+                deadline = time.time() + 5
+                while not seen and time.time() < deadline:
+                    time.sleep(0.05)
+            self.assertEqual(len(seen), 1, seen)
+            self.assertEqual(seen[0]["path"], "/report")
+            self.assertTrue(bwkit.verify_status(seen[0]["body"]))
+            self.assertEqual(seen[0]["body"]["commitment"]["window"], self.lab.t // 3600 * 3600)   # the report carries the later commitment
+            time.sleep(0.5)
+            self.assertEqual(len(seen), 1)                        # and nothing more until the next commitment
+            self.assertIsNone(self.lab.mint._report_timer)
+        finally:
+            del self.lab.mint.config["status_url"]
+            srv.shutdown()
+            srv.server_close()
+        # without a status URL a commitment schedules nothing
+        self.lab.hour(3_000, 3_000)
+        self.assertIsNone(self.lab.mint._report_timer)
+
+    def test_the_map_is_signed_by_the_mint_and_names_it(self):
+        path = os.path.join(self.lab.root, "map.json")
+        shutil.copy(os.path.join(os.path.dirname(os.path.abspath(__file__)), "phase0", "map.json"), path)
+        self.lab.mint.config["map"] = path
+        srv, seen, base = feed_server()
+        try:
+            rec = self.lab.mint.map_record(now=self.lab.t)
+            self.assertEqual((rec["kind"], rec["proto"], rec["by"], rec["at"]), ("map", 1, self.lab.mint.nym, self.lab.t))
+            self.assertEqual(rec["map"]["mints"], [{"nym": self.lab.mint.nym, "name": "bw-mint", "domain": "earth"}])
+            self.assertEqual(set(rec["map"]["places"]), {"house", "next-door", "the-cabin"})
+            self.assertEqual(rec["map"]["nodes"]["bw-neighbor"], "next-door")
+            self.assertTrue(bwkit.verify_map(rec))
+            self.assertTrue(bwkit.verify_map(json.loads(json.dumps(rec))))
+            bad = dict(rec)
+            bad["map"] = dict(rec["map"], mints=[])
+            self.assertFalse(bwkit.verify_map(bad))
+            self.assertIsNone(self.lab.mint.map_url())            # no status_url: nowhere to post by default
+            self.lab.mint.config["status_url"] = base + "/report"
+            self.assertEqual(self.lab.mint.map_url(), base + "/map")
+            status, body = self.lab.mint.post_map(self.lab.mint.map_url(), rec)
+            self.assertEqual((status, body), (200, {"stored": True, "received_at": 1}))
+            self.assertEqual(seen[0]["path"], "/map")
+            self.assertTrue(bwkit.verify_map(seen[0]["body"]))
+            with self.assertRaises(SystemExit):
+                self.lab.payer.map_record()                       # only the Mint signs the map
+        finally:
+            del self.lab.mint.config["map"]
+            self.lab.mint.config.pop("status_url", None)
+            srv.shutdown()
+            srv.server_close()
 
     def test_assert_public_refuses_addresses(self):
         with self.assertRaises(ValueError):
@@ -1747,7 +1841,7 @@ class StewardRole(unittest.TestCase):
         with open(self.map_path, "w") as f:
             json.dump(m, f)
         with self.assertRaises(ValueError) as cm:
-            lab.mint.report("http://127.0.0.1:1/status", "tok", now=lab.t + 60)
+            lab.mint.report("http://127.0.0.1:1/report", now=lab.t + 60)
         self.assertIn("192.168.0.61", str(cm.exception))
         # without a Steward key the report says so and still goes
         other = bwkit.Node(os.path.join(lab.root, "mint2"), {"role": "mint", "name": "m2"})
@@ -2026,10 +2120,10 @@ class Health(unittest.TestCase):
                          [{"level": "bad", "text": "The %s hour has 1 settlement and no commitment." % bwkit.page_tstamp(w), "since": w + 3600}])
         lab.mint.load_index()                                                             # the ledger has the commitment; the index again
         self.assertEqual(lab.mint.health({}, w + 3600 + 301)["items"], [])
-        self.assertEqual(lab.mint.health({"last_report_at": lab.t}, lab.t + 599)["items"], [])
-        self.assertEqual(lab.mint.health({"last_report_at": lab.t}, lab.t + 601)["items"],
-                         [{"level": "warn", "text": "The public status was last posted 10 min ago.", "since": lab.t}])
-        self.assertEqual(lab.payer.health({"last_report_at": lab.t}, lab.t + 601)["items"], [])   # only the Mint posts
+        self.assertEqual(lab.mint.health({"last_report_at": lab.t}, lab.t + 1499)["items"], [])   # two heartbeats may be missed
+        self.assertEqual(lab.mint.health({"last_report_at": lab.t}, lab.t + 1501)["items"],
+                         [{"level": "warn", "text": "The public status was last posted 25 min ago.", "since": lab.t}])
+        self.assertEqual(lab.payer.health({"last_report_at": lab.t}, lab.t + 1501)["items"], [])   # only the Mint posts
 
     def test_a_link_whose_gap_runs_past_its_margin(self):
         lab = self.lab
@@ -2203,7 +2297,7 @@ class Dashboard(unittest.TestCase):
         srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         try:
-            lab.mint.report("http://127.0.0.1:%d/status" % srv.server_address[1], "tok", now=lab.t + 9)
+            lab.mint.report("http://127.0.0.1:%d/report" % srv.server_address[1], now=lab.t + 9)
         finally:
             srv.shutdown()
             srv.server_close()

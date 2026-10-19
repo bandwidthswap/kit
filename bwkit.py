@@ -89,7 +89,7 @@ try:
 except ImportError:                 # an older install without it: everything but purchases and the Steward still runs
     rules = None
 
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 IMPL = "bwkit/" + VERSION               # `impl` in every envelope: informational, never the profile
 PROTO = 1                               # the profile every record this kit writes carries (spec, Section 14)
 PROTOS = (1,)                           # the profiles it accepts; a record without `proto` is profile 1
@@ -97,6 +97,8 @@ FIELDS = ("payer", "hop", "hop_index", "merkle_root", "bytes", "t_first", "t_las
 DOMAIN = b"bandwidthswap/receipt/v1\n"   # prefixed to every signed receipt and ack
 COMMIT_DOMAIN = b"bandwidthswap/commitment/v1\n"   # prefixed to every signed commitment
 LINK_DOMAIN = b"bandwidthswap/link/v1\n"           # prefixed to every signed link announcement
+STATUS_DOMAIN = b"bandwidthswap/status/v1\n"       # prefixed to the Mint's signed status record, the public feed's (spec, Section 9)
+MAP_DOMAIN = b"bandwidthswap/map/v1\n"             # prefixed to the signed map a feed lists Mints by (spec, Section 9)
 LEAF_PREFIX, NODE_PREFIX = b"\x00", b"\x01"       # RFC 6962: a leaf and an inner node hash differently
 LEAF_SKIP = ("t",)                      # the settlement's own clock stays out of its leaf (see leaf_of)
 CLOCK_TOLERANCE_S = 5                   # the pilot's clock rule: 5 seconds, decline; also the Mint's slack on `since`
@@ -146,6 +148,7 @@ HOP_FLUSH_DELAY_S = 5                   # the hop sends its own copy of an ack t
 FLUSH_EVERY_S = 300                     # and retries whatever is left in its outbox this often
 MAX_BODY = 1 << 20
 STATUS_TIMEOUT_S = 10                   # posting the status report
+REPORT_AFTER_COMMIT_S = 10              # a serving Mint posts a status report this long after a commitment, once for all of them
 HISTORY_HOURS = 12                      # the status report carries each node's windows of the last twelve hours
 HISTORY_MAX = 36                        # at most this many per node (the forced tests made several in one hour)
 REPORT_MAX = 64 * 1024                  # the status Worker refuses a larger body
@@ -156,7 +159,7 @@ HEALTH = {                              # the checks every view shows (dashboard
     "lost_after_s": 7200,               # two windows without an ack: the hop never countersigned, the window is lost
     "lost_shown_s": 86400,              # a lost window is listed for a day; after that the ledger and the open-windows table hold it
     "commit_slack_s": 300,              # an hour is committed within five minutes of closing
-    "report_s": 600,                    # the public status is posted every two minutes; ten without one is a warning
+    "report_s": 1500,                   # the public status is posted every ten minutes and after each commitment; twenty-five without one is a warning
     "gap_windows": 24,                  # the gap is judged as the median over this many of a link's newest windows
     "gap_min_windows": 3,               # and not before this many
 }
@@ -288,6 +291,44 @@ def assert_public(text):
         m = pat.search(text)
         if m:
             raise ValueError("a status report may not carry an address (%s)" % m.group(0))
+
+
+# ---------------------------------------------------------------- the status record and the map (the public feed; spec, Section 9, informative)
+
+def status_canon(rec):
+    """The signed bytes of a status record: the domain string and the canonical JSON of the record without sig."""
+    return STATUS_DOMAIN + canon_json({k: v for k, v in rec.items() if k != "sig"}).encode()
+
+
+def sign_status(priv, body):
+    return b64u(priv.sign(STATUS_DOMAIN + canon_json(body).encode()))
+
+
+def verify_status(rec):
+    """True when rec carries the signature of the Mint it names in `mint`."""
+    try:
+        pub_of_nym(rec["mint"]).verify(b64u_dec(rec["sig"]), status_canon(rec))
+        return True
+    except (InvalidSignature, ValueError, KeyError, TypeError):
+        return False
+
+
+def map_canon(rec):
+    """The signed bytes of a map record: the domain string and the canonical JSON of the record without sig."""
+    return MAP_DOMAIN + canon_json({k: v for k, v in rec.items() if k != "sig"}).encode()
+
+
+def sign_map(priv, body):
+    return b64u(priv.sign(MAP_DOMAIN + canon_json(body).encode()))
+
+
+def verify_map(rec):
+    """True when rec carries the signature of the Mint it names in `by`."""
+    try:
+        pub_of_nym(rec["by"]).verify(b64u_dec(rec["sig"]), map_canon(rec))
+        return True
+    except (InvalidSignature, ValueError, KeyError, TypeError):
+        return False
 
 
 # ---------------------------------------------------------------- link announcements (spec, Section 7)
@@ -1224,6 +1265,9 @@ class Node:
             with open(kp, "rb") as f:
                 self.priv = Ed25519PrivateKey.from_private_bytes(f.read())
         self.index = None
+        self._serving = False                 # set by serve(): only a serving Mint posts a report after a commitment
+        self._report_timer = None
+        self._report_lock = threading.Lock()
 
     @classmethod
     def from_env(cls):
@@ -1936,6 +1980,7 @@ class Node:
         c = make_commitment(self.priv, [s for s in self.index["settled"].values() if commit_hour(s) == window], window, now)
         self.ledger_append(c)
         log("commitment for hour %d: root %s over %d settlement%s" % (window, c["root"][:16], c["count"], "" if c["count"] == 1 else "s"))
+        self.report_later()                   # the hour shows on the public feed within seconds, not at the next heartbeat
         return c
 
     def commitments(self):
@@ -2147,33 +2192,120 @@ class Node:
             "nodes": sorted(nodes.values(), key=lambda n: (order[n["role"]], n["name"])),
         }
 
-    def report(self, url=None, token=None, now=None):
-        """Mint: post status_report() to the status page's Worker. Returns (HTTP status, body).
+    def status_url(self):
+        """Where the Mint posts its status record: BWKIT_STATUS_URL, else `status_url` in the config, the feed's /report; None when neither is set."""
+        return os.environ.get("BWKIT_STATUS_URL") or self.config.get("status_url") or None
 
-        The URL and the token come from the arguments, else from the
-        environment (BWKIT_STATUS_URL, BWKIT_STATUS_TOKEN: the systemd unit
-        reads them from the root-only /etc/bwkit/status.env), the URL also from
-        `status_url` in the config. The token is never in the config.
+    def map_url(self):
+        """Where the map goes: the feed's /map beside the /report that status_url names; None when status_url is not a /report."""
+        url = self.status_url()
+        return re.sub(r"/report/?$", "/map", url) if url and re.search(r"/report/?$", url) else None
+
+    def status_record(self, now=None, service=None):
+        """Mint: status_report() as the signed record the public feed takes (spec, Section 9, informative).
+
+        The report with `kind` "status", `proto`, `mint` (this Mint's NYM) and
+        `sig`: Ed25519 by the Mint over STATUS_DOMAIN and the canonical JSON of
+        the record without `sig`. The key is the credential: the feed verifies
+        the signature under `mint` and asks for nothing else, so there is no
+        token to issue, store or rotate, and a reader of the feed checks the
+        same signature on what the feed serves.
         """
         if self.role != "mint":
             raise SystemExit("only the Mint reports")
-        url = url or os.environ.get("BWKIT_STATUS_URL") or self.config.get("status_url")
-        token = token or os.environ.get("BWKIT_STATUS_TOKEN")
+        if self.priv is None:
+            raise SystemExit("no key: the status record is signed by the Mint (bwkit keygen)")
+        rec = self.status_report(now, service)
+        rec["kind"], rec["proto"], rec["mint"] = "status", PROTO, self.nym
+        rec["sig"] = sign_status(self.priv, rec)
+        return rec
+
+    def report(self, url=None, now=None):
+        """Mint: post the signed status record to the public feed. Returns (HTTP status, body).
+
+        The URL comes from the argument, else BWKIT_STATUS_URL, else
+        `status_url` in the config: the feed's /report. The feed answers 429
+        to a second report from the same Mint within a minute and 409 to one
+        whose generated_at is not newer than the last it stored; a caller
+        that lands on either has lost nothing, the next heartbeat carries
+        the same ledger.
+        """
+        if self.role != "mint":
+            raise SystemExit("only the Mint reports")
+        url = url or self.status_url()
         if not url:
-            raise SystemExit("no status URL: set BWKIT_STATUS_URL in /etc/bwkit/status.env (or status_url in the config)")
-        if not token:
-            raise SystemExit("no token: set BWKIT_STATUS_TOKEN in /etc/bwkit/status.env")
-        rep = self.status_report(now, service=self.service_up())
-        text = json.dumps(rep, sort_keys=True)
+            raise SystemExit("no status URL: set status_url in the config (the feed's /report), or BWKIT_STATUS_URL")
+        rec = self.status_record(now, service=self.service_up())
+        text = json.dumps(rec, sort_keys=True)
         assert_public(text)
         if len(text) > REPORT_MAX:
-            raise ValueError("the report is %d bytes; the status Worker takes at most %d" % (len(text), REPORT_MAX))
-        status, body = http_post(url, rep, timeout=STATUS_TIMEOUT_S, headers={"Authorization": "Bearer " + token})
+            raise ValueError("the report is %d bytes; the status feed takes at most %d" % (len(text), REPORT_MAX))
+        status, body = http_post(url, rec, timeout=STATUS_TIMEOUT_S)
         if 200 <= status < 300:
             st = self.state()
             st["last_report_at"] = int(now if now is not None else time.time())
             self.write_json("state.json", st)
         return status, body
+
+    def report_later(self, delay=None):
+        """A serving Mint with a status URL posts a report `delay` seconds after a commitment (REPORT_AFTER_COMMIT_S by
+        default), once however many commitments land meanwhile, so the hour shows on the feed within seconds of
+        closing; the timer's heartbeat does the rest. Anything else is a no-op."""
+        if not self._serving or self.role != "mint" or not self.status_url():
+            return
+        with self._report_lock:
+            if self._report_timer is not None:
+                return
+            t = threading.Timer(REPORT_AFTER_COMMIT_S if delay is None else delay, self.report_quietly)
+            t.daemon = True
+            self._report_timer = t
+            t.start()
+
+    def report_quietly(self):
+        """report() from the timer thread: logs the outcome, raises nothing."""
+        with self._report_lock:
+            self._report_timer = None
+        try:
+            status, body = self.report()
+        except (urlerror.URLError, socket.timeout, OSError, ValueError, SystemExit) as e:
+            log("status not posted after the commitment: %s" % e)
+            return
+        if 200 <= status < 300:
+            log("status posted after the commitment: %s" % json.dumps(body, sort_keys=True))
+        elif status in (409, 429):
+            log("status not posted after the commitment (%s %s); the next heartbeat carries it" % (status, body.get("error") if isinstance(body, dict) else body))
+        else:
+            log("status feed refused the report after the commitment: %s %s" % (status, body))
+
+    def map_record(self, now=None):
+        """Mint: the membership's map (load_map) as the signed record a feed lists Mints by (spec, Section 9, informative).
+
+        `kind` "map", `proto`, `by` (this Mint's NYM), `at`, `map` (the file's
+        domains, places and nodes, and `mints`: this Mint's NYM with its name
+        and its domain, the one whose `mint` is this node, else the first) and
+        `sig`: Ed25519 by the Mint over MAP_DOMAIN and the canonical JSON of
+        the record without `sig`. The feed takes it from a Mint its operator
+        names and lists the Mints in `mints`; when Mints reconcile the map
+        among themselves (paper, A.5) the record is what they reconcile.
+        """
+        if self.role != "mint":
+            raise SystemExit("only the Mint signs the map")
+        if self.priv is None:
+            raise SystemExit("no key: the map is signed by the Mint (bwkit keygen)")
+        now = int(now if now is not None else time.time())
+        m = self.load_map()
+        mine = [k for k, d in m["domains"].items() if isinstance(d, dict) and d.get("mint") == self.name]
+        domain = mine[0] if mine else next(iter(m["domains"]), None)
+        rec = {"kind": "map", "proto": PROTO, "by": self.nym, "at": now,
+               "map": {"mints": [{"nym": self.nym, "name": self.name, "domain": domain}],
+                       "domains": m["domains"], "places": m["places"], "nodes": m["nodes"]}}
+        assert_public(canon_json(rec))
+        rec["sig"] = sign_map(self.priv, rec)
+        return rec
+
+    def post_map(self, url, rec=None):
+        """Mint: post the signed map to the feed's /map. Returns (HTTP status, body)."""
+        return http_post(url, rec or self.map_record(), timeout=STATUS_TIMEOUT_S)
 
     # the node's own page
 
@@ -2706,6 +2838,7 @@ class Node:
 
         srv = ThreadingHTTPServer((host, port), Handler)
         srv.daemon_threads = True
+        self._serving = True
         if self.role == "hop" and self.config.get("mint"):
             def retry():
                 while True:
@@ -3095,9 +3228,15 @@ def main(argv=None):
     st.add_argument("--link", help="the announcement in force (a JSON file); without it, the pilot defaults")
     st.add_argument("--price", type=float, default=DEFAULT_PRICE_USD_PER_GB, help="the default price when there is no announcement")
     st.add_argument("--fee", type=float, default=DEFAULT_STEWARD_FEE, help="the Steward's fraction f")
-    rp = sub.add_parser("report", help="mint: post the ledger's public summary to the status page "
-                                       "(BWKIT_STATUS_URL and BWKIT_STATUS_TOKEN, from /etc/bwkit/status.env)")
-    rp.add_argument("--print", dest="print_only", action="store_true", help="print the report instead of posting it")
+    rp = sub.add_parser("report", help="mint: post the ledger's public summary, signed with the Mint's key, to the status feed "
+                                       "(status_url in the config, or BWKIT_STATUS_URL: the feed's /report)")
+    rp.add_argument("--print", dest="print_only", action="store_true", help="print the signed record instead of posting it")
+    rp.add_argument("--url", help="post here instead of status_url")
+    mp = sub.add_parser("map", help="the membership's map as a signed record: what a status feed lists Mints by")
+    mps = mp.add_subparsers(dest="mapcmd", required=True)
+    mpp = mps.add_parser("post", help="mint: sign the map (BWKIT_MAP, or `map` in the config) and post it to the feed's /map")
+    mpp.add_argument("--print", dest="print_only", action="store_true", help="print the signed record instead of posting it")
+    mpp.add_argument("--url", help="post here instead of the /map beside status_url")
     pv = sub.add_parser("prove", help="mint: print the inclusion proofs for every settlement of an hour, against its commitment")
     pv.add_argument("window", help="the hour: Unix seconds (any moment in it) or YYYY-MM-DDTHH in local time")
     vp = sub.add_parser("verify-proof", help="check a proof file against the commitment it carries (no node state needed)")
@@ -3418,17 +3557,39 @@ def main(argv=None):
         if node.role != "mint":
             raise SystemExit("only the Mint reports")
         if args.print_only:
-            print(json.dumps(node.status_report(service=node.service_up()), indent=1, sort_keys=True))
+            print(json.dumps(node.status_record(service=node.service_up()), indent=1, sort_keys=True))
+            return 0
+        if not (args.url or node.status_url()):
+            log("no status URL (status_url in the config, or BWKIT_STATUS_URL): nothing posted")
             return 0
         try:
-            status, body = node.report()
+            status, body = node.report(args.url)
         except (urlerror.URLError, socket.timeout, OSError) as e:
-            log("status page unreachable: %s" % e)
+            log("status feed unreachable: %s" % e)
             return 1
         if not 200 <= status < 300:
-            log("status page refused the report: %s %s" % (status, body))
+            log("status feed refused the report: %s %s" % (status, body))
             return 1
         log("status posted: %s" % json.dumps(body, sort_keys=True))
+    elif args.cmd == "map":
+        if node.role != "mint":
+            raise SystemExit("only the Mint signs the map")
+        rec = node.map_record()
+        if args.print_only:
+            print(json.dumps(rec, indent=1, sort_keys=True))
+            return 0
+        url = args.url or node.map_url()
+        if not url:
+            raise SystemExit("no map URL: set status_url in the config to the feed's /report (the map goes to its /map), or pass --url")
+        try:
+            status, body = node.post_map(url, rec)
+        except (urlerror.URLError, socket.timeout, OSError) as e:
+            log("status feed unreachable: %s" % e)
+            return 1
+        if not 200 <= status < 300:
+            log("status feed refused the map: %s %s" % (status, body))
+            return 1
+        log("map posted: %s" % json.dumps(body, sort_keys=True))
     return 0
 
 
