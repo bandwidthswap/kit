@@ -223,7 +223,9 @@ step_status() {
 import json; p='/etc/bwkit/config.json'; c=json.load(open(p)); c['status_url']='$url'; json.dump(c,open(p,'w'),indent=2); print('bw-mint: status_url', c['status_url'])
 PY"
   COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py steward_rules.py install.sh systemd dashboard phase0/map.json | ssh_to bw-mint 'mkdir -p ~/kit && tar -C ~/kit -xf - && sudo install -m 0755 ~/kit/bwkit.py /usr/local/bin/bwkit && sudo install -m 0644 ~/kit/steward_rules.py /usr/local/bin/steward_rules.py && sudo install -d -m 0755 /usr/local/share/bwkit/dashboard && sudo install -m 0644 ~/kit/dashboard/index.html ~/kit/dashboard/*.css ~/kit/dashboard/*.js /usr/local/share/bwkit/dashboard/ && sudo rm -f /usr/local/share/bwkit/dashboard.html /usr/local/share/bwkit/dashboard/dashboard.html && sudo install -m 0644 ~/kit/systemd/*.service ~/kit/systemd/*.timer /etc/systemd/system/ && sudo rm -f /etc/bwkit/status.env && sudo systemctl daemon-reload && sudo systemctl restart bwkit && sleep 1 && echo "bw-mint: bwkit $(grep -m1 "^VERSION" /usr/local/bin/bwkit | cut -d\" -f2), server $(systemctl is-active bwkit), the token file is gone"'
-  run bw-mint 'sudo systemctl enable -q --now bwkit-status.timer && sudo systemctl start bwkit-status.service && echo "bw-mint: bwkit-status.timer enabled (every ten minutes, five past), a signed report sent"'
+  # The timer is restarted so the new schedule applies; the first post may meet the feed's one-a-minute rate (429) right
+  # after the old timer's last post, and the journal says so; the next heartbeat carries it.
+  run bw-mint 'sudo systemctl enable -q --now bwkit-status.timer && sudo systemctl restart bwkit-status.timer && (sudo systemctl start bwkit-status.service || true) && echo "bw-mint: bwkit-status.timer enabled (every ten minutes, five past); the first signed report:" && journalctl -u bwkit-status -n 1 --no-pager -o cat'
   check_status
 }
 
