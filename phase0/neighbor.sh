@@ -43,12 +43,19 @@
 #
 # Steps, each usable on its own: upgrade time logs tailnet kit peers house fetch update announce check wifi bench
 #
+# Any other node away from the bench is provisioned the same way (Oct 19, 2026): N names it and ROLE its role, e.g.
+#   N=bw-cabin SSH_SUFFIX=-ts phase0/neighbor.sh upgrade      (then time, logs, kit, peers, check; not house, which
+#   repoints bw-house's payer at N, and not tailnet when the card joined the tailnet by itself: the site repo's
+#   tools/card/apply-card.sh does that from ~/.config/bwkit/<node>.env). ROLE=mint installs a second Mint (bw-mint2),
+#   whose peers and feed are its own and are not this script's.
+#
 # Nothing here prints or copies a private key. Tailscale's keys are made on each node; the node's NYM key is made by
 # install.sh and stays on the node, which is the neighbor's. The Mac keeps SSH access through bw-house (phase0/NEIGHBOR.md).
 set -eu
 kit="$(cd "$(dirname "$0")/.." && pwd)"
 SSH="ssh -o ConnectTimeout=8 -o BatchMode=yes"
-N="bw-neighbor"
+N="${N:-bw-neighbor}"
+ROLE="${ROLE:-hop}"
 MINT_LAN="${MINT_LAN:-192.168.0.61}"
 FETCH_URLS="${FETCH_URLS:-https://speed.cloudflare.com/__down?bytes=100000000 http://speedtest.tele2.net/100MB.zip https://speed.hetzner.de/100MB.bin}"
 ts_ip() {
@@ -121,9 +128,13 @@ EOS
 }
 
 step_kit() {
-  say "bwkit on $N as the hop; NYMs exchanged with bw-house and bw-mint"
-  COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py steward_rules.py install.sh systemd dashboard | $SSH $N 'mkdir -p ~/kit && tar -C ~/kit -xf -'
-  run $N 'cd ~/kit && sudo ./install.sh hop'
+  say "bwkit on $N as the $ROLE"
+  COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py steward_rules.py install.sh systemd dashboard | $SSH "$(host_of $N)" 'mkdir -p ~/kit && tar -C ~/kit -xf -'
+  run $N "cd ~/kit && sudo ./install.sh $ROLE"
+  if [ "$ROLE" != hop ]; then
+    run $N 'sudo systemctl enable -q --now bwkit && sleep 1 && systemctl is-active bwkit && sudo -u bwkit bwkit nym'
+    return 0
+  fi
   mint_ts="$(ts_ip bw-mint 2>/dev/null || true)"
   [ -n "$mint_ts" ] || { echo "the Mint's tailnet address is not known yet (bw-mint not reachable and MINT_TS not set); the hop's config gets it in the peers step"; mint_ts="MINT_TS_PENDING"; }
   run $N "sudo python3 - <<'PY'
