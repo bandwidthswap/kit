@@ -73,7 +73,7 @@ SSH_SUFFIX="${SSH_SUFFIX:-}"
 step_upgrade() {
   say "upgrade and reboot $N"
   run $N 'sudo apt-get -o DPkg::Lock::Timeout=600 update -q && sudo DEBIAN_FRONTEND=noninteractive apt-get -o DPkg::Lock::Timeout=600 full-upgrade -y -q && sudo apt-get -o DPkg::Lock::Timeout=600 autoremove -y -q && sudo reboot' || true
-  sleep 20; i=0; until $SSH $N true 2>/dev/null; do i=$((i+1)); [ $i -gt 90 ] && { echo "gave up"; exit 1; }; printf .; sleep 10; done; echo " up"
+  sleep 20; i=0; until $SSH "$(host_of $N)" true 2>/dev/null; do i=$((i+1)); [ $i -gt 90 ] && { echo "gave up"; exit 1; }; printf .; sleep 10; done; echo " up"
   run $N 'uname -r; grep PRETTY /etc/os-release'
 }
 
