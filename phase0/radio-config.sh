@@ -37,15 +37,19 @@ for h in $nodes; do
   gps=DISABLED; case " $gps_nodes " in *" $h "*) gps=ENABLED;; esac
   say "$h: region US, owner $h ($short), role CLIENT, $preset, gps $gps, broadcasts quiet"
   $SSH "$h$SSH_SUFFIX" "$m --set lora.region US --set-owner '$h' --set-owner-short '$short' --set device.role CLIENT --set lora.hop_limit 3 --set lora.modem_preset $preset --set position.gps_mode $gps --set position.position_broadcast_smart_enabled false --set position.position_broadcast_secs 86400 --set telemetry.device_update_interval 86400 --set telemetry.environment_update_interval 86400 2>&1 | grep -vE '^Connected|^Writing|^Set |^INFO|^$' | tail -3"
-  say "$h: the channel bwlab at index 0, its key from the Mac (the board reboots after its settings; up to three tries)"
-  for try in 1 2 3; do
+  say "$h: the channel bwlab at index 0, its key from the Mac (the board reboots after each change; verified by key hash)"
+  want="$(printf '%s' "$LORA_PSK" | shasum -a 256 | cut -c1-16)"
+  have=""
+  for try in 1 2 3 4; do
     sleep 25
-    if printf '%s\n' "$LORA_PSK" | $SSH "$h$SSH_SUFFIX" "read k; $m --ch-index 0 --ch-set name bwlab --ch-set psk base64:\$k 2>&1 | grep -qiE 'reconnect|not fully booted|Timed out|No such file' && exit 1; exit 0"; then echo "$h: channel set (try $try)"; break; fi
-    echo "$h: the board was not ready (try $try)"
+    have="$($SSH "$h$SSH_SUFFIX" "timeout 60 $m --info 2>/dev/null | grep -oE '\"psk\": \"[^\"]*\", \"name\": \"bwlab\"' | head -1 | sed -E 's/\"psk\": \"([^\"]*)\".*/\\1/' | tr -d '\\n' | sha256sum | cut -c1-16" 2>/dev/null || true)"
+    if [ "$have" = "$want" ]; then echo "$h: channel bwlab holds the Mac's key (try $try)"; break; fi
+    printf '%s\n' "$LORA_PSK" | $SSH "$h$SSH_SUFFIX" "read k; timeout 90 $m --ch-index 0 --ch-set name bwlab --ch-set psk base64:\$k >/dev/null 2>&1" || true
+    echo "$h: channel written (try $try); checking after the board's reboot"
   done
-  sleep 20
-  # --info prints the channel's key in full; only the owner, the number, the region, the preset and whether bwlab is there are shown
-  $SSH "$h$SSH_SUFFIX" "$m --info 2>/dev/null | grep -E '^Owner|myNodeNum|\"region\"|modemPreset' | sed 's/^/$h: /' | head -5; $m --info 2>/dev/null | grep -q '\"name\": \"bwlab\"' && echo '$h: channel bwlab at index 0' || echo '$h: NO bwlab channel'" || true
+  [ "$have" = "$want" ] || echo "$h: COULD NOT VERIFY the channel key after four tries"
+  # --info prints the channel's key and a URL that encodes it; only the owner, the number, the region and the preset are shown
+  $SSH "$h$SSH_SUFFIX" "timeout 60 $m --info 2>/dev/null | grep -E '^Owner|myNodeNum|\"region\"|modemPreset' | sed 's/^/$h: /' | head -5" || true
 done
 
 say "what bw-house's board hears (fills in as the others beacon)"
