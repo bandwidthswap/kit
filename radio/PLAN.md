@@ -2,9 +2,9 @@
 
 Written Oct 19, 2026, against bwkit 0.5.0, whitepaper v0.6 Section 9 and the site's roadmap. Phase 1 is the offline-settlement test: receipts, acknowledgements and liveness move onto a low-rate radio channel, a radio link replaces the bench cable to the forest node, and the test is to cut the house's internet mid-window and show the window still settles. The radios are on the desk: three LILYGO T-Beam Supreme boards (915 MHz, SX1262, Meshtastic preloaded, GPS), antennas and cables; the Heltec Wi-Fi HaLow pair for the data plane; and two more Raspberry Pi 3 B boards, which this plan makes nodes. Section 6 asks whether this is the best we can do.
 
-## Status, Oct 19, 2026, 17:45 UTC (the handoff)
+## Status, Oct 24, 2026, 19:10 UTC (the handoff)
 
-Steps 1, 3, 5 and 6 are partly done: `bw-house`'s board is on the private channel `bwlab` (radio id `!435b0188`); the carrier, the codec and the Meshtastic tool are installed on `bw-house`, `bw-neighbor` and `bw-cabin`; the carrier passes its fake-mesh tests and its adapter opened a real board. The other two boards are on no Pi yet, no carrier runs, and the hop needs bwkit 0.5.0 first. The kit's `PUNCH-LIST.md`, "Phase 1: the radios", and the site repo's `CLAUDE.md`, "Pick up here", list the steps in order.
+Steps 1, 3, 5 and 6 are partly done. `bw-house`'s and `bw-cabin`'s boards are on `bwlab`, their carriers run (`bw-house` as the Mint's gateway), a traceroute between them went direct, and the gateway heard the cabin's beacon by radio: the first traffic on this path. `bw-neighbor` has no board yet, so the test (step 7) waits on it. The kit's `PUNCH-LIST.md`, "Phase 1: the radios", and the site repo's `CLAUDE.md`, "Pick up here", list the steps in order.
 
 ## 0. Where we stand
 
