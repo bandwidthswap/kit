@@ -52,6 +52,6 @@ for h in $nodes; do
   $SSH "$h$SSH_SUFFIX" "timeout 60 $m --info 2>/dev/null | grep -E '^Owner|myNodeNum|\"region\"|modemPreset' | sed 's/^/$h: /' | head -5" || true
 done
 
-say "what bw-house's board hears (fills in as the others beacon)"
 first="$(echo "$nodes" | awk '{print $1}')"
+say "what $first's board has heard (fills in as the others announce themselves)"
 $SSH "$first$SSH_SUFFIX" "$m --nodes 2>/dev/null | grep -E '^│ +[0-9]' | cut -c1-120" || true

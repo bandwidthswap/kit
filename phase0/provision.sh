@@ -265,8 +265,10 @@ ids = dict(x.split('=', 1) for x in '$RADIO_IDS'.split())
 p = '/etc/bwkit/config.json'; c = json.load(open(p))
 peers = json.load(open('/var/lib/bwkit/peers.json')) if os.path.exists('/var/lib/bwkit/peers.json') else {}
 radio = c.get('radio') or {}
-radio.update({'port': '/dev/bwradio', 'gateway': $gw, 'peers': {nym: ids[name] for nym, name in peers.items() if name in ids}})
-if not $gw: radio['gateway_id'] = ids.get('$gateway')
+gw = '$gw' == 'true'
+radio.update({'port': '/dev/bwradio', 'gateway': gw, 'peers': {nym: ids[name] for nym, name in peers.items() if name in ids}})
+if gw: radio.pop('gateway_id', None)
+else: radio['gateway_id'] = ids.get('$gateway')
 c['radio'] = radio; json.dump(c, open(p, 'w'), indent=2); print('$h: radio', json.dumps(radio))
 PY"
       run "$h" 'sudo systemctl enable -q --now bwkit-radio && sleep 2 && systemctl is-active bwkit-radio && journalctl -u bwkit-radio -n 2 --no-pager -o cat'

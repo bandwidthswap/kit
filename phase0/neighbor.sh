@@ -27,7 +27,9 @@
 #                    it goes to each node once on stdin and is never echoed). Disable key expiry for the three nodes afterwards.
 #   WIFI_SSID / WIFI_PSK   the neighbor's Wi-Fi, written as a NetworkManager profile that connects when the network is seen
 #   FETCH_URLS       the house's hourly purchase from the neighbor: sources tried in order until one serves 100 MB
-#                    (default: Cloudflare's speed test, then tele2's, then Hetzner's; Cloudflare answered 403 once)
+#                    (default since Oct 24, 2026: Hetzner's Ashburn and Hillsboro hosts, OVH's, thinkbroadband's. The
+#                    first list died on Oct 23: Cloudflare refuses the neighbor's exit (403), tele2 times out and
+#                    speed.hetzner.de no longer resolves.)
 #   MINT_LAN         the Mint's LAN address, which bw-house keeps using (default 192.168.0.61)
 #   NODES            which nodes the tailnet step joins (default: bw-house bw-neighbor bw-mint); the Pi can be joined on
 #                    its own from the neighbor's network, and the bench nodes later from the house LAN
@@ -57,7 +59,7 @@ SSH="ssh -o ConnectTimeout=8 -o BatchMode=yes"
 N="${N:-bw-neighbor}"
 ROLE="${ROLE:-hop}"
 MINT_LAN="${MINT_LAN:-192.168.0.61}"
-FETCH_URLS="${FETCH_URLS:-https://speed.cloudflare.com/__down?bytes=100000000 http://speedtest.tele2.net/100MB.zip https://speed.hetzner.de/100MB.bin}"
+FETCH_URLS="${FETCH_URLS:-https://ash-speed.hetzner.com/100MB.bin https://hil-speed.hetzner.com/100MB.bin https://proof.ovh.net/files/100Mb.dat http://ipv4.download.thinkbroadband.com/100MB.zip}"
 ts_ip() {
   case "$1" in bw-mint) [ -n "${MINT_TS:-}" ] && { echo "$MINT_TS"; return; } ;; "$N") [ -n "${NEIGH_TS:-}" ] && { echo "$NEIGH_TS"; return; } ;; esac
   run "$1" 'tailscale ip -4' | head -1
