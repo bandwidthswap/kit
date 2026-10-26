@@ -15,13 +15,20 @@ By role (every rule is in the plan):
              it had come over HTTP
   hop        a receipt arriving by radio is acknowledged through the node's own /ack (the ack the node already holds,
              if it was asked before) and the ack goes back by radio
+  relay      (a node whose board carries for a hop without one on the same network, bw-mint2 for bw-neighbor) a receipt
+             arriving by radio for that hop is posted to the hop's own /ack over the network and the hop's ack goes
+             back by radio; the relay signs nothing and keeps nothing, and a receipt asked twice gets the hop's one ack
   gateway    (the node that reaches the Mint over the LAN, bw-house) a record arriving by radio for the Mint is posted
              to the Mint and answered with a `delivered`
   everyone   records to the Mint still in the outbox after GRACE_S go to the gateway by radio and are moved to sent/
              on its `delivered`; a beacon every BEACON_S
 
 config.json:  "radio": {"port": "/dev/bwradio", "gateway": false, "gateway_id": "!a1b2c3d4",
-                        "peers": {"<NYM>": "!a1b2c3d4", ...}, "self_url": "http://127.0.0.1:8710"}
+                        "peers": {"<NYM>": "!a1b2c3d4", ...}, "self_url": "http://127.0.0.1:8710",
+                        "relay": {"<hop NYM>": "http://192.168.1.149:8710"}, "names": {"<NYM>": "bw-neighbor", ...}}
+              `peers` is where a NYM's packets go: for a hop reached through a relay, the relay's board. `relay` and
+              `names` are the relay's: the hops it carries for, and the NYMs it must recognise on the air (the hop and
+              its payers) when its own peers.json does not name them.
 """
 
 import importlib.machinery
@@ -59,7 +66,7 @@ def load_bwkit():
 bwkit = load_bwkit()
 log = bwkit.log
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 RADIO_AFTER_S = 2        # a payer's receipt goes to the hop by radio this long after it is signed, unless an ack is held
 ASK_RETRY_S = 5          # and again this often while no ack and no decline has come back
 ASK_GIVE_UP_S = 90       # until this long after t_last: beyond the widest clock tolerance a link would announce, the window is lost
@@ -96,6 +103,8 @@ class Carrier:
         self.gateway = bool(cfg.get("gateway"))
         self.gateway_id = cfg.get("gateway_id")
         self.radio_of = dict(cfg.get("peers") or {})           # NYM -> radio id
+        self.relay = dict(cfg.get("relay") or {})              # hop NYM -> that hop's /ack over this node's network
+        self.names = dict(cfg.get("names") or {})              # NYM -> name, beside the node's own peers
         self.self_url = (cfg.get("self_url") or "http://127.0.0.1:%d" % int(node.config.get("port") or bwkit.DEFAULT_PORT)).rstrip("/")
         self.mint_url = (node.config.get("mint") or "").rstrip("/") or None
         self.pending = {}                                       # (sig, dest) -> {"file": outbox name or None, "sent": t, "tries": n}
@@ -110,7 +119,7 @@ class Carrier:
     # ---------------------------------------------------------------- helpers
 
     def peers(self):
-        return self.node.peers()
+        return {**self.names, **self.node.peers()}
 
     def dest_for(self, nym):
         return self.radio_of.get(nym)
@@ -237,20 +246,24 @@ class Carrier:
         r = env["receipt"]
         if kind == wire.RECEIPT and self.node.role == "hop" and r["hop"] == self.node.nym:
             self.ack_by_radio(env, from_id, now)
+        elif kind == wire.RECEIPT and r["hop"] in self.relay:
+            self.ack_by_radio(env, from_id, now, ack_url=self.relay[r["hop"]])
         if kind == wire.ACK and self.node.role == "payer" and r["payer"] == self.node.nym:
             self.take_ack(env, from_id, now)
         if self.gateway:
             self.deliver_to_mint(env, from_id)
 
-    def ack_by_radio(self, env, from_id, now):
-        """The hop: acknowledge through the node's own /ack, or hand back the ack it already holds, and send it to the payer."""
+    def ack_by_radio(self, env, from_id, now, ack_url=None):
+        """The hop: acknowledge through the node's own /ack, or hand back the ack it already holds, and send it to the
+        payer. A relay (ack_url, the hop's own /ack over the network) asks the hop every time: since bwkit 0.5.0 a hop
+        asked twice returns its one ack, so the relay holds none."""
         r, sig = env["receipt"], env["sig"]
-        ack = self.held_acks().get(sig)
+        ack = None if ack_url else self.held_acks().get(sig)
         if not ack:
             try:
-                status, body = bwkit.http_post(self.self_url + "/ack", env)
+                status, body = bwkit.http_post((ack_url or self.self_url) + "/ack", env)
             except (urlerror.URLError, socket.timeout, OSError) as e:
-                log("radio: the node's own /ack did not answer: %s" % e)
+                log("radio: %s did not answer: %s" % ("the hop %s's /ack" % self.peers().get(r["hop"], r["hop"][:20]) if ack_url else "the node's own /ack", e))
                 return
             if status != 200:
                 word = (body or {}).get("error", "") if isinstance(body, dict) else ""
@@ -266,7 +279,8 @@ class Carrier:
             log("radio: cannot encode the ack: %s" % e)
             return
         self.send(dest, packet, now=now)
-        log("radio: ack %s for %s's receipt %s back to %s" % (ack["sig"][:12], env.get("from"), sig[:12], dest))
+        log("radio: ack %s for %s's receipt %s back to %s%s" % (ack["sig"][:12], env.get("from"), sig[:12], dest,
+            " (relayed for %s)" % ack.get("from") if ack_url else ""))
 
     def take_ack(self, env, from_id, now):
         """The payer: an ack that came by radio, kept as receipt_run keeps one that came over HTTP."""
@@ -414,7 +428,8 @@ def main(argv):
     port = cfg.get("port") or "/dev/bwradio"
     radio = MeshtasticRadio(port)
     carrier = Carrier(node, radio)
-    log("bwradio %s: %s %s on %s as %s%s" % (VERSION, node.role, node.name, port, radio.my_id, ", the Mint's gateway" if carrier.gateway else ""))
+    log("bwradio %s: %s %s on %s as %s%s%s" % (VERSION, node.role, node.name, port, radio.my_id, ", the Mint's gateway" if carrier.gateway else "",
+        ", relays for %s" % ", ".join(carrier.peers().get(n, n[:20]) for n in carrier.relay) if carrier.relay else ""))
     while True:
         radio.poll()
         carrier.tick()

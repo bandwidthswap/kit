@@ -18,7 +18,10 @@
 #                                  venv at /opt/bwradio with the Meshtastic API, bwradio and its unit; prints each board's
 #                                  radio id. With RADIO_IDS="bw-house=!a1b2c3d4 bw-neighbor=!e5f6a7b8 ..." it also writes
 #                                  the `radio` object into each node's config (the gateway is RADIO_GATEWAY, bw-house) and
-#                                  starts the carrier
+#                                  starts the carrier. RADIO_RELAY="bw-neighbor=bw-mint2:http://192.168.1.149:8710" says a
+#                                  hop without a board is carried by another node's on its network (the hop's /ack at that
+#                                  address): the payer sends that hop's receipts to the relay's board, and the relay's
+#                                  config gets the hop's address and the names it must know on the air
 #   phase0/provision.sh steward    bw-mint: the Network Steward (PLAN.md 2.4): the map (phase0/map.json to /etc/bwkit/map.json),
 #                                  the Steward's key, the Mint restarted so it accepts the Steward's postings, and the hourly
 #                                  bwkit-steward.timer (five past the hour, after the commitment); run once at the end
@@ -256,22 +259,42 @@ EOS
     # the radio id is !<myNodeNum in hex>: RADIO_IDS takes it as "bw-house=!a1b2c3d4"
   done
   if [ -n "${RADIO_IDS:-}" ]; then
+    # RADIO_RELAY, as JSON by relay node (hop, the hop's NYM, its /ack, the names on the air: the hop's peers and itself),
+    # read from each hop; base64 so it crosses the quoting below untouched
+    relay_b64=""
+    if [ -n "${RADIO_RELAY:-}" ]; then
+      say "the hops carried by another node's board: $RADIO_RELAY"
+      relay_json="{}"
+      for x in $RADIO_RELAY; do
+        hop="${x%%=*}"; rest="${x#*=}"; via="${rest%%:*}"; url="${rest#*:}"
+        names="$(run "$hop" "sudo python3 -c \"import json, urllib.request; p = json.load(open('/var/lib/bwkit/peers.json')); s = json.load(urllib.request.urlopen('http://127.0.0.1:8710/status')); p[s['nym']] = '$hop'; print(json.dumps({'hop': '$hop', 'nym': s['nym'], 'url': '$url', 'names': p}))\"")"
+        relay_json="$(printf '%s\n%s\n%s\n' "$relay_json" "$via" "$names" | python3 -c "import json, sys; j, via, entry = sys.stdin.read().split('\n', 2); d = json.loads(j); d[via] = json.loads(entry); print(json.dumps(d))")"
+      done
+      relay_b64="$(printf '%s' "$relay_json" | base64 | tr -d '\n')"
+    fi
     say "the radio object in each node's config"
     for h in $nodes; do
       gw=false; [ "$h" = "$gateway" ] && gw=true
       run "$h" "sudo python3 - <<'PY'
-import json, os
+import base64, json, os
 ids = dict(x.split('=', 1) for x in '$RADIO_IDS'.split())
+relay = json.loads(base64.b64decode('$relay_b64') or b'{}')   # relay node -> {hop, nym, url, names}
 p = '/etc/bwkit/config.json'; c = json.load(open(p))
 peers = json.load(open('/var/lib/bwkit/peers.json')) if os.path.exists('/var/lib/bwkit/peers.json') else {}
 radio = c.get('radio') or {}
 gw = '$gw' == 'true'
 radio.update({'port': '/dev/bwradio', 'gateway': gw, 'peers': {nym: ids[name] for nym, name in peers.items() if name in ids}})
+for via, r in relay.items():                                   # a peer carried by a relay is reached at the relay's board
+    if r['nym'] in peers and via in ids: radio['peers'][r['nym']] = ids[via]
+if '$h' in relay:                                              # this node carries for a hop
+    r = relay['$h']
+    radio['relay'] = {r['nym']: r['url']}; radio['names'] = r['names']
+    radio['peers'].update({nym: ids[name] for nym, name in r['names'].items() if name in ids and name != r['hop']})
 if gw: radio.pop('gateway_id', None)
 else: radio['gateway_id'] = ids.get('$gateway')
 c['radio'] = radio; json.dump(c, open(p, 'w'), indent=2); print('$h: radio', json.dumps(radio))
 PY"
-      run "$h" 'sudo systemctl enable -q --now bwkit-radio && sleep 2 && systemctl is-active bwkit-radio && journalctl -u bwkit-radio -n 2 --no-pager -o cat'
+      run "$h" 'sudo systemctl enable -q bwkit-radio && sudo systemctl restart bwkit-radio && sleep 3 && systemctl is-active bwkit-radio && journalctl -u bwkit-radio -n 1 --no-pager -o cat'   # restart: a re-run carries new code and config
     done
   else
     echo "no RADIO_IDS given: the configs are untouched; run again with RADIO_IDS="bw-house=!... bw-neighbor=!..." from the ids printed above"

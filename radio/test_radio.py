@@ -193,7 +193,8 @@ class Outage(unittest.TestCase):
         lab.hour(1_000, 1_000)
         env = self.lines(lab.payer, "receipts.jsonl")[-1]
         stranger = self.mesh.radio("!stranger")
-        stranger.send("!hop", wire.encode(env)[:-1] + b"\x00")              # a corrupted signature byte
+        bent = bytearray(wire.encode(env)); bent[-1] ^= 0x01                 # a corrupted signature byte (a flipped bit: always a change)
+        stranger.send("!hop", bytes(bent))
         stranger.send("!hop", b"hello")                                      # not bwl/1
         bad = json.loads(json.dumps(env)); bad["receipt"]["bytes"] += 1      # re-encoded with the old signature
         stranger.send("!hop", wire.encode(bad))
@@ -228,6 +229,81 @@ class Outage(unittest.TestCase):
         self.assertEqual(self.mesh.queue, [])                   # not again until BEACON_S
         self.hop.tick(lab.t + bwradio.BEACON_S)
         self.assertEqual(len(self.mesh.queue), 1)
+
+
+class Relayed(Outage):
+    """The same outage, with the hop's board gone: a fourth node on the hop's own network (bw-mint2 next door, a Mint
+    with no peers) has the board, and its carrier relays the receipt to the hop's /ack and the hop's ack back."""
+
+    def setUp(self):
+        super().setUp()
+        lab = self.lab
+        self.mesh.radios.pop("!hop")                            # the hop has no board
+        self.payer.radio_of[lab.hop.nym] = "!relay"            # the payer's packets for the hop go to the relay's board
+        self.relay_node = bwkit.Node(os.path.join(lab.root, "mint2"), {"role": "mint", "name": "bw-mint2"})
+        self.relay_node.keygen()                                # it knows no one; the carrier is told the names
+        self.relay_node.config["radio"] = {"gateway": False, "gateway_id": "!house", "peers": {lab.payer.nym: "!house"},
+                                           "relay": {lab.hop.nym: lab.hop_url},
+                                           "names": {lab.payer.nym: "bw-house", lab.hop.nym: "bw-forest"}}
+        self.relay = bwradio.Carrier(self.relay_node, self.mesh.radio("!relay"))
+        self.relay.last_beacon = self.t0 + 10 ** 9
+
+    def test_a_window_settles_by_radio_while_the_internet_is_down(self):
+        lab = self.lab
+        out = self.run_hour(1_000, 1_000)
+        acks = self.lines(lab.payer, "acks.jsonl")
+        self.assertEqual(len(acks), 1)
+        self.assertEqual(acks[0]["receipt"]["prev_sig"], out["receipt"]["sig"])
+        self.assertEqual(acks[0]["from"], "bw-forest")         # the hop's own ack, signed by the hop
+        s = self.settled()
+        self.assertEqual(len(s), 1)
+        self.assertEqual((s[0]["payer_bytes"], s[0]["hop_bytes"], s[0]["status"]), (1_000, 1_000, "settled"))
+        self.assertEqual(self.payer.pending, {})
+        self.assertEqual([d[:2] for d in self.mesh.delivered], [("!house", "!relay"), ("!relay", "!house"), ("!house", "!relay")])
+        self.assertEqual([d[2] for d in self.mesh.delivered], [wire.RECEIPT, wire.ACK, wire.DELIVERED])
+        self.assertEqual(len(self.lines(lab.hop, "acks.jsonl")), 1)
+        self.assertFalse(os.path.exists(self.relay_node.path("acks.jsonl")))   # the relay kept nothing
+        self.assertEqual(os.listdir(self.relay_node.path("outbox")), [])
+        self.assertEqual(len(os.listdir(lab.hop.path("outbox"))), 1)           # the hop's own copy waits for its own path to the Mint
+
+    def test_the_hops_own_copy_reaches_the_mint_through_the_gateway(self):
+        pass                                                    # the hop has no radio here: its copy waits (asserted above)
+
+    def test_a_doubled_receipt_gets_the_same_ack_once(self):
+        lab = self.lab
+        self.run_hour(1_000, 1_000, double=lambda data, dest: data[1] == wire.RECEIPT)
+        self.assertEqual(len(self.lines(lab.hop, "acks.jsonl")), 1)      # the hop's held_ack, asked twice through the relay
+        self.assertEqual(len(self.lines(lab.payer, "acks.jsonl")), 1)
+        self.assertEqual(len(self.settled()), 1)
+
+    def test_the_hop_unreachable_from_the_relay_is_asked_again(self):
+        lab = self.lab
+        self.relay.relay[lab.hop.nym] = "http://127.0.0.1:1"   # the hop's own network is down too
+        lab.hour(1_000, 1_000)
+        now = lab.t
+        self.payer.tick(now)
+        self.payer.tick(now + bwradio.RADIO_AFTER_S)
+        self.mesh.deliver(now=now + 3)
+        self.assertEqual(self.mesh.queue, [])                   # nothing came back
+        self.assertEqual(len(self.payer.pending), 1)
+        self.payer.tick(now + bwradio.RADIO_AFTER_S + bwradio.ASK_RETRY_S)
+        self.assertEqual([q[1][1] for q in self.mesh.queue], [wire.RECEIPT])   # asked again
+        self.relay.relay[lab.hop.nym] = lab.hop_url             # the hop's network is back
+        self.mesh.deliver(now=now + 8)
+        self.mesh.deliver(now=now + 10)
+        self.assertEqual(len(self.lines(lab.payer, "acks.jsonl")), 1)
+
+    def test_a_lost_receipt_is_asked_again_within_the_clock_rule(self):
+        pass                                                    # the payer's side, unchanged: Outage covers it
+
+    def test_a_declined_receipt_stops_the_asking(self):
+        pass                                                    # likewise
+
+    def test_strangers_and_noise_are_dropped(self):
+        pass
+
+    def test_beacons_are_heard_and_written_by_the_gateway(self):
+        pass
 
 
 if __name__ == "__main__":
