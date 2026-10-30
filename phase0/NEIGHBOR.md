@@ -149,7 +149,55 @@ The Mint registers it and every window from the one running settles with the pre
 - The clock: `phase0/link-report.sh` gives the day-by-day figure between the sites; `chronyc tracking` on both ends is the live view, and the hop's journal says if it ever declines a receipt (since bwkit 0.1.1). Section 10 lists drift between sites as unmeasured; this is the measurement.
 - The outbox when the neighbor's internet drops: receipts wait and settle when it returns, which is the claim in Section 1 of the paper.
 - At least one dispute, forced the way the bench did it (`phase0/dispute-test.sh` works unchanged with the hop at the neighbor's), and resolved from the two signed receipts alone.
-- The invoice at the end of the month: `sudo -u bwkit bwkit invoice 2026-11` on `bw-mint`. There is no payment rail; settle it the way neighbors do.
+- The invoice at the end of each month: `sudo -u bwkit bwkit invoice 2026-11` on `bw-mint` at the start of December for the first full month, and `2026-10` on Nov 1 for the partial one; what it prints and what to expect are under "The first invoice, Nov 1" below. There is no payment rail; settle it the way neighbors do.
+
+## The first invoice, Nov 1
+
+October is a partial month: the neighbor's node signed its first window at 00:23 on Oct 18, so October's invoice runs from Oct 18 to Oct 31 and November is the first full month. The command, from a Mac account that holds a lab key and the `-ts` aliases (on the `isiah` Mac, the `isiah` and `todd` accounts since Oct 30):
+
+```
+ssh bw-mint-ts 'sudo -u bwkit bwkit invoice 2026-10'
+```
+
+It reads the Mint's ledger and prints. It writes nothing, so it can be run as often as wanted: before the month is over it is a preview, and on Nov 1 it is the whole month. Months are the Mint's local time, America/Chicago, and a window belongs to the month its `t_last` falls in. A window's `t_last` is one second past the hour, so the window from 22:00 to 23:00 on Oct 31 is October's last and the window from 23:00 to midnight is November's first; from 00:01 on Nov 1 the command gives all of October. The dashboard's Invoice table on the Mint's view sums the same way in the browser's own month, so a browser in the Mint's time zone shows the same figures.
+
+It prints one line per payer and hop, with a refund line under a pair that had short windows, and the Steward's line last. For October, in this order:
+
+```
+2026-10  bw-house pays bw-neighbor: N windows (D disputed), BYTES, $A + $P premium on 168 purchased windows ($0.0000 of it the Steward's): the relay's $R, the Steward's $F
+2026-10    returned to bw-house on short windows: $0.0300
+2026-10  bw-house pays bw-forest: 38 windows (2 disputed), 44.33 MB, $0.0044: the relay's $0.0044, the Steward's $0.0000
+2026-10  the Network Steward's share: $F (f = 0.05 of every settlement since 0.3.0; none before)
+```
+
+- **N windows (D disputed)**: the hourly windows the Mint settled between the two. A disputed window is one where the two signed counts differed by more than the link's margin; it is paid at the smaller count like every other window, so a dispute changes nothing on the invoice. October has seven: five on Oct 18 before the margin was set to ten percent, one on Oct 19 when the hop's counter held 2 KB against the payer's 117 MB, and one on Oct 26 when the hop's count was double the payer's.
+- **BYTES**: the settled bytes, the smaller count of each window, summed.
+- **$A**: the carriage, the settled bytes at the posted ten cents a gigabyte. The first four windows of Oct 18 settled before bwkit 0.3.0 and carry no fee; they are in A whole.
+- **$P premium on 168 purchased windows**: what the house's purchase (`60162767`, Oct 18 to Oct 25) paid above the posted price, two cents a gigabyte on the bytes moved. Every cent of it came from the house's own dollar of escrow, which was never used up, so the Steward's match was never drawn: that is the `$0.0000 of it the Steward's`.
+- **returned to bw-house on short windows**: on the windows under the purchase's 50 MB minimum (the outage of Oct 23 and 24, when the downloads failed and the windows carried tunnel chatter) the premium the minimum would have earned went back to the house. The escrow was the house's own and a line on the invoice, so this line moves no money; it is there so the purchase's arithmetic adds up.
+- **the relay's $R**: A + P − F. This is what the house owes the neighbor.
+- **the Steward's $F**: five percent of A + P on every window since 0.3.0. It is owed to the Steward, not the neighbor, and stays on the Mint's books: `sudo -u bwkit bwkit steward book` on `bw-mint` shows the same figure as the Steward's income, most of it standing in its offers.
+- **bw-house pays bw-forest**: the bench's 38 windows of Oct 16 to 18, before the neighbor's node existed; test traffic between the house's own boards, under half a cent and no fee. Nothing to settle with anyone.
+
+**What to expect.** From the Mint's ledger on Oct 30 at 13:00 (302 windows so far), and what 34 more hours at the current rate add:
+
+| | Oct 18 to Oct 30, 13:00 | expected on Nov 1 |
+|---|---|---|
+| windows (disputed) | 302 (7) | 336 (7), if every hour settles |
+| settled bytes | 31.46 GB | about 35.5 GB |
+| carriage, A | $3.1461 | about $3.55 |
+| premium, P | $0.3217 | the same; the purchase is over |
+| returned on short windows | $0.0300 | the same |
+| the relay's, R | $3.2969 | about $3.68 |
+| the Steward's, F | $0.1709 | about $0.19 |
+
+A window since the purchase resumed carries about 114 MB, $0.0114 of carriage and $0.0006 of fee, about 27 cents a day. P, the refund and the bw-forest line are fixed; A, F and R grow by the hour until 23:00 on Oct 31. If the count on Nov 1 is below 336 an hour did not settle, and `sudo -u bwkit bwkit ledger` on `bw-mint` finds it. The neighbor can check the count against its own `acks.jsonl`, and the ledger is readable to anyone on the tailnet.
+
+**How it is settled.** There is no payment rail. Show the neighbor the `bw-neighbor` line, agree on R, pay it the way neighbors do, and note the date and the amount here:
+
+- October 2026: not yet paid.
+
+The Steward's F stays where it is. At the start of December the same command with `2026-11` is the first full month.
 
 ## What the neighbor needs to know
 
