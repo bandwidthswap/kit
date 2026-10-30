@@ -40,7 +40,8 @@
 #                    ~/.ssh/config goes to its tailnet address through bw-house, once bw-house is on the tailnet
 #   LINK_PRICE LINK_MARGIN LINK_MIN_BYTES LINK_PATIENCE LINK_MEDIUM LINK_RANGE LINK_CLOCK_TOL (seconds; 15 on a link
 #   whose receipts may come by radio: radio/PLAN.md, Section 3)
-#                    the link's terms for `announce` (defaults: 0.10 USD/GB, 0.10, 65536, 0, wifi, building): the price per
+#                    the link's terms for `announce` (defaults: 0.10 USD/GB, 0.03, 65536, 0, wifi, building, 15 s, what the
+#                    neighbor's link announces since Oct 30, 2026, so a bare run re-announces the same terms): the price per
 #                    gigabyte, the agreement margin as a fraction, its floor in bytes, how many windows short of the hop's
 #                    count beyond the margin it bears before declining a payer (0: never), the medium and the range class
 #
@@ -246,8 +247,8 @@ step_update() {
 }
 
 step_announce() {
-  price="${LINK_PRICE:-0.10}"; margin="${LINK_MARGIN:-0.10}"; minb="${LINK_MIN_BYTES:-65536}"; patience="${LINK_PATIENCE:-0}"
-  medium="${LINK_MEDIUM:-wifi}"; range="${LINK_RANGE:-building}"; tol="${LINK_CLOCK_TOL:-5}"
+  price="${LINK_PRICE:-0.10}"; margin="${LINK_MARGIN:-0.03}"; minb="${LINK_MIN_BYTES:-65536}"; patience="${LINK_PATIENCE:-0}"
+  medium="${LINK_MEDIUM:-wifi}"; range="${LINK_RANGE:-building}"; tol="${LINK_CLOCK_TOL:-15}"
   say "the link's terms on $N: $price USD/GB, margin $margin, min_bytes $minb, patience $patience, $medium/$range, clock tolerance $tol s; the on_decline hook"
   # The hook: declining a receipt costs the hop the window and the payer nothing, so the remedy with teeth is to stop
   # offering the exit node. It runs as the bwkit user, so one sudoers line lets it run that one command and no other.
