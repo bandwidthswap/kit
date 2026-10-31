@@ -9,9 +9,10 @@ window.BW = window.BW || {};
   function myMonth(X, now){
     var d=new Date(now*1000), month=d.getFullYear()+'-'+F.pad(d.getMonth()+1), me=X.me, hop=X.role==='hop';
     var W=X.S.filter(function(s){ var e=new Date(s.t_last*1000); return e.getFullYear()+'-'+F.pad(e.getMonth()+1)===month; });
-    var gb=0, carriage=0, fee=0, prem=0, refund=0, disputed=0; W.forEach(function(s){ gb+=s.settled_bytes; carriage+=s.amount_usd||0; fee+=s.fee_usd||0; prem+=s.premium_usd||0; refund+=s.refund_usd||0; if(s.status==='disputed') disputed++; });
-    var mine = hop ? carriage-fee+prem : carriage+prem-refund;
-    var cells=[[hop?'owed to me':'I owe', money(mine), hop?'carriage less the fee, plus premiums':'carriage plus premiums, less what came back'],['windows', String(W.length), disputed+' settled disputed'],['carried', bytes(gb), 'settled bytes'],['the Steward\'s fee', money(fee), 'f of every window'+(hop?', out of my share':', out of what I paid')],['premiums', money(prem), hop?'earned on purchased windows':'paid on my purchases']];
+    var gb=0, carriage=0, fee=0, prem=0, disputed=0; W.forEach(function(s){ gb+=s.settled_bytes; carriage+=s.amount_usd||0; fee+=s.fee_usd||0; prem+=s.premium_usd||0; if(s.status==='disputed') disputed++; });
+    // a window's refund_usd is the premium on its shortfall, which the Mint never drew from the escrow, so it is not owed and not subtracted
+    var mine = hop ? carriage-fee+prem : carriage+prem;
+    var cells=[[hop?'owed to me':'I owe', money(mine), hop?'carriage less the fee, plus premiums':'carriage plus premiums'],['windows', String(W.length), disputed+' settled disputed'],['carried', bytes(gb), 'settled bytes'],['the Steward\'s fee', money(fee), 'f of every window'+(hop?', out of my share':', out of what I paid')],['premiums', money(prem), hop?'earned on purchased windows':'paid on my purchases']];
     return '<h2>My month <small>'+month+', as the Mint settled it</small></h2><div class="now">'+cells.map(function(c){ return '<div><span class="k">'+c[0]+'</span><span class="v">'+esc(c[1])+'</span><span class="s">'+esc(c[2])+'</span></div>'; }).join('')+'</div>';
   }
 

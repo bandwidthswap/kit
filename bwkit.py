@@ -2965,6 +2965,7 @@ class Steward:
             else:
                 status = "open"
             rows.append({"rec": rec, "status": status, "used": used, "pool": pool, "paid": round(total - pool, 6), "total": total,
+                         "returned": round(max(0.0, pool), 6) if status != "open" else 0.0,   # what goes back to whoever put it in
                          "topups": book.topups_total(rec), "mine": rec["poster"] == nym, "refund": u.get("refund", 0.0),
                          "match": book.match_for(rec["id"]) if rec["program"] == "payer" else None})
         mine = [r for r in rows if r["mine"]]
@@ -3120,7 +3121,7 @@ class Steward:
                               "premium_per_gb": rec["premium_per_gb"], "min_bytes": rec["min_bytes"],
                               "windows": rec["windows"], "windows_left": max(0, rec["windows"] - r["used"]), "deadline": rec["deadline"],
                               "posted_at": rec["posted_at"], "escrow_usd": r["total"], "topups_usd": r["topups"], "paid_usd": r["paid"], "refund_usd": r["refund"],
-                              "match_usd": r["match"]["escrow"] if r["match"] else None, "status": r["status"]})
+                              "returned_usd": r["returned"], "match_usd": r["match"]["escrow"] if r["match"] else None, "status": r["status"]})
         payouts = []
         for st in sorted((st for st in t["settled"] if st.get("purchase")), key=lambda st: (-st["t"], -st["t_last"]))[:24]:
             payouts.append({"t": st["t"], "window": {"t_first": st["t_first"], "t_last": st["t_last"]}, "payer": name(st["payer"]),
@@ -3477,6 +3478,8 @@ def main(argv=None):
             steward = node.steward_nym() if node.role == "mint" else None
             for rec in recs:
                 u = book.use.get(rec["id"], {}) if book else {}
+                done = book and (rec["id"] in book.closed or time.time() > rec["deadline"] or u.get("windows", 0) >= rec["windows"])
+                back = round(max(0.0, book.pool(rec)), 6) if done else 0.0
                 who = "the Steward" if rec["poster"] == steward else peers.get(rec["poster"], rec["poster"][:20])
                 print("%s  %-13s %s  %s -> %s%s  >=%s  %s/GB  %d window%s%s  escrow %s%s  until %s" % (
                     rec["id"][:16], rec["program"], who, rec["route"]["from"] if rec["route"]["from"] and not rec["route"]["from"].startswith("ed25519:") else who,
@@ -3484,7 +3487,8 @@ def main(argv=None):
                     fmt_bytes(rec["min_bytes"]), rec["premium_per_gb"], rec["windows"], "" if rec["windows"] == 1 else "s",
                     (", %d used" % u["windows"]) if u.get("windows") else "", book.total_escrow(rec) if book else rec["escrow"],
                     (", %s paid" % round(u.get("own", 0.0) + u.get("steward", 0.0), 6)) if u else "",
-                    time.strftime("%Y-%m-%d %H:%M", time.localtime(rec["deadline"])) + (", closed" if book and rec["id"] in book.closed else "")))
+                    time.strftime("%Y-%m-%d %H:%M", time.localtime(rec["deadline"])) + (", closed" if book and rec["id"] in book.closed else "")
+                    + ((", %s returned" % back) if back else "")))
     elif args.cmd == "steward":
         st = Steward(node)
         if args.swcmd == "keygen":

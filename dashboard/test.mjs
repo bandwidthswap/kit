@@ -68,6 +68,12 @@ function noThrow(label, fn) { let out; try { out = fn(); } catch (e) { throw new
   const key = BW.keyOf(X.S[0]);
   noThrow('a window\'s detail', () => BW.sec.windowDetail(X, key));
   const pur = X.purchases[0]; ok(pur, 'the Mint holds purchases'); noThrow('a purchase\'s detail', () => BW.sec.purchaseDetail(X, pur.id));
+  // the house's purchase: seven windows drew 1.60¢ of the dollar; past its deadline the rest shows as returned
+  const house = X.purchases.find((p) => p.program === 'payer'); ok(house, 'the house\'s purchase is in the snapshot');
+  const paid = X.paidOn[house.id]; eq(paid.windows, 7, 'seven windows settled against it'); eq(paid.own.toFixed(6), '0.016017', 'all of the premium from the poster\'s pool'); eq(paid.drawn, 0, 'nothing from the Steward');
+  ok(html.includes('<td class="n">1.60¢</td><td class="n">98.40¢</td><td><span class="st open">open</span>'), 'premium paid 1.60¢, 98.40¢ unspent, open');
+  const after = house.deadline + 1, Z = BW.derive(after), lateHtml = noThrow('the Mint\'s view past the deadline', () => BW.views.mint(Z, after));
+  ok(lateHtml.includes('<td class="n">98.40¢ <span class="m">returned</span></td><td><span class="st closed">closed</span>'), 'past the deadline the unspent 98.40¢ is marked returned');
   const earlier = now - 86400, Y = BW.derive(earlier);
   ok(Y.S.length < X.S.length && Y.S.length > 0, 'as of a day earlier the books are smaller: ' + Y.S.length);
   noThrow('the Mint\'s view as of a day earlier', () => BW.views.mint(Y, earlier));
@@ -107,6 +113,12 @@ function noThrow(label, fn) { let out; try { out = fn(); } catch (e) { throw new
   ok(html.includes('<span class="k">I owe</span><span class="v">16.13¢</span>'), 'I owe: 16.13¢');
   ok(html.includes('<h2>My purchases'), 'the payer\'s purchases section'); ok(html.includes('<h2>The Mint '), 'the Mint card');
   eq(X.purchases.length, 1, 'one purchase of its own');
+  // a short window's refund is the premium the Mint never drew: it does not lower what the payer owes
+  const Xr = Object.assign({}, X, { S: X.S.map((s, i) => (i ? s : Object.assign({}, s, { refund_usd: 0.05 }))) });
+  ok(BW.views.node(Xr, now).includes('<span class="k">I owe</span><span class="v">16.13¢</span>'), 'I owe is unchanged by a refund on a short window');
+  ok(html.includes('<th class="n">unspent</th>'), 'the purchases table says what is left of the escrow');
+  ok(html.includes('<td class="n">$1.00</td><td class="n">7 / 168'), 'the dollar of escrow, seven windows settled against it so far');
+  ok(html.includes('<td class="n">1.60¢</td><td class="n">98.40¢</td><td><span class="st open">open</span>'), '1.60¢ drawn, 98.40¢ unspent, open and so not called returned');
 }
 
 // ---------------------------------------------------------------- the fleet's view

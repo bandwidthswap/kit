@@ -595,8 +595,10 @@ class Merkle(unittest.TestCase):
         self.assertEqual(c["root"], bwkit.merkle_root([bwkit.leaf_of(s) for s in ss]).hex())
         self.assertTrue(bwkit.verify_commitment(c))
         other = bwkit.nym_of_pub(bwkit.Ed25519PrivateKey.generate().public_key())
+        sig = bytearray(bwkit.b64u_dec(c["signature"]))
+        sig[0] ^= 0x01                                                     # a flipped bit, never a no-op (zeroing the last byte was one in 256 runs)
         for bad in (dict(c, count=1), dict(c, window=c["window"] + 3600), dict(c, root="0" * 64),
-                    dict(c, signature=c["signature"][:-2] + "AA"), dict(c, mint=other), dict(c, signature=None)):
+                    dict(c, signature=bwkit.b64u(bytes(sig))), dict(c, mint=other), dict(c, signature=None)):
             self.assertFalse(bwkit.verify_commitment(bad))
         unsigned = bwkit.make_commitment(None, ss, 1_800_000_000, now=7)    # what a rebuild makes
         self.assertEqual(unsigned["root"], c["root"])
@@ -1760,7 +1762,17 @@ class StewardRole(unittest.TestCase):
         self.assertEqual(fd["payouts"][0]["payer"], "bw-house")
         self.assertEqual((fd["payouts"][0]["hop"], fd["payouts"][0]["premium_usd"], fd["payouts"][0]["window"]), ("bw-forest", 0.002, {"t_first": lab.t - 3600, "t_last": lab.t}))
         self.assertEqual(fd["paid_usd"], 0.0)
+        self.assertEqual(house["returned_usd"], 0.0)                           # open: nothing has come back yet
         bwkit.assert_public(json.dumps(fd))
+        # past its deadline the purchase is expired and the pool it did not spend returns to the poster, and the feed says so
+        late = st.feed(rec["deadline"] + 1)
+        house = [p for p in late["purchases"] if p["program"] == "payer"][0]
+        self.assertEqual((house["status"], house["paid_usd"], house["refund_usd"]), ("expired", 0.002, 0.0))
+        self.assertAlmostEqual(house["returned_usd"], 0.998, places=6)       # the dollar less the one premium drawn
+        self.assertAlmostEqual(house["escrow_usd"], house["paid_usd"] + house["returned_usd"], places=6)
+        m = [p for p in late["purchases"] if p["program"] == "match"][0]
+        self.assertEqual((m["status"], m["paid_usd"]), ("expired", 0.0))
+        self.assertAlmostEqual(m["returned_usd"], 0.00008, places=6)         # the untouched match, back to the Steward
         # the command line
         env = mint_env(lab)
         rc, text = cli(["steward", "book"], env)
