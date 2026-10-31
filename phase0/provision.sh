@@ -25,6 +25,10 @@
 #   phase0/provision.sh steward    bw-mint: the Network Steward (PLAN.md 2.4): the map (phase0/map.json to /etc/bwkit/map.json),
 #                                  the Steward's key, the Mint restarted so it accepts the Steward's postings, and the hourly
 #                                  bwkit-steward.timer (five past the hour, after the commitment); run once at the end
+#   phase0/provision.sh invoice    bw-mint: the monthly invoice written by the Mint itself: bwkit-invoice.timer runs
+#                                  `bwkit invoice --save` ten minutes into the first of each month (the Mint's local
+#                                  time), which writes last month's invoice to /var/lib/bwkit/invoices/<month>.txt;
+#                                  GET /invoice on the Mint serves it (and the month so far before it is written)
 #   phase0/provision.sh check      the four verifications, nothing changed
 #   phase0/provision.sh all        upgrade, time, tunnel, logs and kit, in order
 #
@@ -315,6 +319,13 @@ step_steward() {
   run bw-mint 'systemctl list-timers bwkit-steward.timer --no-pager | head -2'
 }
 
+step_invoice() {
+  say "the monthly invoice on bw-mint: the units, the timer, this month so far as a check"
+  COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit" -cf - bwkit.py steward_rules.py install.sh systemd dashboard phase0/map.json | ssh_to bw-mint 'mkdir -p ~/kit && tar -C ~/kit -xf - && sudo install -m 0755 ~/kit/bwkit.py /usr/local/bin/bwkit && sudo install -m 0644 ~/kit/steward_rules.py /usr/local/bin/steward_rules.py && sudo install -d -m 0755 /usr/local/share/bwkit/dashboard && sudo install -m 0644 ~/kit/dashboard/index.html ~/kit/dashboard/*.css ~/kit/dashboard/*.js /usr/local/share/bwkit/dashboard/ && sudo install -m 0644 ~/kit/systemd/*.service ~/kit/systemd/*.timer /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl restart bwkit && sleep 1 && echo "bw-mint: bwkit $(grep -m1 "^VERSION" /usr/local/bin/bwkit | cut -d\" -f2), server $(systemctl is-active bwkit)"'
+  run bw-mint 'sudo systemctl enable -q --now bwkit-invoice.timer && systemctl list-timers bwkit-invoice.timer --no-pager | head -2'
+  run bw-mint 'sudo -u bwkit bwkit invoice "$(date +%Y-%m)" && echo "bw-mint: GET /invoice serves $(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:8710/invoice?month=$(date +%Y-%m)"), saved so far: $(curl -s http://127.0.0.1:8710/invoices)"'
+}
+
 check_status() {
   say "status reporter"
   run bw-mint 'systemctl list-timers bwkit-status.timer --no-pager | head -2; journalctl -u bwkit-status -n 2 --no-pager -o cat'
@@ -331,6 +342,7 @@ case "${1:-}" in
   map) step_map ;;
   radio) step_radio ;;
   steward) step_steward ;;
+  invoice) step_invoice ;;
   check) check_time; check_tunnel; check_kit; check_status ;;
   all) step_upgrade; step_time; step_tunnel; step_logs; step_kit ;;
   *) sed -n '2,26p' "$0"; exit 2 ;;

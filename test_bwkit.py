@@ -944,6 +944,51 @@ def cli(args, env):
     return rc, out.getvalue()
 
 
+class Invoices(unittest.TestCase):
+    """The monthly invoice (spec, Section 8): the month before this one by default, written by the timer, served at /invoice."""
+
+    def setUp(self):
+        self.lab = Lab()
+
+    def tearDown(self):
+        self.lab.close()
+
+    def test_previous_month(self):
+        self.assertEqual(bwkit.previous_month(time.mktime((2026, 11, 1, 0, 10, 0, 0, 0, -1))), "2026-10")
+        self.assertEqual(bwkit.previous_month(time.mktime((2027, 1, 15, 12, 0, 0, 0, 0, -1))), "2026-12")
+
+    def test_saved_and_served(self):
+        lab = self.lab
+        lab.hour(1_000_000_000, 1_000_000_000)
+        month = time.strftime("%Y-%m", time.localtime(lab.t))
+        # before the timer has run, /invoice is the month so far
+        status, body = bwkit.http_get(lab.mint_url + "/invoice?month=" + month)
+        self.assertEqual(status, 200)
+        self.assertIn("1 windows (0 disputed), 1.00 GB, $0.1000: the relay's $0.0950, the Steward's $0.0050", body)
+        self.assertIn("the month so far, computed now", body)
+        self.assertEqual(json.loads(bwkit.http_get(lab.mint_url + "/invoices")[1]), [])
+        # what the timer runs; a second run rewrites the same file
+        rc, text = cli(["invoice", month, "--save"], mint_env(lab))
+        self.assertEqual(rc, 0)
+        self.assertIn("the Network Steward's share: $0.0050", text)
+        self.assertIn("saved to %s" % os.path.join(lab.mint.dir, "invoices", month + ".txt"), text)
+        rc, text = cli(["invoice", month, "--save"], mint_env(lab))
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(bwkit.http_get(lab.mint_url + "/invoices")[1]), [month])
+        status, body = bwkit.http_get(lab.mint_url + "/invoice?month=" + month)
+        self.assertIn("1 windows (0 disputed), 1.00 GB", body)
+        self.assertIn("written ", body)
+        self.assertNotIn("computed now", body)
+        # no month: the month before this one, which this lab has nothing in
+        rc, text = cli(["invoice"], mint_env(lab))
+        self.assertEqual((rc, text), (0, "no settlements in %s\n" % bwkit.previous_month()))
+        with self.assertRaises(SystemExit):
+            cli(["invoice", "10-2026"], mint_env(lab))
+        with self.assertRaises(bwkit.urlerror.HTTPError) as cm:
+            bwkit.http_get(lab.mint_url + "/invoice?month=10-2026")
+        self.assertEqual(cm.exception.code, 400)
+
+
 class Links(unittest.TestCase):
     """Link announcements (spec, Section 7): signed by the hop, registered with the Mint, in force from `since`."""
 

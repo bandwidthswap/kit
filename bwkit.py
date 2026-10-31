@@ -89,7 +89,7 @@ try:
 except ImportError:                 # an older install without it: everything but purchases and the Steward still runs
     rules = None
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 IMPL = "bwkit/" + VERSION               # `impl` in every envelope: informational, never the profile
 PROTO = 1                               # the profile every record this kit writes carries (spec, Section 14)
 PROTOS = (1,)                           # the profiles it accepts; a record without `proto` is profile 1
@@ -889,6 +889,13 @@ def check_proof(doc, mint=None):
             ok = False
             lines.append("BAD: %s" % e)
     return ok, lines
+
+
+def previous_month(now=None):
+    """The month before the one `now` falls in, YYYY-MM, in local time: what the invoice timer sums on the first."""
+    t = time.localtime(now if now is not None else time.time())
+    y, m = (t.tm_year, t.tm_mon - 1) if t.tm_mon > 1 else (t.tm_year - 1, 12)
+    return "%04d-%02d" % (y, m)
 
 
 def parse_hour(text):
@@ -2090,6 +2097,61 @@ class Node:
             o["relay_usd"] = round(o["amount_usd"] + o["premium_usd"] - o["fee_usd"], 6)
         return out
 
+    def invoice_text(self, month):
+        """The invoice as `bwkit invoice` prints it: one line per payer and hop, a refund line under a pair with short windows, the Steward's line last."""
+        peers = self.peers()
+        tot = self.invoice(month)
+        lines = []
+        if not tot:
+            lines.append("no settlements in %s" % month)
+        fees = 0.0
+        for (payer, hop), o in sorted(tot.items()):
+            fees = round(fees + o["fee_usd"], 6)
+            lines.append("%s  %s pays %s: %d windows (%d disputed), %s, $%.4f%s: the relay's $%.4f, the Steward's $%.4f" % (
+                month, peers.get(payer, payer), peers.get(hop, hop), o["windows"], o["disputed"],
+                fmt_bytes(o["settled_bytes"]), o["amount_usd"],
+                " + $%.4f premium on %d purchased window%s ($%.4f of it the Steward's)" % (
+                    o["premium_usd"], o["purchases"], "" if o["purchases"] == 1 else "s", o["from_steward_usd"]) if o["purchases"] else "",
+                o["relay_usd"], o["fee_usd"]))
+            if o["refund_usd"]:
+                lines.append("%s    returned to %s on short windows: $%.4f" % (month, peers.get(payer, payer), o["refund_usd"]))
+        if tot:
+            lines.append("%s  the Network Steward's share: $%.4f (f = %s of every settlement since 0.3.0; none before)" % (
+                month, fees, self.config.get("steward_fee", DEFAULT_STEWARD_FEE)))
+        return "\n".join(lines) + "\n"
+
+    def invoice_save(self, month, now=None):
+        """Write the month's invoice to invoices/<month>.txt (bwkit-invoice.timer does this on the first of the next month) and return the path.
+
+        The file is the text with one line added saying when it was written; a second run rewrites it the same.
+        """
+        text = self.invoice_text(month) + "written %s by bwkit %s on %s\n" % (
+            time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(now if now is not None else time.time())), VERSION, self.config.get("name", "the Mint"))
+        d = self.path("invoices")
+        os.makedirs(d, exist_ok=True)
+        tmp = os.path.join(d, month + ".txt.tmp")
+        with open(tmp, "w") as f:
+            f.write(text)
+        os.replace(tmp, os.path.join(d, month + ".txt"))
+        return os.path.join(d, month + ".txt")
+
+    def invoice_saved(self, month):
+        """The saved invoice's text, or None when the month has none."""
+        if not re.match(r"^\d{4}-\d{2}$", month):
+            return None
+        p = self.path("invoices", month + ".txt")
+        if not os.path.exists(p):
+            return None
+        with open(p) as f:
+            return f.read()
+
+    def invoices_saved(self):
+        """The months with a saved invoice, oldest first."""
+        d = self.path("invoices")
+        if not os.path.isdir(d):
+            return []
+        return sorted(n[:-4] for n in os.listdir(d) if re.match(r"^\d{4}-\d{2}\.txt$", n))
+
     # the status page
 
     def service_up(self):
@@ -2814,6 +2876,16 @@ class Node:
                     if not node.map_path_exists():
                         return self.reply(404, {"error": "no map on this node"})
                     return self.reply(200, node.load_map())
+                if url.path == "/invoice" and node.role == "mint":
+                    month = urlparse.parse_qs(url.query).get("month", [""])[0] or previous_month()
+                    if not re.match(r"^\d{4}-\d{2}$", month):
+                        return self.reply(400, {"error": "month must be YYYY-MM"})
+                    text = node.invoice_saved(month)
+                    if text is None:
+                        text = node.invoice_text(month) + "the month so far, computed now; the Mint writes %s.txt on the first of the next month\n" % month
+                    return self.raw(text.encode(), "text/plain; charset=utf-8", filename="invoice-%s.txt" % month)
+                if url.path == "/invoices" and node.role == "mint":
+                    return self.reply(200, node.invoices_saved())
                 if url.path == "/proof" and node.role == "mint":
                     q = urlparse.parse_qs(url.query).get("window", [""])[0]
                     if not q.isdigit():
@@ -3240,8 +3312,9 @@ def main(argv=None):
     lg = sub.add_parser("ledger", help="mint: print the ledger")
     lg.add_argument("--disputes", action="store_true", help="only disputed settlements")
     lg.add_argument("--json", action="store_true")
-    iv = sub.add_parser("invoice", help="mint: sum a month's settlements (YYYY-MM), with the Steward's share apart")
-    iv.add_argument("month")
+    iv = sub.add_parser("invoice", help="mint: sum a month's settlements (YYYY-MM; without one, last month), with the Steward's share apart")
+    iv.add_argument("month", nargs="?", help="YYYY-MM in the Mint's local time; the default is the month before this one")
+    iv.add_argument("--save", action="store_true", help="also write it to invoices/<month>.txt under the state directory, where GET /invoice serves it")
     vf = sub.add_parser("verify", help="check the signature on receipt files (no node state needed)")
     vf.add_argument("files", nargs="+")
     st = sub.add_parser("settle", help="resolve one window offline from a receipt file and an ack file")
@@ -3556,24 +3629,12 @@ def main(argv=None):
                     time.strftime("%Y-%m-%d %H:%M", time.localtime(e["received_at"])), e["kind"], e["from"],
                     r["t_first"], r["t_last"], fmt_bytes(r["bytes"]), e["sig"][:12]))
     elif args.cmd == "invoice":
-        peers = node.peers()
-        tot = node.invoice(args.month)
-        if not tot:
-            print("no settlements in %s" % args.month)
-        fees = 0.0
-        for (payer, hop), o in sorted(tot.items()):
-            fees = round(fees + o["fee_usd"], 6)
-            print("%s  %s pays %s: %d windows (%d disputed), %s, $%.4f%s: the relay's $%.4f, the Steward's $%.4f" % (
-                args.month, peers.get(payer, payer), peers.get(hop, hop), o["windows"], o["disputed"],
-                fmt_bytes(o["settled_bytes"]), o["amount_usd"],
-                " + $%.4f premium on %d purchased window%s ($%.4f of it the Steward's)" % (
-                    o["premium_usd"], o["purchases"], "" if o["purchases"] == 1 else "s", o["from_steward_usd"]) if o["purchases"] else "",
-                o["relay_usd"], o["fee_usd"]))
-            if o["refund_usd"]:
-                print("%s    returned to %s on short windows: $%.4f" % (args.month, peers.get(payer, payer), o["refund_usd"]))
-        if tot:
-            print("%s  the Network Steward's share: $%.4f (f = %s of every settlement since 0.3.0; none before)" % (
-                args.month, fees, node.config.get("steward_fee", DEFAULT_STEWARD_FEE)))
+        month = args.month or previous_month()
+        if not re.match(r"^\d{4}-\d{2}$", month):
+            raise SystemExit("the month is YYYY-MM, as in 2026-10")
+        print(node.invoice_text(month), end="")
+        if args.save:
+            print("saved to %s" % node.invoice_save(month))
     elif args.cmd == "prove":
         if node.role != "mint":
             raise SystemExit("only the Mint proves")

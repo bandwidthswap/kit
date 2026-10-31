@@ -153,13 +153,13 @@ The Mint registers it and every window from the one running settles with the pre
 
 ## The first invoice, Nov 1
 
-October is a partial month: the neighbor's node signed its first window at 00:23 on Oct 18, so October's invoice runs from Oct 18 to Oct 31 and November is the first full month. The command, from a Mac account that holds a lab key and the `-ts` aliases (on the `isiah` Mac, the `isiah` and `todd` accounts since Oct 30):
+October is a partial month: the neighbor's node signed its first window at 00:23 on Oct 18, so October's invoice runs from Oct 18 to Oct 31 and November is the first full month. **Nobody has to run anything on the first.** Since bwkit 0.5.1 (Oct 31) the Mint writes the invoice itself: `bwkit-invoice.timer` on `bw-mint` runs `bwkit invoice --save` at 00:10 on the first of each month, in the Mint's local time, and the text lands in `/var/lib/bwkit/invoices/2026-10.txt` with a last line saying when it was written (`Persistent=true`: a Mint that was off at the time writes it when it is next up). To read it, from any machine on the tailnet, open the Mint's `/invoice` on port 8710 in a browser or with curl (`?month=2026-10` for a particular month; the default is last month's; `/invoices` lists the months written), or, with a lab key:
 
 ```
 ssh bw-mint-ts 'sudo -u bwkit bwkit invoice 2026-10'
 ```
 
-It reads the Mint's ledger and prints. It writes nothing, so it can be run as often as wanted: before the month is over it is a preview, and on Nov 1 it is the whole month. Months are the Mint's local time, America/Chicago, and a window belongs to the month its `t_last` falls in. A window's `t_last` is one second past the hour, so the window from 22:00 to 23:00 on Oct 31 is October's last and the window from 23:00 to midnight is November's first; from 00:01 on Nov 1 the command gives all of October. The dashboard's Invoice table on the Mint's view sums the same way in the browser's own month, so a browser in the Mint's time zone shows the same figures.
+Both read the Mint's ledger and print; neither changes it, so run them as often as wanted. Before the file exists, `/invoice` and the command give the month so far, as a preview. Months are the Mint's local time, America/Chicago, and a window belongs to the month its `t_last` falls in. A window's `t_last` is one second past the hour, so the window from 22:00 to 23:00 on Oct 31 is October's last and the window from 23:00 to midnight is November's first; the timer's 00:10 is after both. The dashboard's Invoice table on the Mint's view sums the same way in the browser's own month, so a browser in the Mint's time zone shows the same figures. `SSH_SUFFIX=-ts phase0/provision.sh invoice` is what installed the timer, and re-running it is harmless.
 
 It prints one line per payer and hop, with a refund line under a pair that had short windows, and the Steward's line last. For October, in this order:
 
@@ -193,11 +193,11 @@ It prints one line per payer and hop, with a refund line under a pair that had s
 
 A window since the purchase resumed carries about 114 MB, $0.0114 of carriage and $0.0006 of fee, about 27 cents a day. P, the refund and the bw-forest line are fixed; A, F and R grow by the hour until 23:00 on Oct 31. If the count on Nov 1 is below 336 an hour did not settle, and `sudo -u bwkit bwkit ledger` on `bw-mint` finds it. The neighbor can check the count against its own `acks.jsonl`, and the ledger is readable to anyone on the tailnet.
 
-**How it is settled.** There is no payment rail. Show the neighbor the `bw-neighbor` line, agree on R, pay it the way neighbors do, and note the date and the amount here:
+**How it is settled.** There is no payment rail, and the saved file is arithmetic, not a payment. Show the neighbor the `bw-neighbor` line (they can read the same `/invoice` from their own node, over the tailnet), agree on R, pay it the way neighbors do, and note the date and the amount here:
 
 - October 2026: not yet paid.
 
-The Steward's F stays where it is. At the start of December the same command with `2026-11` is the first full month.
+The Steward's F stays where it is. On Dec 1 the timer writes `2026-11.txt`, the first full month, the same way.
 
 ## What the neighbor needs to know
 

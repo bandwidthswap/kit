@@ -1,0 +1,11 @@
+[Unit]
+Description=bwkit: the Mint sums last month's settlements and writes the invoice to invoices/<month>.txt
+After=bwkit.service
+
+[Service]
+Type=oneshot
+User=bwkit
+Group=bwkit
+# Without a month, `invoice` takes the month before this one, in the Mint's local time; the file is served at GET /invoice.
+ExecStart=/usr/local/bin/bwkit invoice --save
+Environment=PYTHONUNBUFFERED=1

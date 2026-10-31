@@ -1,0 +1,10 @@
+[Unit]
+Description=bwkit: write last month's invoice ten minutes into the first of the month
+
+[Timer]
+OnCalendar=*-*-01 00:10:00
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
