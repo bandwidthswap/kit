@@ -199,6 +199,110 @@ A window since the purchase resumed carries about 114 MB, $0.0114 of carriage an
 
 The Steward's F stays where it is. On Dec 1 the timer writes `2026-11.txt`, the first full month, the same way.
 
-## What the neighbor needs to know
+## For the operator of bw-neighbor
 
-The box uses a little of their connection every hour, about the size of a short video, and nothing else. It only connects outward, to the house's private network, and listens for nothing from the internet. The house can log into it through that connection to maintain it; they can stop that by removing the house's key, and stop everything by unplugging it. The receipts it signs are its own, kept on the box, and are the proof of what it carried and what it is owed.
+The rest of this file is written about you, for the house. This section is written to you. The box in your house is yours: you hold its keys, you set its price, and you can read every number it is owed from the box itself, without asking the house. Each part below is something you can do on your own.
+
+### Your key
+
+The box takes no passwords; it takes keys. Six keys open it today and all six are the house's (the lines in its `~/.ssh/authorized_keys` whose comment starts `bandwidthswap-pis-`). The seventh should be one the house never held. Make it on your own computer, on a Mac, Windows 10 or later, or Linux, in a terminal:
+
+```
+ssh-keygen -t ed25519 -f ~/.ssh/bw-neighbor -C "<your name> bw-neighbor"
+```
+
+That writes two files. `~/.ssh/bw-neighbor` is the private half: it never leaves your computer, and nobody, the house included, should ever ask for it. `~/.ssh/bw-neighbor.pub` is one line of text that is safe to send any way you like; text it to the house, and they put it on the box beside their own with `phase0/neighbor.sh key` (the line on stdin; it prints the fingerprints of every key on the box afterwards and nothing else). From then on, from your own Wi-Fi:
+
+```
+ssh -i ~/.ssh/bw-neighbor bw@bw-neighbor.local
+```
+
+(`bw-neighbor.local` is the box's name on your network. If your computer cannot find it, your router's device list shows its address; on Nov 1, 2026 it was 192.168.1.149.) The `bw` user can `sudo`, so from that prompt everything below is yours to do, including the last step of this part: the house's six lines are in `~/.ssh/authorized_keys`, and deleting them (`nano ~/.ssh/authorized_keys`, delete the `bandwidthswap-pis-` lines, save) ends the house's access to the box. Keep yours. The house then updates the kit by sending you the steps, or not at all; nothing on the box stops working without them.
+
+### What runs on it
+
+Raspberry Pi OS, and on it four services and one timer. `systemctl status <name>` shows each.
+
+| Name | What it is |
+|---|---|
+| `bwkit` | The hop: a small Python program (`/usr/local/bin/bwkit`, one file, readable) that meters the tunnel interface, signs an acknowledgement of each hour's receipt from the house, sends it to the Mint, keeps its own copy of everything it signs in `/var/lib/bwkit/` (`sudo ls` there; `acks.jsonl` is yours, `receipts.jsonl` the house's receipts since Oct 18), and serves your page on port 8710. |
+| `tailscaled` | The tunnel the house's traffic comes through, and the "exit node" it offers: the service you are paid for is the house sending its hourly download out through your connection. |
+| `chrony` | The clock, set from the public time pool. The receipts carry times, and when the house's receipt is more than fifteen seconds from the box's own clock the box refuses to sign it. |
+| `avahi-daemon` | Answers to `bw-neighbor.local` on your Wi-Fi. |
+| `bwkit-linklog.timer` | Every ten minutes, one line of byte counters and the clock's offset into `/var/lib/bwkit/linklog.jsonl`. It stays on the box; the house reads it over SSH when it wants the week's figures. |
+
+Nothing else of the house's runs on it. `sudo journalctl -u bwkit -n 20` shows the last twenty lines the hop wrote, one per hour: `ack for bw-house <window>: payer says N, we say M`.
+
+### What it sends, and to whom
+
+Everything the box sends over your connection, and nothing is left out:
+
+- **To the Mint, once an hour,** your acknowledgement: the house's receipt (the window's start and end times, its byte count, both public keys, its signature), your byte count with the four counter readings it came from, and your signature. No name, no address: the Mint knows you as `bw-neighbor` from a list it keeps, and your key is the only thing in the record that identifies the box. The same goes for the announcement when you change the terms (next part). The Mint is the house's own box, reached over the tunnel at a private address.
+- **To the house, once an hour,** the same acknowledgement, in answer to its receipt. Your page reads nothing from the house: it reads the Mint's records through your own box.
+- **Through your connection, once an hour,** the house's download: 100 MB from a public test file, about 2.4 GB a day. That is the bandwidth you sell. The box forwards it and keeps no record of it; what the house fetched is in the house's own log.
+- **To Tailscale's servers,** the tunnel's coordination traffic, and **to the public time pool,** chrony's. Neither carries a record of yours.
+
+The box accepts connections on two ports: `22` (SSH, keys only) and `8710` (your page and the hop's own API). Your router forwards neither, so nothing from the internet reaches them; anyone on your Wi-Fi can read the page, which holds the same counts and keys as above.
+
+### How to read your page
+
+`http://bw-neighbor.local:8710/` on your Wi-Fi (or the address above). It redraws every minute; the slider at the top moves every section back to an earlier moment. Top to bottom, the parts that matter to you:
+
+- **Now**: whether the hop is up, the last receipt it countersigned, what waits in the outbox for the Mint, how many windows have settled, and the clock's offset from its time source.
+- **Attention**: anything wrong, in words, or nothing. A gap between your count and the house's beyond the margin shows here before it shows anywhere else.
+- **My month** (`owed to me`): what the Mint has settled for you this month, the number of windows and how many were disputed, the bytes carried, the Steward's fee taken out, the premiums earned. The figure is yours after the fee.
+- **The invoice**: last month as the Mint wrote it, your line picked out, and this month so far. This is the number you are paid; the next part says how to check it.
+- **My link**: the terms you announced (price, margin, since when), and **Payers**, the house's standing against your patience, once it has been counted short at all.
+- **My windows**: every window of yours the Mint settled, newest first, both counts side by side, with *disputed* on the ones that differed by more than the margin. A disputed window is paid at the smaller count, like every window.
+- **The Mint**: who keeps the books, whether it answered just now, how many of your last 24 windows are in committed hours, and the button *verify the latest hour here*. Press it. The box fetches the Mint's signed commitment for the latest hour and the proof of the windows settled in it, and your browser checks both with the Mint's public key: *verified* means the Mint's books hold those windows exactly as it committed to them, *failed* means they do not. Press it again after a redraw; the line is wiped each minute.
+
+### The invoice, and whether it is true
+
+On the first of each month the Mint writes last month's invoice, and your page shows it under **The invoice** within the hour. Your line reads like this (October's, which began on Oct 18):
+
+```
+2026-10  bw-house pays bw-neighbor: 336 windows (8 disputed), 35.22 GB, $3.5219 + $0.3217 premium on 168 purchased windows ($0.0000 of it the Steward's): the relay's $3.6539, the Steward's $0.1897
+```
+
+*The relay's* figure is yours, the house pays it to you however you two settle up; *the Steward's* is the Mint's fee and stays on its books. To check the line against your own records rather than the Mint's, on the box:
+
+```
+sudo -u bwkit bwkit owed 2026-10
+```
+
+It rebuilds the month from the receipts and acknowledgements the box itself signed, by the same rule the Mint uses, prints the line it gets, and sets it against the Mint's figure by figure: `matches the Mint's invoice` and exit 0, or each figure that differs and why, and exit 1. One honest gap: the box has kept the house's receipts only since Oct 18 (the kit before that day kept only your acknowledgement), so October's first thirteen windows cannot be rebuilt from your copies alone, and the command says so; the house can hand you its `receipts.jsonl` and `--receipts <file>` fills them. From November the month is whole on your box.
+
+### Changing the price, or any of the terms
+
+The price is yours, and the margin, and the rest. They are in one block of `/etc/bwkit/config.json`:
+
+```
+"link": {
+  "price": 0.1,             dollars per gigabyte carried
+  "margin": 0.03,           how far apart the two counts may be and still agree, as a fraction (0.03 is 3%)
+  "min_bytes": 65536,       the margin's floor in bytes, so a tiny window is never a dispute
+  "patience_windows": 0,    how many windows the house may count short of yours beyond the margin before you stop serving it; 0 means never
+  "medium": "wifi",         what the link is, for the record
+  "range_class": "building",
+  "clock_tolerance_s": 15   how far off the house's clock may be from yours before you refuse to sign, in seconds
+}
+```
+
+To change one: `sudo nano /etc/bwkit/config.json`, edit the number (keep the commas and the quotes as they are; the file is JSON), save, then
+
+```
+sudo systemctl restart bwkit
+sudo -u bwkit bwkit announce
+```
+
+The first makes the running hop read the new block. The second signs the terms with the box's key and registers them with the Mint, which prints what it registered: `announced <hash>: 0.12 USD/GB, margin 0.03, ...`. From the next window on, every window settles under those terms, and **My link** on your page shows them within the hour, `since` the moment you announced. The window running when you announced settles under the old terms. `sudo -u bwkit bwkit announce --print` shows the signed announcement without sending it, if you want to look first. A file that no longer parses stops the hop from starting; `bwkit` names the line, and `sudo journalctl -u bwkit -n 5` shows the message. There is no approval step on the house's side: the house pays the price you announce, or stops buying.
+
+### How to stop it
+
+Three ways, from the mildest:
+
+- **Stop carrying, keep the records:** `sudo tailscale set --advertise-exit-node=false`. The house's downloads fail from the next hour and no more windows settle. `--advertise-exit-node=true` offers it again (the house may have to approve it once more in its Tailscale console).
+- **Stop the hop:** `sudo systemctl stop bwkit`, and `sudo systemctl disable bwkit` to keep it stopped across a reboot. The house's receipts go unanswered and the windows do not settle.
+- **Leave:** `sudo tailscale logout` takes the box off the house's network, or unplug it. Everything in `/var/lib/bwkit/` stays on the card: your acknowledgements are your proof of what you carried and what you are owed, with or without the box running.
+
+Removing the house's keys (under *Your key*) is separate from all three: the box can carry with the house locked out, or stop with it still able to log in.

@@ -21,6 +21,9 @@
 #                               `bwkit announce`: the signed announcement is registered with the Mint and governs every
 #                               window that starts from now
 #   phase0/neighbor.sh bench    put bw-house's payer back on bw-forest over wg0 (the bench as it was)
+#   phase0/neighbor.sh key      < their.pub   put the operator's own public key on bw-neighbor beside the lab keys: one line
+#                               (the .pub file's contents) on stdin, checked with ssh-keygen before it goes, then `keys`
+#   phase0/neighbor.sh keys     the keys that open bw-neighbor, by fingerprint and comment; never the key itself
 #
 # Environment:
 #   TS_AUTHKEY       required for prep: a Tailscale pre-authentication key from the admin console (one-off keys are best;
@@ -45,7 +48,7 @@
 #                    gigabyte, the agreement margin as a fraction, its floor in bytes, how many windows short of the hop's
 #                    count beyond the margin it bears before declining a payer (0: never), the medium and the range class
 #
-# Steps, each usable on its own: upgrade time logs tailnet kit peers house fetch update announce check wifi bench
+# Steps, each usable on its own: upgrade time logs tailnet kit peers house fetch update announce key keys check wifi bench
 #
 # Any other node away from the bench is provisioned the same way (Oct 19, 2026): N names it and ROLE its role, e.g.
 #   N=bw-cabin SSH_SUFFIX=-ts phase0/neighbor.sh upgrade      (then time, logs, kit, peers, check; not house, which
@@ -284,6 +287,25 @@ EOS
   run bw-mint 'sudo -u bwkit bwkit links'
 }
 
+step_key() {
+  # The operator's own key, made on their machine (phase0/NEIGHBOR.md, "Your key"): the public line comes on stdin and is
+  # appended to the bw user's authorized_keys beside the lab keys, once. Nothing here reads or copies a private key.
+  line="$(head -n 1 | tr -d '\r')"
+  case "$line" in
+    ssh-ed25519\ *|ssh-rsa\ *|ecdsa-sha2-*|sk-ssh-ed25519@openssh.com\ *|sk-ecdsa-sha2-*) ;;
+    *) echo "stdin must hold one public key line, the .pub file's contents (ssh-ed25519 AAAA... comment); nothing was changed"; exit 2 ;;
+  esac
+  printf '%s\n' "$line" | ssh-keygen -lf - >/dev/null 2>&1 || { echo "ssh-keygen cannot read that as a public key; nothing was changed"; exit 2; }
+  say "the operator's key on $N: $(printf '%s\n' "$line" | ssh-keygen -lf - | cut -d' ' -f2-)"
+  printf '%s\n' "$line" | $SSH "$(host_of $N)" 'read -r line; f=~/.ssh/authorized_keys; umask 077; mkdir -p ~/.ssh; touch "$f"; if grep -qxF -- "$line" "$f"; then echo "$(hostname): already there"; else printf "%s\n" "$line" >> "$f"; echo "$(hostname): added"; fi'
+  step_keys
+}
+
+step_keys() {
+  say "the keys that open $N, by fingerprint and comment (the lab's are bandwidthswap-pis-*)"
+  run $N 'ssh-keygen -lf ~/.ssh/authorized_keys'
+}
+
 step_check() {
   say "the tailnet, as bw-house sees it"
   run bw-house 'tailscale status | head -5'
@@ -307,6 +329,6 @@ case "${1:-}" in
   prep)  step_upgrade; step_time; step_logs; step_tailnet; step_kit; step_peers; step_house; step_check; step_wifi ;;
   check) step_check ;;
   bench) step_bench ;;
-  upgrade|time|logs|wifi|tailnet|kit|peers|house|fetch|update|announce) "step_$1" ;;
+  upgrade|time|logs|wifi|tailnet|kit|peers|house|fetch|update|announce|key|keys) "step_$1" ;;
   *) sed -n '2,20p' "$0"; exit 2 ;;
 esac

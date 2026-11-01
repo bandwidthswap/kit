@@ -1354,8 +1354,15 @@ class Node:
     def from_env(cls):
         directory = os.environ.get("BWKIT_DIR", "/var/lib/bwkit")
         cfg = os.environ.get("BWKIT_CONFIG", "/etc/bwkit/config.json")
-        with open(cfg) as f:
-            return cls(directory, json.load(f))
+        try:
+            with open(cfg) as f:
+                return cls(directory, json.load(f))
+        except OSError as e:
+            raise SystemExit("could not read the config %s: %s" % (cfg, e.strerror or e))
+        except ValueError as e:
+            # An operator edits this file by hand (phase0/NEIGHBOR.md): the line, not a traceback.
+            raise SystemExit("the config %s is not JSON: %s. Put it back to shape (every value but the last in a block ends with a comma, "
+                             "numbers bare, words in double quotes), then restart bwkit." % (cfg, e))
 
     def path(self, *parts):
         return os.path.join(self.dir, *parts)

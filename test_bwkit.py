@@ -946,6 +946,34 @@ def cli(args, env):
     return rc, out.getvalue()
 
 
+class Config(unittest.TestCase):
+    """The config an operator edits by hand (phase0/NEIGHBOR.md): a file that does not parse names its line, not a traceback."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="bwkit-test-")
+
+    def tearDown(self):
+        shutil.rmtree(self.root)
+
+    def test_a_config_that_is_not_json_names_the_line(self):
+        cfg = os.path.join(self.root, "config.json")
+        with open(cfg, "w") as f:
+            f.write('{\n "role": "hop",\n "name": "x",\n "link": {"price": 0.12,}\n}\n')
+        with mock.patch.dict(os.environ, {"BWKIT_DIR": self.root, "BWKIT_CONFIG": cfg}), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                bwkit.main(["nym"])
+        self.assertIn("the config %s is not JSON: " % cfg, str(cm.exception))
+        self.assertIn("line 4", str(cm.exception))
+        self.assertIn("then restart bwkit", str(cm.exception))
+
+    def test_a_missing_config_is_named(self):
+        cfg = os.path.join(self.root, "nowhere.json")
+        with mock.patch.dict(os.environ, {"BWKIT_DIR": self.root, "BWKIT_CONFIG": cfg}), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as cm:
+                bwkit.main(["nym"])
+        self.assertIn("could not read the config %s: No such file or directory" % cfg, str(cm.exception))
+
+
 class Invoices(unittest.TestCase):
     """The monthly invoice (spec, Section 8): the month before this one by default, written by the timer, served at /invoice."""
 
