@@ -435,7 +435,9 @@ class StatusReport(unittest.TestCase):
         self.assertEqual(rec["sig"], bwkit.sign_status(self.lab.mint.priv, body))
         # what JSON carries round-trips: the signature holds on the parsed text, floats and all
         self.assertTrue(bwkit.verify_status(json.loads(json.dumps(rec))))
-        for tamper in ({"generated_at": rec["generated_at"] + 1}, {"mint": self.lab.hop.nym}, {"sig": rec["sig"][:-2] + "AA"}):
+        flipped = bytearray(bwkit.b64u_dec(rec["sig"]))
+        flipped[0] ^= 0x01                                                 # a flipped bit, never a no-op (zeroing the last byte was one in 256 runs)
+        for tamper in ({"generated_at": rec["generated_at"] + 1}, {"mint": self.lab.hop.nym}, {"sig": bwkit.b64u(bytes(flipped))}):
             bad = dict(rec)
             bad.update(tamper)
             self.assertFalse(bwkit.verify_status(bad), tamper)
@@ -2449,8 +2451,8 @@ class Dashboard(unittest.TestCase):
             self.assertEqual(snap["map"]["places"]["the-cabin"]["name"], "the cabin", role)    # the Mint's map, proxied to the nodes
             if role != "mint":
                 invoices = {m: lab.mint.invoice_text(m) + "the month so far, computed now; the Mint writes %s.txt on the first of the next month\n" % m
-                        for m in (bwkit.previous_month(), time.strftime("%Y-%m"))}      # the Mint's invoice for last month and this one, through the node
-            self.assertEqual(snap["mint"], {"ledger": mint_ledger, "commitments": lab.mint.commitments(), "name": "bw-mint", "invoice": invoices}, role)
+                            for m in (bwkit.previous_month(), time.strftime("%Y-%m"))}      # the Mint's invoice for last month and this one, through the node
+                self.assertEqual(snap["mint"], {"ledger": mint_ledger, "commitments": lab.mint.commitments(), "name": "bw-mint", "invoice": invoices}, role)
                 self.assertEqual(snap["outbox"], [], role)
                 self.assertEqual(snap["acks"], open(getattr(lab, role).path("acks.jsonl")).read(), role)
                 self.assertEqual(snap["receipts"], open(getattr(lab, role).path("receipts.jsonl")).read(), role)
@@ -2515,7 +2517,7 @@ class Dashboard(unittest.TestCase):
         lab.hop.config["mint"] = "http://127.0.0.1:1"
         lab.hop._mint_info = None
         snap = self.snapshot_of(bwkit.http_get(lab.hop_url + "/snapshot")[1])
-        self.assertEqual((snap["mint"], snap["proofs"], snap["map"]), ({"ledger": "", "commitments": [], "name": None}, {}, None))
+        self.assertEqual((snap["mint"], snap["proofs"], snap["map"]), ({"ledger": "", "commitments": [], "name": None, "invoice": {}}, {}, None))
         self.assertIn('"kind": "ack"', snap["acks"])
 
 
