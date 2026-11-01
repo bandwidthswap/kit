@@ -28,6 +28,8 @@ html,body{margin:0;background:var(--bg);color:var(--fg);font-family:var(--sans);
 main{max-width:1240px;margin:0 auto;padding:16px max(16px,env(safe-area-inset-right,0px)) 56px max(16px,env(safe-area-inset-left,0px))}
 h2{font-size:15px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--muted);margin:28px 0 8px;display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}
 h2 small{font-weight:400;letter-spacing:0;text-transform:none;color:var(--muted);font-size:13px}
+main>h3,section>h3,#view h3:not(.card h3){font-size:13px;font-weight:700;margin:14px 0 4px;display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}
+h3 small{font-weight:400;color:var(--muted);font-size:12px}
 .now{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1px;background:var(--line);border:1px solid var(--line);border-radius:8px;overflow:hidden}
 .now div{background:var(--panel);padding:10px 12px;min-width:0}
 .now .k{display:block;font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
@@ -95,3 +97,4 @@ svg .close{fill:var(--info)} svg .close.slow{fill:var(--warn)}
 .fleet-add{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:8px 0 0}
 .fleet-add input{font:inherit;font-size:13px;border:1px solid var(--line);background:var(--panel);color:var(--fg);border-radius:4px;padding:4px 8px;min-width:220px}
 @media (max-width:640px){ .bar .name{font-size:16px} .now .v{font-size:17px} .chart svg{min-height:120px} }
+pre.invoice{font-size:12px;line-height:1.5;white-space:pre-wrap;overflow-wrap:anywhere;margin:6px 0 0;padding:8px 10px;border:1px solid var(--line);border-radius:4px;background:var(--panel)}

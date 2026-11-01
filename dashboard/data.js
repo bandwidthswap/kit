@@ -42,6 +42,7 @@ window.BW = window.BW || {};
     D.receipts=typeof s.receipts==='string'?parseJsonl(s.receipts):(s.receipts||[]);
     D.outbox=s.outbox||[];
     if(s.mint){ D.mint={ledger: typeof s.mint.ledger==='string'?parseJsonl(s.mint.ledger):(s.mint.ledger||[]), commitments: s.mint.commitments||[], name: s.mint.name||null}; }
+    D.mintInvoice=(s.mint&&s.mint.invoice)||{};   // {month: the Mint's invoice text}, read through this node when the snapshot was taken
     if(s.nodes){ D.mode='fleet'; D.nodes=s.nodes.map(function(n){ return {url:n.url, name:n.name, status:n.status||null, steward:n.steward||null, map:n.map||null, ledger: typeof n.ledger==='string'?parseJsonl(n.ledger):(n.ledger||[]), error:n.error||null, mine: n.mine!==false}; }); }
     D.fetchedAt=s.taken_at||(s.status&&s.status.time)||Math.floor(Date.now()/1000);
     return true;
@@ -65,6 +66,7 @@ window.BW = window.BW || {};
         jobs.push(opt(b, '/purchases', true, '').then(function(v){ D.purchases=parseJsonl(v); }));
         jobs.push(opt(b, '/outbox', false, []).then(function(v){ D.outbox=v||[]; }));
         jobs.push(opt(b, '/mint/ledger', true, '').then(function(t){ D.mint={ledger: parseJsonl(t), commitments: [], name: st.mint_name||null}; return opt(b, '/mint/commitments', false, []).then(function(c){ D.mint.commitments=c||[]; }); }));
+        jobs.push(Promise.all(BW.invoiceMonths(Math.floor(Date.now()/1000)).map(function(m){ return opt(b, '/mint/invoice?month='+m, true, null).then(function(t){ return [m, t]; }); })).then(function(pairs){ var inv={}; pairs.forEach(function(x){ if(typeof x[1]==='string') inv[x[0]]=x[1]; }); D.mintInvoice=inv; }));
         jobs.push(opt(b, '/map', false, null).then(function(v){ D.map=v; }));
       }
       return Promise.all(jobs);
@@ -83,6 +85,8 @@ window.BW = window.BW || {};
   };
 
   // ---------------------------------------------------------------- derive the books as of a moment
+  // The two months a node's Invoice section shows: the one before this (the Mint writes it on the first) and this one so far.
+  BW.invoiceMonths = function(now){ var d=new Date(now*1000), y=d.getFullYear(), m=d.getMonth(); var pad=function(n){ return (n<10?'0':'')+n; }; var prev = m===0 ? (y-1)+'-12' : y+'-'+pad(m); return [prev, y+'-'+pad(m+1)]; };
   BW.now = function(){ return D.asOf || (D.snapshot ? D.fetchedAt : Math.floor(Date.now()/1000)); };
 
   function keyOf(r){ return r.payer+'|'+r.hop+'|'+r.t_first; }

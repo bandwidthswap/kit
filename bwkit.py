@@ -891,6 +891,80 @@ def check_proof(doc, mint=None):
     return ok, lines
 
 
+def invoice_sums(entries, month):
+    """The sums `bwkit invoice` prints, per (payer, hop), over the settlements of a month (YYYY-MM, local time, by t_last).
+
+    A settlement from before profile 1 carries no fee, so none is taken from it. The Mint sums its ledger; a hop sums
+    the ledger it rebuilt from its own copies (`bwkit owed`), and the two agree or the invoice is wrong.
+    """
+    out = {}
+    for e in entries:
+        if e.get("kind") != "settlement":
+            continue
+        if time.strftime("%Y-%m", time.localtime(e["t_last"])) != month:
+            continue
+        k = (e["payer"], e["hop"])
+        o = out.setdefault(k, {"windows": 0, "disputed": 0, "settled_bytes": 0, "amount_usd": 0.0, "fee_usd": 0.0, "relay_usd": 0.0,
+                               "premium_usd": 0.0, "refund_usd": 0.0, "from_steward_usd": 0.0, "purchases": 0})
+        o["windows"] += 1
+        o["disputed"] += 1 if e["status"] == "disputed" else 0
+        o["settled_bytes"] += e["settled_bytes"]
+        fee = e.get("fee_usd", 0.0)
+        o["amount_usd"] = round(o["amount_usd"] + e["amount_usd"], 6)
+        o["fee_usd"] = round(o["fee_usd"] + fee, 6)
+        if e.get("purchase"):
+            o["purchases"] += 1
+            o["premium_usd"] = round(o["premium_usd"] + e["premium_usd"], 6)
+            o["refund_usd"] = round(o["refund_usd"] + e["refund_usd"], 6)
+            o["from_steward_usd"] = round(o["from_steward_usd"] + e["from_steward_usd"], 6)
+        o["relay_usd"] = round(o["amount_usd"] + o["premium_usd"] - o["fee_usd"], 6)
+    return out
+
+
+def invoice_pair_line(month, payer_name, hop_name, o):
+    """One pair's line of the invoice, the form `parse_invoice_line` reads back."""
+    return "%s  %s pays %s: %d windows (%d disputed), %s, $%.4f%s: the relay's $%.4f, the Steward's $%.4f" % (
+        month, payer_name, hop_name, o["windows"], o["disputed"],
+        fmt_bytes(o["settled_bytes"]), o["amount_usd"],
+        " + $%.4f premium on %d purchased window%s ($%.4f of it the Steward's)" % (
+            o["premium_usd"], o["purchases"], "" if o["purchases"] == 1 else "s", o["from_steward_usd"]) if o["purchases"] else "",
+        o["relay_usd"], o["fee_usd"])
+
+
+INVOICE_LINE_RE = re.compile(
+    r"^(?P<month>\d{4}-\d{2})  (?P<payer>\S+) pays (?P<hop>\S+): (?P<windows>\d+) windows \((?P<disputed>\d+) disputed\), "
+    r"(?P<bytes>[0-9.]+ [KMGT]?B), \$(?P<amount>[0-9.]+)"
+    r"(?: \+ \$(?P<premium>[0-9.]+) premium on (?P<purchases>\d+) purchased windows? \(\$(?P<from_steward>[0-9.]+) of it the Steward's\))?"
+    r": the relay's \$(?P<relay>[0-9.]+), the Steward's \$(?P<fee>[0-9.]+)$")
+
+
+def parse_invoice_line(line):
+    """A pair's line of an invoice back into its figures (the strings as printed), or None for any other line."""
+    m = INVOICE_LINE_RE.match(line.rstrip("\n"))
+    if not m:
+        return None
+    d = m.groupdict()
+    return {"month": d["month"], "payer": d["payer"], "hop": d["hop"], "windows": int(d["windows"]), "disputed": int(d["disputed"]),
+            "bytes": d["bytes"], "amount": d["amount"], "premium": d["premium"] or "0.0000", "purchases": int(d["purchases"] or 0),
+            "from_steward": d["from_steward"] or "0.0000", "relay": d["relay"], "fee": d["fee"]}
+
+
+def invoice_lines(tot, peers, month, fee):
+    """The invoice's text from its sums: one line per payer and hop, a refund line under a pair with short windows, the Steward's line last."""
+    lines = []
+    if not tot:
+        lines.append("no settlements in %s" % month)
+    fees = 0.0
+    for (payer, hop), o in sorted(tot.items()):
+        fees = round(fees + o["fee_usd"], 6)
+        lines.append(invoice_pair_line(month, peers.get(payer, payer), peers.get(hop, hop), o))
+        if o["refund_usd"]:
+            lines.append("%s    returned to %s on short windows: $%.4f" % (month, peers.get(payer, payer), o["refund_usd"]))
+    if tot:
+        lines.append("%s  the Network Steward's share: $%.4f (f = %s of every settlement since 0.3.0; none before)" % (month, fees, fee))
+    return "\n".join(lines) + "\n"
+
+
 def previous_month(now=None):
     """The month before the one `now` falls in, YYYY-MM, in local time: what the invoice timer sums on the first."""
     t = time.localtime(now if now is not None else time.time())
@@ -2070,55 +2144,12 @@ class Node:
         return no_ack, no_receipt
 
     def invoice(self, month):
-        """Sum the settlements of a month (YYYY-MM) per payer and hop, in local time, with the Steward's share apart.
-
-        A settlement from before profile 1 carries no fee, so none is taken from it.
-        """
-        out = {}
-        for e in self.ledger_lines():
-            if e.get("kind") != "settlement":
-                continue
-            if time.strftime("%Y-%m", time.localtime(e["t_last"])) != month:
-                continue
-            k = (e["payer"], e["hop"])
-            o = out.setdefault(k, {"windows": 0, "disputed": 0, "settled_bytes": 0, "amount_usd": 0.0, "fee_usd": 0.0, "relay_usd": 0.0,
-                                   "premium_usd": 0.0, "refund_usd": 0.0, "from_steward_usd": 0.0, "purchases": 0})
-            o["windows"] += 1
-            o["disputed"] += 1 if e["status"] == "disputed" else 0
-            o["settled_bytes"] += e["settled_bytes"]
-            fee = e.get("fee_usd", 0.0)
-            o["amount_usd"] = round(o["amount_usd"] + e["amount_usd"], 6)
-            o["fee_usd"] = round(o["fee_usd"] + fee, 6)
-            if e.get("purchase"):
-                o["purchases"] += 1
-                o["premium_usd"] = round(o["premium_usd"] + e["premium_usd"], 6)
-                o["refund_usd"] = round(o["refund_usd"] + e["refund_usd"], 6)
-                o["from_steward_usd"] = round(o["from_steward_usd"] + e["from_steward_usd"], 6)
-            o["relay_usd"] = round(o["amount_usd"] + o["premium_usd"] - o["fee_usd"], 6)
-        return out
+        """Sum the settlements of a month (YYYY-MM) per payer and hop, in local time, with the Steward's share apart (invoice_sums)."""
+        return invoice_sums(self.ledger_lines(), month)
 
     def invoice_text(self, month):
         """The invoice as `bwkit invoice` prints it: one line per payer and hop, a refund line under a pair with short windows, the Steward's line last."""
-        peers = self.peers()
-        tot = self.invoice(month)
-        lines = []
-        if not tot:
-            lines.append("no settlements in %s" % month)
-        fees = 0.0
-        for (payer, hop), o in sorted(tot.items()):
-            fees = round(fees + o["fee_usd"], 6)
-            lines.append("%s  %s pays %s: %d windows (%d disputed), %s, $%.4f%s: the relay's $%.4f, the Steward's $%.4f" % (
-                month, peers.get(payer, payer), peers.get(hop, hop), o["windows"], o["disputed"],
-                fmt_bytes(o["settled_bytes"]), o["amount_usd"],
-                " + $%.4f premium on %d purchased window%s ($%.4f of it the Steward's)" % (
-                    o["premium_usd"], o["purchases"], "" if o["purchases"] == 1 else "s", o["from_steward_usd"]) if o["purchases"] else "",
-                o["relay_usd"], o["fee_usd"]))
-            if o["refund_usd"]:
-                lines.append("%s    returned to %s on short windows: $%.4f" % (month, peers.get(payer, payer), o["refund_usd"]))
-        if tot:
-            lines.append("%s  the Network Steward's share: $%.4f (f = %s of every settlement since 0.3.0; none before)" % (
-                month, fees, self.config.get("steward_fee", DEFAULT_STEWARD_FEE)))
-        return "\n".join(lines) + "\n"
+        return invoice_lines(self.invoice(month), self.peers(), month, self.config.get("steward_fee", DEFAULT_STEWARD_FEE))
 
     def invoice_save(self, month, now=None):
         """Write the month's invoice to invoices/<month>.txt (bwkit-invoice.timer does this on the first of the next month) and return the path.
@@ -2151,6 +2182,133 @@ class Node:
         if not os.path.isdir(d):
             return []
         return sorted(n[:-4] for n in os.listdir(d) if re.match(r"^\d{4}-\d{2}\.txt$", n))
+
+    def owed(self, month, purchases_path=None, invoice_path=None, links_path=None, price=DEFAULT_PRICE_USD_PER_GB, fee=DEFAULT_STEWARD_FEE):
+        """Hop or payer: the month's invoice line from this node's own copies alone, set against the Mint's.
+
+        The receipts and acks this node kept (its own and the other side's,
+        countersigned) and the announcements it made are rebuilt into
+        settlements by the Mint's own rule (rebuild, spec Section 11) and
+        summed as the Mint sums an invoice (invoice_sums), with no Mint
+        involved. Then the Mint's invoice for the month is read, through this
+        node's proxy when it answers or from --invoice, and the line that
+        names this node is compared figure by figure. The Mint's word was
+        never the proof; this is that sentence as a command.
+
+        Purchases are the Mint's: --purchases, or /purchases through the
+        proxy (signed records, checked like everything else); without them a
+        purchased window's premium cannot be computed and the text says so.
+        A payer keeps no announcements, so --links or the Mint's /links.
+
+        Returns (text, rc): 0 when every figure of every line agrees, 1 when
+        one differs, 2 when the Mint's invoice could not be read or compared.
+        """
+        if self.role == "mint":
+            raise SystemExit("the Mint prints its invoice with `bwkit invoice`; `owed` is for a hop or a payer")
+        me, my_name = self.nym, self.config.get("name") or self.nym
+
+        def own(name):
+            p = self.path(name)
+            return read_jsonl(p) if os.path.exists(p) else ([], [])
+
+        receipts, bad_r = own("receipts.jsonl")
+        acks, bad_a = own("acks.jsonl")
+        sources = []
+        if links_path:
+            links, bad_l = read_jsonl(links_path)
+            sources.append("announcements from %s" % os.path.basename(links_path))
+        elif self.role == "hop":
+            links, bad_l = own("links.jsonl")
+            sources.append("my own announcements")
+        else:
+            links, bad_l = [], []
+        purchases, bad_p, purchases_known = [], [], False      # known: the Mint's registry was read, even if it is empty
+        if purchases_path:
+            purchases, bad_p = read_jsonl(purchases_path)
+            purchases_known = True
+            sources.append("purchases from %s" % os.path.basename(purchases_path))
+        mint_text = None
+        if invoice_path:
+            with open(invoice_path) as f:
+                mint_text = f.read()
+        proxied = []
+        try:
+            if not purchases_path:
+                status, data, _ = self.proxy_get("/purchases")
+                if status == 200:
+                    purchases = [(i, json.loads(line)) for i, line in enumerate(data.decode("utf-8").split("\n"), 1) if line.strip()]
+                    purchases_known = True
+                    proxied.append("purchases")
+            if links_path is None and self.role != "hop":
+                status, data, _ = self.proxy_get("/links")
+                if status == 200:
+                    links = [(i, rec) for i, rec in enumerate(json.loads(data.decode("utf-8")), 1)]
+                    proxied.append("announcements")
+            if mint_text is None:
+                status, data, _ = self.proxy_get("/invoice?month=" + month)
+                if status == 200:
+                    mint_text = data.decode("utf-8")
+                    proxied.append("the invoice")
+        except (urlerror.URLError, socket.timeout, OSError, ValueError):
+            pass
+        if proxied:
+            sources.append("from the Mint through this node: " + ", ".join(proxied))
+        place_of = place_lookup(self.load_map(), self.peers()) if self.map_path_exists() else None
+        entries, rep = rebuild(receipts, acks, links, price, fee, purchases=purchases, place_of=place_of)
+        left_out = bad_r + bad_a + bad_l + bad_p + rep["bad"]
+        names = dict(self.peers())
+        names.setdefault(me, my_name)
+        mine = {k: v for k, v in invoice_sums(entries, month).items() if (k[1] if self.role == "hop" else k[0]) == me}
+        lines = ["from my own copies: %d receipts and %d acks under %d announcements and %d purchases (%s) rebuilt into %d settlements, %d of them mine in %s%s" % (
+            rep["receipts"], rep["acks"], rep["links"], rep["purchases"], "; ".join(sources) or "nothing else",
+            rep["settlements"], sum(o["windows"] for o in mine.values()), month,
+            "; %d lines left out" % len(left_out) if left_out else "")]
+        for line in left_out:
+            lines.append("left out: " + line)
+        if not purchases_known:
+            lines.append("no purchases at hand (the Mint did not answer; pass --purchases <file>): a purchased window's premium is not computed here")
+        for (payer, hop), o in sorted(mine.items()):
+            lines.append(invoice_pair_line(month, names.get(payer, payer), names.get(hop, hop), o))
+            if o["refund_usd"]:
+                lines.append("%s    returned to %s on short windows: $%.4f" % (month, names.get(payer, payer), o["refund_usd"]))
+        if not mine:
+            lines.append("%s  no window of mine settled" % month)
+        total = round(sum(o["relay_usd"] if self.role == "hop" else o["amount_usd"] + o["premium_usd"] for o in mine.values()), 6)
+        lines.append("%s  %s: $%.4f" % (month, "owed to me, the relay's share of every line" if self.role == "hop" else "I owe, carriage and premiums of every line", total))
+        # against the Mint's invoice
+        if mint_text is None:
+            lines.append("the Mint's invoice was not read (no Mint answered through this node; pass --invoice <file>), so nothing was compared")
+            return "\n".join(lines) + "\n", 2
+        mint_lines = [r for r in (parse_invoice_line(l) for l in mint_text.split("\n")) if r]
+        mint_mine = [r for r in mint_lines if (r["hop"] if self.role == "hop" else r["payer"]) == my_name]
+        if not mine and not mint_mine:
+            lines.append("matches the Mint's invoice: neither side has a window of mine in %s" % month)
+            return "\n".join(lines) + "\n", 0
+        if not mint_mine:
+            lines.append("DIFFERS: the Mint's invoice has no line naming %s (it names %s); the Mint may know me by another name, or holds none of my windows" % (
+                my_name, ", ".join(sorted({r["hop"] if self.role == "hop" else r["payer"] for r in mint_lines})) or "no pair at all"))
+            return "\n".join(lines) + "\n", 2
+        diffs = []
+        by_other = {(r["payer"] if self.role == "hop" else r["hop"]): r for r in mint_mine}
+        for (payer, hop), o in sorted(mine.items()):
+            other = names.get(payer, payer) if self.role == "hop" else names.get(hop, hop)
+            r = by_other.pop(other, None)
+            if r is None:
+                diffs.append("the Mint has no line for %s" % other)
+                continue
+            own_line = parse_invoice_line(invoice_pair_line(month, names.get(payer, payer), names.get(hop, hop), o))
+            for field in ("windows", "disputed", "bytes", "amount", "premium", "purchases", "from_steward", "relay", "fee"):
+                if own_line[field] != r[field]:
+                    unit = "" if field in ("windows", "disputed", "purchases", "bytes") else "$"
+                    diffs.append("%s with %s: %s%s here, %s%s on the Mint" % (field, other, unit, own_line[field], unit, r[field]))
+        for other in by_other:
+            diffs.append("the Mint has a line for %s that my copies do not" % other)
+        if diffs:
+            lines.append("DIFFERS from the Mint's invoice:")
+            lines.extend("  " + d for d in diffs)
+            return "\n".join(lines) + "\n", 1
+        lines.append("matches the Mint's invoice, figure for figure: %s $%.4f" % ("the relay's" if self.role == "hop" else "I owe", total))
+        return "\n".join(lines) + "\n", 0
 
     # the status page
 
@@ -2612,10 +2770,11 @@ class Node:
 
     def snapshot_remote(self):
         """A hop's or a payer's share of a snapshot that comes from its Mint, fetched before the node's lock is taken:
-        {mint: {ledger, commitments, name}, map, proofs}. Nothing of it is re-serialised: the ledger is the Mint's text,
-        the proofs are the Mint's text, for the hours that hold this node's windows (the newest SNAPSHOT_PROOFS)."""
+        {mint: {ledger, commitments, name, invoice}, map, proofs}. Nothing of it is re-serialised: the ledger is the
+        Mint's text, the proofs are the Mint's text, for the hours that hold this node's windows (the newest
+        SNAPSHOT_PROOFS), and `invoice` is {month: text} for the month before this one and this one so far."""
         info = self.mint_info()
-        out = {"mint": {"ledger": "", "commitments": [], "name": info["name"]}, "map": None, "proofs": {}}
+        out = {"mint": {"ledger": "", "commitments": [], "name": info["name"], "invoice": {}}, "map": None, "proofs": {}}
         try:
             status, data, _ = self.proxy_get("/ledger")
             if status == 200:
@@ -2623,6 +2782,10 @@ class Node:
             status, data, _ = self.proxy_get("/commitments")
             if status == 200:
                 out["mint"]["commitments"] = json.loads(data.decode("utf-8"))
+            for month in (previous_month(), time.strftime("%Y-%m")):
+                status, data, _ = self.proxy_get("/invoice?month=" + month)
+                if status == 200:
+                    out["mint"]["invoice"][month] = data.decode("utf-8")
             if not self.map_path_exists():
                 status, data, _ = self.proxy_get("/map")
                 if status == 200:
@@ -2672,7 +2835,7 @@ class Node:
                     pass                                     # an hour settled since its commitment: the next one has both
             snap["proofs"] = proofs
             return snap
-        remote = remote or {"mint": {"ledger": "", "commitments": [], "name": self.mint_info()["name"]}, "map": None, "proofs": {}}
+        remote = remote or {"mint": {"ledger": "", "commitments": [], "name": self.mint_info()["name"], "invoice": {}}, "map": None, "proofs": {}}
         if self.role == "payer":
             snap["receipts"] = self.file_bytes("receipts.jsonl").decode("utf-8")
             snap["acks"] = self.file_bytes("acks.jsonl").decode("utf-8")
@@ -2848,7 +3011,7 @@ class Node:
                         return self.raw(node.file_bytes(url.path[1:] + ".jsonl"), "application/x-ndjson")
                     if url.path == "/outbox":
                         return self.reply(200, node.outbox_list())
-                    if url.path in ("/mint/ledger", "/mint/commitments", "/mint/links", "/mint/proof", "/mint/map") or (url.path == "/map" and not node.map_path_exists()):
+                    if url.path in ("/mint/ledger", "/mint/commitments", "/mint/links", "/mint/proof", "/mint/map", "/mint/invoice", "/mint/invoices") or (url.path == "/map" and not node.map_path_exists()):
                         path = url.path[5:] if url.path.startswith("/mint/") else url.path
                         try:
                             status, data, ctype = node.proxy_get(path + ("?" + url.query if url.query else ""))
@@ -3315,6 +3478,14 @@ def main(argv=None):
     iv = sub.add_parser("invoice", help="mint: sum a month's settlements (YYYY-MM; without one, last month), with the Steward's share apart")
     iv.add_argument("month", nargs="?", help="YYYY-MM in the Mint's local time; the default is the month before this one")
     iv.add_argument("--save", action="store_true", help="also write it to invoices/<month>.txt under the state directory, where GET /invoice serves it")
+    ow = sub.add_parser("owed", help="hop or payer: a month's invoice line computed from this node's own receipts, acks and announcements alone, "
+                                     "then set against the Mint's invoice figure by figure (exit 0 agree, 1 differ, 2 not compared)")
+    ow.add_argument("month", nargs="?", help="YYYY-MM in local time; the default is the month before this one")
+    ow.add_argument("--invoice", metavar="FILE", help="the Mint's invoice as a text file, when the Mint cannot be reached through this node")
+    ow.add_argument("--purchases", metavar="FILE", help="the Mint's purchases.jsonl, when it cannot be reached; without purchases no premium is computed")
+    ow.add_argument("--links", metavar="FILE", help="announcements to settle under (a payer keeps none; the Mint's /links otherwise)")
+    ow.add_argument("--price", type=float, default=DEFAULT_PRICE_USD_PER_GB, help="the default price when no announcement is in force")
+    ow.add_argument("--fee", type=float, default=DEFAULT_STEWARD_FEE, help="the Steward's fraction f")
     vf = sub.add_parser("verify", help="check the signature on receipt files (no node state needed)")
     vf.add_argument("files", nargs="+")
     st = sub.add_parser("settle", help="resolve one window offline from a receipt file and an ack file")
@@ -3635,6 +3806,13 @@ def main(argv=None):
         print(node.invoice_text(month), end="")
         if args.save:
             print("saved to %s" % node.invoice_save(month))
+    elif args.cmd == "owed":
+        month = args.month or previous_month()
+        if not re.match(r"^\d{4}-\d{2}$", month):
+            raise SystemExit("the month is YYYY-MM, as in 2026-10")
+        text, rc = node.owed(month, purchases_path=args.purchases, invoice_path=args.invoice, links_path=args.links, price=args.price, fee=args.fee)
+        print(text, end="")
+        return rc
     elif args.cmd == "prove":
         if node.role != "mint":
             raise SystemExit("only the Mint proves")

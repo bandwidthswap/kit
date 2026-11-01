@@ -293,6 +293,8 @@ The rule:
 
 The rebuilt ledger and the Mint's agree when there is no difference. A difference in a window means one side holds a signed record the other does not, or the Mint settled against the rule; a difference in an hour's root with no differing window means the Mint committed to something other than its settlements; a Mint whose own ledger no longer matches the commitment it signed has, in the paper's words, signed its own conviction.
 
+*Informative.* The invoice is a sum over the ledger (Section 8's amounts per payer and hop for a month), so a party that rebuilds the ledger from its own copies can print its own line of the invoice without the Mint and set it against the Mint's; a figure that differs is a window that differs, found as above. The kit's `bwkit owed` is that check as the operator runs it.
+
 ## 12. Patience
 
 A hop keeps, per payer, a count of the windows in which the payer's count fell short of the hop's own by more than the agreement margin: windows where `hop_bytes − payer_bytes > max(min_bytes, margin × hop_bytes)`, with the margin and floor of the hop's own announcement (or the defaults). It counts when it signs the acknowledgement, since that is when it learns both counts. A window where the payer's count is the larger does not count.

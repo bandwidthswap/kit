@@ -989,6 +989,122 @@ class Invoices(unittest.TestCase):
         self.assertEqual(cm.exception.code, 400)
 
 
+class Owed(unittest.TestCase):
+    """`bwkit owed`: the invoice line from a node's own copies, by the Mint's rule, set against the Mint's invoice."""
+
+    WEEK = 7 * 86400
+
+    def setUp(self):
+        self.lab = Lab()
+
+    def tearDown(self):
+        self.lab.close()
+
+    def test_hop_and_payer_agree_with_the_mint(self):
+        lab = self.lab
+        lab.hour(1_000_000_000, 1_000_000_000)
+        lab.hour(2_000_000_000, 2_000_000_000)
+        lab.hour(2_500_000_000, 2_700_000_000)                     # disputed: the hop over the payer by 8%
+        month = time.strftime("%Y-%m", time.localtime(lab.t))
+        mint_line = [l for l in lab.mint.invoice_text(month).split("\n") if " pays " in l][0]
+        self.assertIn("3 windows (1 disputed), 2.50 GB, $0.2500: the relay's $0.2375, the Steward's $0.0125", mint_line)
+        rc, text = cli(["owed", month], hop_env(lab))
+        self.assertEqual(rc, 0, text)
+        self.assertIn("from my own copies: 3 receipts and 3 acks under 0 announcements and 0 purchases (my own announcements; from the Mint through this node: purchases, the invoice) rebuilt into 3 settlements, 3 of them mine in " + month, text)
+        self.assertIn(mint_line, text)                              # the hop prints the Mint's line from its own copies
+        self.assertIn("%s  owed to me, the relay's share of every line: $0.2375" % month, text)
+        self.assertIn("matches the Mint's invoice, figure for figure: the relay's $0.2375", text)
+        self.assertNotIn("no purchases at hand", text)              # the Mint's registry was read; it is empty
+        rc, text = cli(["owed", month], payer_env(lab))
+        self.assertEqual(rc, 0, text)
+        self.assertIn("from the Mint through this node: purchases, announcements, the invoice", text)
+        self.assertIn(mint_line, text)
+        self.assertIn("%s  I owe, carriage and premiums of every line: $0.2500" % month, text)
+        self.assertIn("matches the Mint's invoice, figure for figure: I owe $0.2500", text)
+        # a month with nothing on either side
+        rc, text = cli(["owed", "2001-01"], hop_env(lab))
+        self.assertEqual(rc, 0)
+        self.assertIn("matches the Mint's invoice: neither side has a window of mine in 2001-01", text)
+        # the Mint cannot be reached and no file is given: computed, not compared
+        cfg = os.path.join(lab.root, "hop-dead-mint.json")
+        with open(cfg, "w") as f:
+            json.dump(dict(lab.hop.config, mint="http://127.0.0.1:9"), f)
+        rc, text = cli(["owed", month], {"BWKIT_DIR": lab.hop.dir, "BWKIT_CONFIG": cfg})
+        self.assertEqual(rc, 2)
+        self.assertIn(mint_line, text)
+        self.assertIn("the Mint's invoice was not read", text)
+        self.assertIn("no purchases at hand (the Mint did not answer; pass --purchases <file>)", text)
+        # with the Mint's invoice as a file, the comparison runs; one changed figure in it is named
+        path = os.path.join(lab.root, "invoice.txt")
+        with open(path, "w") as f:
+            f.write(lab.mint.invoice_text(month).replace("the relay's $0.2375", "the relay's $0.2380"))
+        rc, text = cli(["owed", month, "--invoice", path], {"BWKIT_DIR": lab.hop.dir, "BWKIT_CONFIG": cfg})
+        self.assertEqual(rc, 1)
+        self.assertIn("DIFFERS from the Mint's invoice:\n  relay with bw-house: $0.2375 here, $0.2380 on the Mint", text)
+
+    def test_an_altered_copy_differs(self):
+        lab = self.lab
+        lab.hour(1_000_000_000, 1_000_000_000)
+        lab.hour(2_000_000_000, 2_000_000_000)
+        month = time.strftime("%Y-%m", time.localtime(lab.t))
+        # one byte count changed in the hop's own acks: that ack's signature no longer holds, the window drops out, the line differs
+        p = lab.hop.path("acks.jsonl")
+        with open(p) as f:
+            lines = f.read().split("\n")
+        a = json.loads(lines[1])
+        a["receipt"]["bytes"] += 1
+        lines[1] = json.dumps(a, sort_keys=True)
+        with open(p, "w") as f:
+            f.write("\n".join(lines))
+        rc, text = cli(["owed", month], hop_env(lab))
+        self.assertEqual(rc, 1, text)
+        self.assertIn("left out: acks.jsonl line 2: bad signature", text)
+        self.assertIn("DIFFERS from the Mint's invoice:\n  windows with bw-house: 1 here, 2 on the Mint", text)
+        self.assertIn("bytes with bw-house: 1.00 GB here, 2.00 GB on the Mint", text)
+        self.assertIn("relay with bw-house: $0.0950 here, $0.1900 on the Mint", text)
+
+    def test_premiums_come_from_the_mints_purchases(self):
+        lab = self.lab
+        lab.hour(100_000_000, 100_000_000)
+        lab.payer.purchase_post("bw-forest", 50_000_000, 0.02, 3, 1.0, lab.t + self.WEEK, now=lab.t + 1)
+        lab.hour(200_000_000, 200_000_000)
+        lab.hour(220_000_000, 220_000_000)                        # short: the premium in proportion, the rest returns
+        month = time.strftime("%Y-%m", time.localtime(lab.t))
+        mint_text = lab.mint.invoice_text(month)
+        self.assertIn("+ $0.0024 premium on 2 purchased windows", mint_text)
+        rc, text = cli(["owed", month], hop_env(lab))
+        self.assertEqual(rc, 0, text)
+        self.assertIn("from the Mint through this node: purchases, the invoice", text)
+        self.assertIn("+ $0.0024 premium on 2 purchased windows ($0.0000 of it the Steward's)", text)
+        self.assertIn("returned to bw-house on short windows: $0.0006", text)
+        self.assertIn("matches the Mint's invoice, figure for figure", text)
+        # the same copies with no purchases at hand: the premium is missing and the comparison says where
+        cfg = os.path.join(lab.root, "hop-dead-mint.json")
+        with open(cfg, "w") as f:
+            json.dump(dict(lab.hop.config, mint="http://127.0.0.1:9"), f)
+        path = os.path.join(lab.root, "invoice.txt")
+        with open(path, "w") as f:
+            f.write(mint_text)
+        rc, text = cli(["owed", month, "--invoice", path], {"BWKIT_DIR": lab.hop.dir, "BWKIT_CONFIG": cfg})
+        self.assertEqual(rc, 1, text)
+        self.assertIn("no purchases at hand", text)
+        self.assertIn("premium with bw-house: $0.0000 here, $0.0024 on the Mint", text)
+        self.assertIn("purchases with bw-house: 0 here, 2 on the Mint", text)
+        rc, text = cli(["owed", month, "--invoice", path, "--purchases", lab.mint.path("purchases.jsonl")], {"BWKIT_DIR": lab.hop.dir, "BWKIT_CONFIG": cfg})
+        self.assertEqual(rc, 0, text)
+
+    def test_the_mint_declines_and_the_proxy_carries_the_invoice(self):
+        lab = self.lab
+        with self.assertRaises(SystemExit):
+            cli(["owed"], mint_env(lab))
+        lab.hour(1_000_000_000, 1_000_000_000)
+        month = time.strftime("%Y-%m", time.localtime(lab.t))
+        status, body = bwkit.http_get(lab.hop_url + "/mint/invoice?month=" + month)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, lab.mint.invoice_text(month) + "the month so far, computed now; the Mint writes %s.txt on the first of the next month\n" % month)
+        self.assertEqual(json.loads(bwkit.http_get(lab.hop_url + "/mint/invoices")[1]), [])
+
+
 class Links(unittest.TestCase):
     """Link announcements (spec, Section 7): signed by the hop, registered with the Mint, in force from `since`."""
 
@@ -2332,7 +2448,9 @@ class Dashboard(unittest.TestCase):
             self.assertEqual(snap["proofs"][str(w)], proof_text, role)                          # the Mint's own text, byte for byte
             self.assertEqual(snap["map"]["places"]["the-cabin"]["name"], "the cabin", role)    # the Mint's map, proxied to the nodes
             if role != "mint":
-                self.assertEqual(snap["mint"], {"ledger": mint_ledger, "commitments": lab.mint.commitments(), "name": "bw-mint"}, role)
+                invoices = {m: lab.mint.invoice_text(m) + "the month so far, computed now; the Mint writes %s.txt on the first of the next month\n" % m
+                        for m in (bwkit.previous_month(), time.strftime("%Y-%m"))}      # the Mint's invoice for last month and this one, through the node
+            self.assertEqual(snap["mint"], {"ledger": mint_ledger, "commitments": lab.mint.commitments(), "name": "bw-mint", "invoice": invoices}, role)
                 self.assertEqual(snap["outbox"], [], role)
                 self.assertEqual(snap["acks"], open(getattr(lab, role).path("acks.jsonl")).read(), role)
                 self.assertEqual(snap["receipts"], open(getattr(lab, role).path("receipts.jsonl")).read(), role)

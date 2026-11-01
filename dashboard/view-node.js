@@ -16,6 +16,21 @@ window.BW = window.BW || {};
     return '<h2>My month <small>'+month+', as the Mint settled it</small></h2><div class="now">'+cells.map(function(c){ return '<div><span class="k">'+c[0]+'</span><span class="v">'+esc(c[1])+'</span><span class="s">'+esc(c[2])+'</span></div>'; }).join('')+'</div>';
   }
 
+  // The invoice: the Mint's text for the month before this one (written on the first) and this month so far, read through
+  // this node from the Mint, with my own line picked out. `bwkit owed` on this node computes the same line from my copies alone.
+  function invoice(X, now){
+    var inv=BW.D.mintInvoice||{}, months=BW.invoiceMonths(now), me=X.st.name, hop=X.role==='hop';
+    var blocks=months.map(function(m, i){
+      var t=inv[m]; if(typeof t!=='string') return '<h3>'+esc(m)+' <small>'+(i?'this month so far':'last month')+'</small></h3><div class="empty">The Mint\'s invoice for '+esc(m)+' was not read through this node.</div>';
+      var lines=t.split('\n').filter(Boolean), mine=lines.filter(function(l){ var mm=/^\S+  (\S+) pays (\S+):/.exec(l); return mm && (hop ? mm[2]===me : mm[1]===me); });
+      var written=lines.filter(function(l){ return /^written /.test(l); })[0], sofar=lines.some(function(l){ return /computed now/.test(l); });
+      return '<h3>'+esc(m)+' <small>'+(written?'as the Mint wrote it, '+esc(written.replace(/^written /,'')):(sofar?'this month so far, computed by the Mint now':'as the Mint serves it'))+'</small></h3>'
+        +(mine.length?'<div class="now">'+mine.map(function(l){ var mm=/: the relay's \$([0-9.]+), the Steward's \$([0-9.]+)$/.exec(l), am=/\$([0-9.]+)(?: \+ \$([0-9.]+) premium)?:/.exec(l); return '<div><span class="k">'+(hop?'owed to me':'I owe')+'</span><span class="v">$'+esc(hop?(mm?mm[1]:'?'):(am?(Number(am[1])+Number(am[2]||0)).toFixed(4):'?'))+'</span><span class="s">'+esc(l.replace(/^\S+  /,''))+'</span></div>'; }).join('')+'</div>':'<div class="empty">No line of mine on the Mint\'s invoice for '+esc(m)+'.</div>')
+        +'<pre class="invoice">'+esc(lines.filter(function(l){ return !/^written |computed now/.test(l); }).join('\n'))+'</pre>';
+    });
+    return '<h2>The invoice <small>the Mint\'s, through this node; `bwkit owed` here recomputes my line from my own copies</small></h2>'+blocks.join('');
+  }
+
   // My link: the parameters I announced (a hop) or settle under (a payer), and each payer's standing against my patience.
   function myLink(X, now){
     var st=X.st, out='';
@@ -52,6 +67,6 @@ window.BW = window.BW || {};
   V.node=function(X, now){
     var purTitle = X.role==='payer' ? 'My purchases' : 'Purchases on my link';
     var purchases = X.role==='payer' ? S.purchases(X, now, purTitle) : (function(){ var ids={}; X.S.forEach(function(s){ if(s.purchase) ids[s.purchase]=1; }); var n=Object.keys(ids).length, prem=X.S.reduce(function(a,s){ return a+(s.premium_usd||0); },0); return n?'<h2>'+purTitle+' <small>as the Mint settled them</small></h2><div class="now"><div><span class="k">purchases</span><span class="v">'+n+'</span><span class="s">governing my windows</span></div><div><span class="k">premiums earned</span><span class="v">'+esc(money(prem))+'</span><span class="s">above my posted price</span></div></div>':''; })();
-    return [S.now(X, now), S.attention(X, now), C.hourTimeline(X, now), outbox(X, now), myMonth(X, now), myLink(X, now), C.linkCards(X, now), S.pending(X, now), S.windows(X, now, 'My windows'), purchases, theMint(X, now), C.mapChart(X, now, null, [X.st.name])].join('');
+    return [S.now(X, now), S.attention(X, now), C.hourTimeline(X, now), outbox(X, now), myMonth(X, now), invoice(X, now), myLink(X, now), C.linkCards(X, now), S.pending(X, now), S.windows(X, now, 'My windows'), purchases, theMint(X, now), C.mapChart(X, now, null, [X.st.name])].join('');
   };
 })(window.BW);

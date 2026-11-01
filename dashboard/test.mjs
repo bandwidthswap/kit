@@ -102,6 +102,25 @@ function noThrow(label, fn) { let out; try { out = fn(); } catch (e) { throw new
   ok(html.includes('<h2>The Mint <small>who keeps my books</small></h2>'), 'the Mint card');
   ok(html.includes('<span class="k">Mint</span><span class="v">bw-mint</span>'), 'named bw-mint');
   ok(html.includes('data-verify="1792335600"'), 'the latest committed hour can be verified from the hop\'s page');
+  // the Invoice section: nothing read in this snapshot, then the Mint's text for last month and this month, with the hop's own line picked out
+  ok(html.includes('<h2>The invoice <small>'), 'the Invoice section is on the hop\'s page');
+  eq(count(html, 'was not read through this node'), 2, 'a snapshot without the Mint\'s invoice says so for both months');
+  const months = BW.invoiceMonths(now);
+  eq(months.join(' '), '2026-09 2026-10', 'the months the section shows: last month and this one, from the snapshot\'s moment');
+  D.mintInvoice = {};
+  D.mintInvoice[months[0]] = months[0] + '  bw-house pays bw-neighbor: 300 windows (7 disputed), 31.00 GB, $3.1000 + $0.3000 premium on 150 purchased windows ($0.0000 of it the Steward\'s): the relay\'s $3.2450, the Steward\'s $0.1700\n'
+    + months[0] + '    returned to bw-house on short windows: $0.0300\n' + months[0] + '  bw-house pays bw-forest: 38 windows (0 disputed), 45.00 MB, $0.0045: the relay\'s $0.0043, the Steward\'s $0.0002\n'
+    + months[0] + '  the Network Steward\'s share: $0.1702 (f = 0.05 of every settlement since 0.3.0; none before)\nwritten 2026-10-01 00:10 CDT by bwkit 0.5.1 on bw-mint\n';
+  D.mintInvoice[months[1]] = months[1] + '  bw-house pays bw-neighbor: 12 windows (5 disputed), 1.20 GB, $0.1200: the relay\'s $0.1140, the Steward\'s $0.0060\n'
+    + months[1] + '  the Network Steward\'s share: $0.0060 (f = 0.05 of every settlement since 0.3.0; none before)\nthe month so far, computed now; the Mint writes ' + months[1] + '.txt on the first of the next month\n';
+  const withInv = BW.views.node(X, now);
+  ok(withInv.includes('<h3>' + months[0] + ' <small>as the Mint wrote it, 2026-10-01 00:10 CDT by bwkit 0.5.1 on bw-mint</small></h3>'), 'last month is headed by when the Mint wrote it');
+  ok(withInv.includes('<span class="k">owed to me</span><span class="v">$3.2450</span>'), 'the hop\'s own line gives what it is owed for last month');
+  ok(!withInv.includes('<span class="v">$0.0043</span>'), 'bw-forest\'s line is not picked out as mine');
+  ok(withInv.includes('<h3>' + months[1] + ' <small>this month so far, computed by the Mint now</small></h3>'), 'this month is marked as computed now');
+  ok(withInv.includes('<span class="k">owed to me</span><span class="v">$0.1140</span>'), 'and gives this month\'s figure');
+  ok(withInv.includes('<pre class="invoice">') && !withInv.includes('computed now; the Mint writes'), 'the Mint\'s text is shown without its trailer');
+  delete D.mintInvoice;
   const items = BW.attention(X, now);
   eq(items.length, 0, 'nothing needs attention on the hop: ' + JSON.stringify(items));
   noThrow('the hop\'s view as of six hours earlier', () => BW.views.node(BW.derive(now - 6 * 3600), now - 6 * 3600));
