@@ -193,7 +193,7 @@ It prints one line per payer and hop, with a refund line under a pair that had s
 
 A window since the purchase resumed carries about 114 MB, $0.0114 of carriage and $0.0006 of fee, about 27 cents a day. P, the refund and the bw-forest line are fixed; A, F and R grow by the hour until 23:00 on Oct 31. If the count on Nov 1 is below 336 an hour did not settle, and `sudo -u bwkit bwkit ledger` on `bw-mint` finds it. The neighbor can check the count against its own `acks.jsonl`, and the ledger is readable to anyone on the tailnet.
 
-**How it is settled.** There is no payment rail, and the saved file is arithmetic, not a payment. Show the neighbor the `bw-neighbor` line (they can read the same `/invoice` from their own node, over the tailnet), agree on R, pay it the way neighbors do, and note the date and the amount here:
+**How it is settled.** There is no payment rail, and the saved file is arithmetic, not a payment. Show the neighbor the `bw-neighbor` line (they can read the same `/invoice` from their own node, over the tailnet), agree on R, pay it the way neighbors do, and note the date and the amount here and on the Mint (`ssh bw-mint-ts 'sudo -u bwkit bwkit invoice 2026-10 --paid bw-neighbor "settled in person, Nov 2"'`, which the Mint keeps beside the invoice, serves with it, and the neighbor's page shows as the *paid* cell under The invoice; until then that cell says *not yet*):
 
 - October 2026: not yet paid.
 
@@ -264,7 +264,7 @@ On the first of each month the Mint writes last month's invoice, and your page s
 2026-10  bw-house pays bw-neighbor: 336 windows (8 disputed), 35.22 GB, $3.5219 + $0.3217 premium on 168 purchased windows ($0.0000 of it the Steward's): the relay's $3.6539, the Steward's $0.1897
 ```
 
-*The relay's* figure is yours, the house pays it to you however you two settle up; *the Steward's* is the Mint's fee and stays on its books. To check the line against your own records rather than the Mint's, on the box:
+*The relay's* figure is yours, the house pays it to you however you two settle up; *the Steward's* is the Mint's fee and stays on its books. When you have been paid, the house notes it on the Mint in your two's words and the date, and the *paid* cell under your line on the page shows that note; until then it says *not yet*. The note is the Mint's record of what you both said, not a payment, and it changes no figure. To check the line against your own records rather than the Mint's, on the box:
 
 ```
 sudo -u bwkit bwkit owed 2026-10

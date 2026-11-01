@@ -120,6 +120,14 @@ function noThrow(label, fn) { let out; try { out = fn(); } catch (e) { throw new
   ok(withInv.includes('<h3>' + months[1] + ' <small>this month so far, computed by the Mint now</small></h3>'), 'this month is marked as computed now');
   ok(withInv.includes('<span class="k">owed to me</span><span class="v">$0.1140</span>'), 'and gives this month\'s figure');
   ok(withInv.includes('<pre class="invoice">') && !withInv.includes('computed now; the Mint writes'), 'the Mint\'s text is shown without its trailer');
+  ok(withInv.includes('<span class="k">paid</span><span class="v">not yet</span><span class="s">the Mint notes it when the house settles up</span>'), 'last month, written and not marked paid, says not yet');
+  eq(count(withInv, '<span class="k">paid</span>'), 1, 'this month so far carries no paid cell');
+  // the Mint's paid mark, one line after the written line, becomes the cell
+  D.mintInvoice[months[0]] += months[0] + '  bw-house paid bw-neighbor: settled in person, Nov 2 (noted 2026-11-02 10:14 CST on bw-mint)\n' + months[0] + '  bw-house paid bw-forest: bench, nothing owed (noted 2026-11-02 10:15 CST on bw-mint)\n';
+  const withPaid = BW.views.node(X, now);
+  ok(withPaid.includes('<span class="k">paid</span><span class="v">settled in person, Nov 2</span><span class="s">noted 2026-11-02 10:14 CST on bw-mint</span>'), 'the paid mark of my line is the cell');
+  ok(!withPaid.includes('bench, nothing owed</span>'), 'bw-forest\'s mark is not mine');
+  ok(!withPaid.includes('<span class="v">not yet</span>'), 'and not yet is gone');
   delete D.mintInvoice;
   const items = BW.attention(X, now);
   eq(items.length, 0, 'nothing needs attention on the hop: ' + JSON.stringify(items));

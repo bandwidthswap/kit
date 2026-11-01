@@ -2279,6 +2279,62 @@ class Node:
         with open(p) as f:
             return f.read()
 
+    def invoice_marks(self, month):
+        """The paid marks kept beside a month's invoice (invoices/<month>.paid.jsonl), oldest first; [] when none."""
+        p = self.path("invoices", month + ".paid.jsonl")
+        if not re.match(r"^\d{4}-\d{2}$", month) or not os.path.exists(p):
+            return []
+        return [rec for _, rec in read_jsonl(p)[0] if isinstance(rec, dict) and rec.get("kind") == "paid"]
+
+    @staticmethod
+    def mark_line(rec):
+        """A paid mark as one line of the invoice's text: the pair, the note, when and where it was noted."""
+        return "%s  %s paid %s: %s (noted %s on %s)" % (rec["month"], rec["payer"], rec["hop"], rec["note"],
+                                                       time.strftime("%Y-%m-%d %H:%M %Z", time.localtime(rec["t"])), rec["by"])
+
+    def invoice_served(self, month):
+        """The saved invoice's text with its paid marks after it, one line each, or None when the month has no saved invoice."""
+        text = self.invoice_saved(month)
+        if text is None:
+            return None
+        return text + "".join(self.mark_line(rec) + "\n" for rec in self.invoice_marks(month))
+
+    def invoice_mark(self, month, hop, note, payer=None, now=None):
+        """Note that a line of a saved invoice was paid: `bwkit invoice <month> --paid <hop> "<note>"`.
+
+        The mark names the pair of one line of the saved invoice (the hop, and
+        the payer when the hop has more than one), carries the note as given
+        (how and when it was settled, in the parties' words) and the moment it
+        was noted, and is appended to invoices/<month>.paid.jsonl beside the
+        invoice, which it never changes. GET /invoice serves the two together.
+        There is no payment rail; this is the Mint's record that the parties
+        said it was paid. Returns the record. Raises SystemExit with the reason
+        when the month has no saved invoice or no such line.
+        """
+        if not re.match(r"^\d{4}-\d{2}$", month):
+            raise SystemExit("the month is YYYY-MM, as in 2026-10")
+        note = (note or "").strip()
+        if not note:
+            raise SystemExit("a paid mark carries a note: how and when it was settled, as in \"settled in person, Nov 2\"")
+        text = self.invoice_saved(month)
+        if text is None:
+            raise SystemExit("no saved invoice for %s: the Mint writes it on the first of the next month (`bwkit invoice %s --save` writes it now)" % (month, month))
+        lines = [r for r in (parse_invoice_line(l) for l in text.split("\n")) if r]
+        mine = [r for r in lines if r["hop"] == hop and (payer is None or r["payer"] == payer)]
+        if not mine:
+            raise SystemExit("no line of the %s invoice has %s%s paid: the lines are %s" % (
+                month, hop, "" if payer is None else " by " + payer, ", ".join("%s pays %s" % (r["payer"], r["hop"]) for r in lines) or "none"))
+        if len(mine) > 1:
+            raise SystemExit("%d lines of the %s invoice pay %s (%s): say which with --payer" % (
+                len(mine), month, hop, ", ".join(r["payer"] for r in mine)))
+        rec = {"kind": "paid", "month": month, "payer": mine[0]["payer"], "hop": hop, "note": note,
+               "t": int(now if now is not None else time.time()), "by": self.config.get("name", "the Mint")}
+        d = self.path("invoices")
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, month + ".paid.jsonl"), "a") as f:
+            f.write(json.dumps(rec, sort_keys=True) + "\n")
+        return rec
+
     def invoices_saved(self):
         """The months with a saved invoice, oldest first."""
         d = self.path("invoices")
@@ -3180,7 +3236,7 @@ class Node:
                     month = urlparse.parse_qs(url.query).get("month", [""])[0] or previous_month()
                     if not re.match(r"^\d{4}-\d{2}$", month):
                         return self.reply(400, {"error": "month must be YYYY-MM"})
-                    text = node.invoice_saved(month)
+                    text = node.invoice_served(month)
                     if text is None:
                         text = node.invoice_text(month) + "the month so far, computed now; the Mint writes %s.txt on the first of the next month\n" % month
                     return self.raw(text.encode(), "text/plain; charset=utf-8", filename="invoice-%s.txt" % month)
@@ -3615,6 +3671,9 @@ def main(argv=None):
     iv = sub.add_parser("invoice", help="mint: sum a month's settlements (YYYY-MM; without one, last month), with the Steward's share apart")
     iv.add_argument("month", nargs="?", help="YYYY-MM in the Mint's local time; the default is the month before this one")
     iv.add_argument("--save", action="store_true", help="also write it to invoices/<month>.txt under the state directory, where GET /invoice serves it")
+    iv.add_argument("--paid", nargs=2, metavar=("HOP", "NOTE"), help="note that the saved invoice's line paying HOP was settled, with the note in the parties' "
+                                                                  "words (\"settled in person, Nov 2\"); kept beside the invoice and served with it")
+    iv.add_argument("--payer", help="with --paid, which payer's line when more than one pays that hop")
     ow = sub.add_parser("owed", help="hop or payer: a month's invoice line computed from this node's own receipts, acks and announcements alone, "
                                      "then set against the Mint's invoice figure by figure (exit 0 agree, 1 differ, 2 not compared)")
     ow.add_argument("month", nargs="?", help="YYYY-MM in local time; the default is the month before this one")
@@ -3949,9 +4008,17 @@ def main(argv=None):
         month = args.month or previous_month()
         if not re.match(r"^\d{4}-\d{2}$", month):
             raise SystemExit("the month is YYYY-MM, as in 2026-10")
+        if args.paid:
+            if node.role != "mint":
+                raise SystemExit("only the Mint keeps the paid mark")
+            rec = node.invoice_mark(month, args.paid[0], args.paid[1], payer=args.payer)
+            print(node.mark_line(rec))
+            return 0
         print(node.invoice_text(month), end="")
         if args.save:
             print("saved to %s" % node.invoice_save(month))
+        for rec in node.invoice_marks(month):
+            print(node.mark_line(rec))
     elif args.cmd == "owed":
         month = args.month or previous_month()
         if not re.match(r"^\d{4}-\d{2}$", month):

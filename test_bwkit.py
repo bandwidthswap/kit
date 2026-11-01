@@ -1042,6 +1042,61 @@ class Invoices(unittest.TestCase):
         self.assertEqual(cm.exception.code, 400)
 
 
+class PaidMark(unittest.TestCase):
+    """`bwkit invoice <month> --paid <hop> "<note>"`: the Mint's dated note beside a saved invoice, served with it."""
+
+    def setUp(self):
+        self.lab = Lab()
+
+    def tearDown(self):
+        self.lab.close()
+
+    def test_the_mark_is_kept_beside_the_invoice_and_served_with_it(self):
+        lab = self.lab
+        lab.hour(1_000_000_000, 1_000_000_000)
+        month = time.strftime("%Y-%m", time.localtime(lab.t))
+        # before the invoice is saved there is nothing to mark
+        with self.assertRaises(SystemExit) as cm:
+            cli(["invoice", month, "--paid", "bw-forest", "settled in person"], mint_env(lab))
+        self.assertIn("no saved invoice for %s" % month, str(cm.exception))
+        cli(["invoice", month, "--save"], mint_env(lab))
+        saved = open(os.path.join(lab.mint.dir, "invoices", month + ".txt")).read()
+        # a hop no line pays, a note that is empty
+        with self.assertRaises(SystemExit) as cm:
+            cli(["invoice", month, "--paid", "bw-cabin", "settled"], mint_env(lab))
+        self.assertIn("no line of the %s invoice has bw-cabin paid: the lines are bw-house pays bw-forest" % month, str(cm.exception))
+        with self.assertRaises(SystemExit) as cm:
+            cli(["invoice", month, "--paid", "bw-forest", "  "], mint_env(lab))
+        self.assertIn("a paid mark carries a note", str(cm.exception))
+        self.assertEqual(lab.mint.invoice_marks(month), [])
+        # the mark
+        rc, text = cli(["invoice", month, "--paid", "bw-forest", "settled in person, Nov 2"], mint_env(lab))
+        self.assertEqual(rc, 0)
+        self.assertRegex(text, r"^%s  bw-house paid bw-forest: settled in person, Nov 2 \(noted \d{4}-\d{2}-\d{2} \d{2}:\d{2} \S+ on bw-mint\)\n$" % month)
+        marks = lab.mint.invoice_marks(month)
+        self.assertEqual([(m["kind"], m["month"], m["payer"], m["hop"], m["note"], m["by"]) for m in marks],
+                         [("paid", month, "bw-house", "bw-forest", "settled in person, Nov 2", "bw-mint")])
+        self.assertEqual(open(os.path.join(lab.mint.dir, "invoices", month + ".txt")).read(), saved)   # the invoice itself is unchanged
+        # served after the invoice's own lines; the command prints it too; the hop reads it through its proxy; owed still parses the line
+        status, body = bwkit.http_get(lab.mint_url + "/invoice?month=" + month)
+        self.assertTrue(body.startswith(saved), body)
+        self.assertEqual(body[len(saved):], text)
+        rc, printed = cli(["invoice", month], mint_env(lab))
+        self.assertTrue(printed.endswith(text), printed)
+        self.assertEqual(bwkit.http_get(lab.hop_url + "/mint/invoice?month=" + month)[1], body)
+        rc, owed = cli(["owed", month], hop_env(lab))
+        self.assertEqual(rc, 0, owed)
+        self.assertIn("matches the Mint's invoice, figure for figure", owed)
+        # a second mark is kept as well, in order; the month so far (no saved invoice) is served without marks
+        cli(["invoice", month, "--paid", "bw-forest", "and the rest, Nov 3"], mint_env(lab))
+        self.assertEqual([m["note"] for m in lab.mint.invoice_marks(month)], ["settled in person, Nov 2", "and the rest, Nov 3"])
+        self.assertEqual(bwkit.http_get(lab.mint_url + "/invoice?month=" + month)[1].count(" paid bw-forest: "), 2)
+        # a hop does not keep marks
+        with self.assertRaises(SystemExit) as cm:
+            cli(["invoice", month, "--paid", "bw-forest", "x"], hop_env(lab))
+        self.assertIn("only the Mint keeps the paid mark", str(cm.exception))
+
+
 class SettleWindow(unittest.TestCase):
     """`bwkit settle --window`: one window resolved from a node's own copies alone, by the Mint's rule."""
 
