@@ -4,12 +4,18 @@
 // HTML strings.
 //
 //   node dashboard/test.mjs            (Node 18+; test_bwkit.py runs it too when node is on the PATH)
+//
+// The last section is the verifier, bsp.js: its own hashes against node:crypto, the fixtures' proofs under every
+// backend, a run with no WebCrypto at all (a plain-http page off localhost), the honest answer when a check cannot
+// run, and the embedded noble-ed25519 against its published digest.
 
 import fs from 'node:fs';
 import path from 'node:path';
 import vm from 'node:vm';
 import assert from 'node:assert/strict';
 import { fileURLToPath } from 'node:url';
+import { createHash, randomBytes } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const MODULES = ['data.js', 'rules.js', 'charts.js', 'view-mint.js', 'view-node.js', 'view-fleet.js'];
@@ -135,4 +141,66 @@ function noThrow(label, fn) { let out; try { out = fn(); } catch (e) { throw new
   ok(html.includes('bw-forest'), 'the node that did not answer is still on the grid');
 }
 
-console.log('dashboard/test.mjs: ' + checks + ' checks passed on ' + fs.readdirSync(path.join(here, 'fixtures')).filter((f) => f.endsWith('.json')).join(', '));
+// ---------------------------------------------------------------- the verifier, bsp.js
+{
+  const text = fs.readFileSync(path.join(here, 'bsp.js'), 'utf8');
+  // The kit has no package.json, so Node reads a .js file as CommonJS; the module is imported as a data: URL, and a fresh
+  // one for each run below, because a module decides its backends once.
+  const load = () => import('data:text/javascript;base64,' + Buffer.from(text).toString('base64'));
+  const hex = (b) => Buffer.from(b).toString('hex');
+  const mint = JSON.parse(fs.readFileSync(path.join(here, 'fixtures', 'mint.json'), 'utf8'));
+  const proofs = Object.values(mint.proofs);
+  ok(proofs.length === 2 && proofs.every((p) => typeof p === 'string'), 'the Mint fixture holds two proofs as text');
+  const tampered = proofs[0].replace(/"hop_bytes": (\d+)/, (m, n) => '"hop_bytes": ' + (Number(n) + 1));
+  ok(tampered !== proofs[0], 'a tampered copy changes one settlement\'s byte count');
+  const allProofs = async (bsp, label) => {
+    for (const p of proofs) { const r = await bsp.verifyProof(p); ok(r.ok && !r.unavailable, label + ': a real proof verifies: ' + r.reason); }
+    const t = await bsp.verifyProof(tampered);
+    ok(!t.ok && !t.unavailable && /not in the commitment/.test(t.settlements[0].reason || ''), label + ': the tampered copy fails, and is judged: ' + t.reason + ' / ' + t.settlements[0].reason);
+  };
+  // 1. the file's own SHA-256 and SHA-512 against node:crypto, across the block boundaries
+  {
+    const bsp = await load(); bsp.useHashes('js');
+    for (const l of [0, 1, 55, 56, 63, 64, 65, 111, 112, 119, 120, 127, 128, 129, 1000]) {
+      const m = l ? new Uint8Array(randomBytes(l)) : new Uint8Array(0);
+      eq(hex(await bsp.sha256(m)), createHash('sha256').update(m).digest('hex'), 'SHA-256 in JavaScript agrees with node:crypto at ' + l + ' bytes');
+      eq(hex(await bsp.sha512(m)), createHash('sha512').update(m).digest('hex'), 'SHA-512 in JavaScript agrees with node:crypto at ' + l + ' bytes');
+    }
+  }
+  // 2. the proofs under every pairing of hashes and Ed25519
+  for (const h of ['webcrypto', 'js']) for (const e of ['webcrypto', 'noble']) {
+    const bsp = await load(); bsp.useHashes(h); await bsp.useEd25519(e);
+    await allProofs(bsp, 'hashes ' + h + ', Ed25519 ' + e);
+    eq(JSON.stringify(bsp.backends()), JSON.stringify({ hashes: h, ed25519: e }), 'backends() names what ran');
+  }
+  // 3. no WebCrypto at all, in a child process: what a plain-http page off localhost gets
+  {
+    const script = "Object.defineProperty(globalThis, 'crypto', { value: {}, configurable: true });"
+      + "const bsp = await import(process.argv[1]); const r = await bsp.verifyProof(process.argv[2]);"
+      + "console.log(JSON.stringify({ ok: r.ok, unavailable: r.unavailable, reason: r.reason, backends: bsp.backends() }));";
+    const out = JSON.parse(execFileSync(process.execPath, ['--input-type=module', '-e', script, 'data:text/javascript;base64,' + Buffer.from(text).toString('base64'), proofs[0]], { encoding: 'utf8' }).trim());
+    ok(out.ok === true && out.unavailable === false, 'with no crypto.subtle the proof still verifies: ' + JSON.stringify(out));
+    eq(JSON.stringify(out.backends), JSON.stringify({ hashes: 'js', ed25519: 'noble' }), 'and it ran on the file\'s own hashes and the embedded noble');
+  }
+  // 4. the honest answer: a check that cannot run says so, and is not a failed proof
+  {
+    const bsp = await load(); bsp.useHashes('js');
+    await bsp.useEd25519('noble', { etc: {}, verifyAsync: async () => { throw new Error('no curve here'); } });
+    const r = await bsp.verifyProof(proofs[0]);
+    ok(!r.ok && r.unavailable === true && /could not check the signature: verification could not run/.test(r.reason || ''), 'a verifier that cannot run reports "could not check", not a bad signature: ' + r.reason);
+    ok(r.commitment.unavailable === true, 'the commitment carries the same mark');
+  }
+  // 5. the embedded noble-ed25519 is the published file: its last line restored, the digest is the recorded one
+  {
+    const bsp = await load();
+    const head = 'const nobleEd25519 = (() => {\n', start = text.indexOf(head) + head.length;
+    const end = text.lastIndexOf('})();\n', text.indexOf("export const version"));
+    const ret = 'return { CURVE: ed25519_CURVE, etc, ExtendedPoint: Point, getPublicKey, getPublicKeyAsync, Point, sign, signAsync, utils, verify, verifyAsync };\n';
+    const body = text.slice(start, end);
+    ok(body.endsWith(ret), 'the embedded noble ends with the return that replaced its export');
+    const published = body.slice(0, -ret.length) + 'export { ed25519_CURVE as CURVE, etc, Point as ExtendedPoint, getPublicKey, getPublicKeyAsync, Point, sign, signAsync, utils, verify, verifyAsync, };\n';
+    eq(createHash('sha256').update(published).digest('hex'), bsp.NOBLE_SHA256, 'the embedded noble-ed25519 ' + bsp.NOBLE_VERSION + ' is the published index.js, byte for byte but its last line');
+  }
+}
+
+console.log('dashboard/test.mjs: ' + checks + ' checks passed on ' + fs.readdirSync(path.join(here, 'fixtures')).filter((f) => f.endsWith('.json')).join(', ') + ', and bsp.js under every backend');

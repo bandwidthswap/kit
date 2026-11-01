@@ -55,7 +55,11 @@ window.BW = window.BW || {};
       if(!window.bsp){ if(out) out.textContent='the verifier did not load'; return; }
       return window.bsp.verifyProof(text).then(function(r){
         if(!out) return; var n=(r.settlements||[]).length, okN=(r.settlements||[]).filter(function(s){ return s.ok; }).length;
-        out.innerHTML = r.ok ? '<span class="st ok">verified</span> '+okN+' of '+n+' settlement'+(n===1?'':'s')+' in the root, root signed by the Mint' : '<span class="st declined">failed</span> '+F.esc(r.reason||(r.commitment&&r.commitment.reason)||((r.settlements||[]).map(function(s){ return s.reason; }).filter(Boolean)[0])||'');
+        var why=r.reason||(r.commitment&&r.commitment.reason)||((r.settlements||[]).map(function(s){ return s.reason; }).filter(Boolean)[0])||'';
+        // three answers, never two: verified, failed (the proof is wrong), or not checked (this browser could not run the check; the proof is not judged)
+        out.innerHTML = r.ok ? '<span class="st ok">verified</span> '+okN+' of '+n+' settlement'+(n===1?'':'s')+' in the root, root signed by the Mint'
+          : r.unavailable ? '<span class="st none">not checked</span> '+F.esc(why)
+          : '<span class="st declined">failed</span> '+F.esc(why);
       });
     }).catch(function(e){ if(out) out.textContent='could not check: '+e.message; });
   }
