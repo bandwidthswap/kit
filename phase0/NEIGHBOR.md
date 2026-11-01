@@ -148,7 +148,7 @@ The Mint registers it and every window from the one running settles with the pre
 
 - The clock: `phase0/link-report.sh` gives the day-by-day figure between the sites; `chronyc tracking` on both ends is the live view, and the hop's journal says if it ever declines a receipt (since bwkit 0.1.1). Section 10 lists drift between sites as unmeasured; this is the measurement.
 - The outbox when the neighbor's internet drops: receipts wait and settle when it returns, which is the claim in Section 1 of the paper.
-- At least one dispute, forced the way the bench did it (`phase0/dispute-test.sh` works unchanged with the hop at the neighbor's), and resolved from the two signed receipts alone.
+- At least one dispute, forced the way the bench did it (`HOP=bw-neighbor IFACE=tailscale0 TARGET=<bw-neighbor's tailnet address> SSH_SUFFIX=-ts phase0/dispute-test.sh`, which restarts `tailscaled` on the hop mid-window), and resolved from the two signed receipts alone: on the Mint, and on the hop with `bwkit settle --window` from its own copies. **Done Nov 1, 2026**; "A disputed window" under "For the operator" below tells the neighbor what they will find.
 - The invoice at the end of each month: `sudo -u bwkit bwkit invoice 2026-11` on `bw-mint` at the start of December for the first full month, and `2026-10` on Nov 1 for the partial one; what it prints and what to expect are under "The first invoice, Nov 1" below. There is no payment rail; settle it the way neighbors do.
 
 ## The first invoice, Nov 1
@@ -271,6 +271,20 @@ sudo -u bwkit bwkit owed 2026-10
 ```
 
 It rebuilds the month from the receipts and acknowledgements the box itself signed, by the same rule the Mint uses, prints the line it gets, and sets it against the Mint's figure by figure: `matches the Mint's invoice` and exit 0, or each figure that differs and why, and exit 1. One honest gap: the box has kept the house's receipts only since Oct 18 (the kit before that day kept only your acknowledgement), so October's first thirteen windows cannot be rebuilt from your copies alone, and the command says so; the house can hand you its `receipts.jsonl` and `--receipts <file>` fills them. From November the month is whole on your box.
+
+### A disputed window
+
+A window is *disputed* when the two counts differ by more than the margin you announced (3% since Oct 30, or 64 KB, whichever is larger). It is paid at the smaller count, like every window, so a dispute never pays you more than you signed for and never pays you less than the house signed for. On your page, **My windows** marks the row *disputed*; tap the row and it opens to the two signed records side by side, the house's receipt and your acknowledgement, with the fields that differ marked, and under them the settlement with its rule. Those two records are the whole case; nothing the Mint holds is missing from them.
+
+To settle the window yourself, from the copies on the box and nothing else:
+
+```
+sudo -u bwkit bwkit settle --window "2026-11-01 17:10"
+```
+
+Any moment inside the window will do, in your local time, or the Unix seconds the opened row shows beside `t_first`. It finds the house's receipt for that window and your acknowledgement in `/var/lib/bwkit/`, checks both signatures, finds the announcement of yours in force at the window's start, and prints what each side signed, what settles and at which status, the money, then the settlement record, which should agree with the page's row figure for figure. The Mint is not asked. A byte changed in either copy fails its signature, and the command names the copy.
+
+The first one was forced, so that you would see one before a real one came. On Nov 1 the house pushed 20 MB through the tunnel to your Pi twice: after the first it asked for a receipt and the two counts agreed (22.15 MB against 22.31 MB, within the margin); in the middle of the second it restarted the tunnel on your Pi, so your meter started over from zero, then asked for a receipt. Your box signed the 25,886 bytes it had seen since the restart, the house signed 21,081,957, and the Mint paid the smaller, which is three millionths of a dollar. The row is on your page, marked *disputed*, the window of 17:03 to 17:04 on Nov 1; opened, your meter line ends in *reset*, which is the restart. The command above, with `"2026-11-01 17:04"`, resolves it from your copies to the same figures.
 
 ### Changing the price, or any of the terms
 

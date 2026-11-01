@@ -972,6 +972,91 @@ def previous_month(now=None):
     return "%04d-%02d" % (y, m)
 
 
+def parse_moment(text):
+    """A moment from the command line: Unix seconds, or YYYY-MM-DDTHH:MM (a space for the T, or the hour alone) in local time."""
+    if text.isdigit():
+        return int(text)
+    for fmt in ("%Y-%m-%dT%H:%M", "%Y-%m-%dT%H", "%Y-%m-%d %H:%M", "%Y-%m-%d %H"):
+        try:
+            return int(time.mktime(time.strptime(text, fmt)))
+        except ValueError:
+            continue
+    raise SystemExit("a moment is Unix seconds or YYYY-MM-DDTHH:MM (local time)")
+
+
+def settle_own_window(node, moment, price=DEFAULT_PRICE_USD_PER_GB, fee=DEFAULT_STEWARD_FEE):
+    """`bwkit settle --window`: the window of this node's own copies that holds `moment`, settled by the Mint's rule.
+
+    Reads receipts.jsonl, acks.jsonl and links.jsonl in the state directory
+    and nothing else: the payer's receipt whose window holds the moment, the
+    ack that chains to it, and the announcement in force at its start, each
+    checked by its signature. Prints what each side signed and the settlement
+    record as `resolve` makes it. Exit 0 when the window settles, 1 when a
+    copy is missing or fails its check.
+    """
+    if node.role not in ("hop", "payer"):
+        print("settle --window reads a hop's or a payer's own copies; the Mint has the ledger (`bwkit ledger`)")
+        return 1
+    names = node.peers()
+    name_of = lambda nym: names.get(nym) or (node.name if nym == node.nym else nym[:20] + "...")
+    when = lambda t: time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
+    rec_path, ack_path, link_path = node.path("receipts.jsonl"), node.path("acks.jsonl"), node.path("links.jsonl")
+    if not os.path.exists(rec_path):
+        print("no receipts.jsonl here: this node holds no receipt" + (" (a hop keeps the payer's receipts since bwkit 0.4.0)" if node.role == "hop" else ""))
+        return 1
+    receipts = [e for _, e in read_jsonl(rec_path)[0] if isinstance(e, dict) and e.get("kind") == "receipt"]
+    held = [e for e in receipts if e["receipt"]["t_first"] <= moment <= e["receipt"]["t_last"]]
+    if not held:
+        print("no window of my copies holds %s (%d): the receipts here run %s" % (
+            when(moment), moment, ("from %s to %s" % (when(min(e["receipt"]["t_first"] for e in receipts)),
+                                                     when(max(e["receipt"]["t_last"] for e in receipts)))) if receipts else "nowhere, the file is empty"))
+        return 1
+    env = held[-1]
+    r = env["receipt"]
+    try:
+        check_envelope(env)
+    except ValueError as e:
+        print("the receipt for %s..%s in my copies fails its check: %s" % (when(r["t_first"]), when(r["t_last"]), e))
+        return 1
+    acks = [e for _, e in read_jsonl(ack_path)[0] if isinstance(e, dict) and e.get("kind") == "ack"] if os.path.exists(ack_path) else []
+    chained = [a for a in acks if a["receipt"].get("prev_sig") == env["sig"]]
+    print("the window %s to %s, from my own copies:" % (when(r["t_first"]), when(r["t_last"])))
+    print("  the receipt, signed by %s: %d bytes, ok" % (name_of(r["payer"]), r["bytes"]))
+    if not chained:
+        print("  no ack chains to it in my copies: the hop declined the receipt, or never countersigned it; the window is not settled")
+        return 1
+    ack = chained[-1]
+    try:
+        check_envelope(ack)
+    except ValueError as e:
+        print("  the ack in my copies fails its check: %s" % e)
+        return 1
+    print("  the ack, signed by %s: %d bytes, ok" % (name_of(ack["receipt"]["hop"]), ack["receipt"]["bytes"]))
+    links = []
+    if os.path.exists(link_path):
+        for _, l in read_jsonl(link_path)[0]:
+            try:
+                check_link(l)
+                if verify_link(l) and not profile_1_link(l):
+                    links.append(l)
+            except ValueError:
+                continue
+    link = link_in_force(links, r["payer"], r["hop"], r["t_first"])
+    if link:
+        print("  the announcement in force: %s, margin %s, %s %s, since %s" % (link_hash(link)[:16], link["margin"], link["price"], link["unit"], when(link["since"])))
+    else:
+        print("  no announcement of mine in force at its start: the pilot defaults, margin %s, %s USD/GB" % (PILOT_LINK["margin"], price))
+    try:
+        s = resolve(env, ack, price, link=link, fee=fee)
+    except ValueError as e:
+        print("  the two do not settle: %s" % e)
+        return 1
+    print("  settled at %d bytes, %s%s: $%.6f, the Steward's fee $%.6f (no purchase considered: premiums are the Mint's registry)" % (
+        s["settled_bytes"], s["status"].upper(), (" beyond the margin" if s["status"] == "disputed" else " within the margin"), s["amount_usd"], s["fee_usd"]))
+    print(json.dumps(s, indent=1, sort_keys=True))
+    return 0
+
+
 def parse_hour(text):
     """An hour from the command line: Unix seconds (any moment in it) or YYYY-MM-DDTHH[:MM] in local time."""
     if text.isdigit():
@@ -1515,8 +1600,19 @@ class Node:
             return self._flush(mint)
 
     def _flush(self, mint):
+        # Two processes may flush the same outbox at once (the hourly `bwkit receipt` and the radio sidecar's sweep on a
+        # gateway, Nov 1, 2026): each posts the record, the Mint answers the second with 409 duplicate, and the one that
+        # moves the file second finds it gone. The lock is per process, so the move tolerates that: the record was sent.
         names = sorted(os.listdir(self.path("outbox")))
         sent = 0
+
+        def moved(name, dest):
+            try:
+                os.replace(self.path("outbox", name), self.path("sent", dest))
+                return True
+            except FileNotFoundError:
+                return False                                    # another flusher of this outbox moved it first
+
         for name in names:
             p = self.path("outbox", name)
             try:
@@ -1530,15 +1626,15 @@ class Node:
                 log("mint unreachable (%s); %d left in outbox" % (e, len(names) - sent))
                 break
             if 200 <= status < 300:
-                os.replace(p, self.path("sent", name))
-                self.append("sent.jsonl", {"t": int(time.time()), "file": name, "mint": body})
+                if moved(name, name):
+                    self.append("sent.jsonl", {"t": int(time.time()), "file": name, "mint": body})
                 sent += 1
             elif status == 409 and isinstance(body, dict) and body.get("error") == "duplicate":
-                os.replace(p, self.path("sent", name))
+                moved(name, name)
                 sent += 1
             else:
                 log("mint refused %s: %s %s" % (name, status, body))
-                os.replace(p, self.path("sent", name + ".refused"))
+                moved(name, name + ".refused")
         return sent, len(os.listdir(self.path("outbox")))
 
     def flush_quietly(self):
@@ -3531,10 +3627,13 @@ def main(argv=None):
     ow.add_argument("--fee", type=float, default=DEFAULT_STEWARD_FEE, help="the Steward's fraction f")
     vf = sub.add_parser("verify", help="check the signature on receipt files (no node state needed)")
     vf.add_argument("files", nargs="+")
-    st = sub.add_parser("settle", help="resolve one window offline from a receipt file and an ack file")
-    st.add_argument("receipt")
-    st.add_argument("ack")
-    st.add_argument("--link", help="the announcement in force (a JSON file); without it, the pilot defaults")
+    st = sub.add_parser("settle", help="resolve one window offline from a receipt file and an ack file, or, with --window, "
+                                       "from this node's own copies of that window (receipts.jsonl, acks.jsonl, links.jsonl)")
+    st.add_argument("receipt", nargs="?")
+    st.add_argument("ack", nargs="?")
+    st.add_argument("--window", metavar="MOMENT", help="on a hop or a payer: settle the window of my own copies that holds this moment, "
+                                                       "Unix seconds or YYYY-MM-DDTHH:MM in local time, by the Mint's rule, with no Mint involved")
+    st.add_argument("--link", help="the announcement in force (a JSON file); without it, the pilot defaults (not with --window, which finds it)")
     st.add_argument("--price", type=float, default=DEFAULT_PRICE_USD_PER_GB, help="the default price when there is no announcement")
     st.add_argument("--fee", type=float, default=DEFAULT_STEWARD_FEE, help="the Steward's fraction f")
     rp = sub.add_parser("report", help="mint: post the ledger's public summary, signed with the Mint's key, to the status feed "
@@ -3593,7 +3692,11 @@ def main(argv=None):
                 ok = False
                 print("%s: BAD: %s" % (fn, e))
         return 0 if ok else 1
+    if args.cmd == "settle" and args.window:
+        return settle_own_window(Node.from_env(), parse_moment(args.window), args.price, args.fee)
     if args.cmd == "settle":
+        if not (args.receipt and args.ack):
+            raise SystemExit("settle takes a receipt file and an ack file, or --window <moment> on a hop or a payer")
         with open(args.receipt) as f:
             rec = json.load(f)
         with open(args.ack) as f:

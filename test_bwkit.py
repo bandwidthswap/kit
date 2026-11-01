@@ -251,6 +251,29 @@ class Windows(unittest.TestCase):
         s = [e for e in self.lab.mint.ledger_lines() if e["kind"] == "settlement"]
         self.assertEqual(len(s), 1)
 
+    def test_two_flushers_of_one_outbox_do_not_trip_on_each_other(self):
+        # the radio sidecar's sweep and `bwkit receipt` flush the payer's outbox from two processes (Nov 1, 2026):
+        # the other one moves the file after the Mint has taken it, and this one must not raise over the missing file
+        self.lab.mint_srv.shutdown()
+        self.lab.mint_srv.server_close()
+        self.lab.hour(5_000_000, 5_000_000)
+        self.lab.mint_srv = self.lab.mint.serve("127.0.0.1", self.lab.mint_srv.server_address[1], block=False)
+        payer, real_post = self.lab.payer, bwkit.http_post
+        names = sorted(os.listdir(payer.path("outbox")))
+
+        def other_flusher_wins(url, env):
+            status, body = real_post(url, env)
+            for name in names:                                   # the other process moves what it posted, too
+                if name in os.listdir(payer.path("outbox")):
+                    os.replace(payer.path("outbox", name), payer.path("sent", name))
+                    break
+            return status, body
+        with mock.patch.object(bwkit, "http_post", other_flusher_wins):
+            sent, left = payer.flush()
+        self.assertEqual((sent, left), (2, 0))
+        self.assertEqual(sorted(os.listdir(payer.path("sent"))), names)
+        self.assertEqual(len([e for e in self.lab.mint.ledger_lines() if e["kind"] == "settlement"]), 1)
+
     def test_ack_before_receipt_still_settles(self):
         # the hop's own copy reaches the Mint first; the Mint pairs them when the receipt arrives
         self.lab.hour(1_000, 1_000)
@@ -1017,6 +1040,81 @@ class Invoices(unittest.TestCase):
         with self.assertRaises(bwkit.urlerror.HTTPError) as cm:
             bwkit.http_get(lab.mint_url + "/invoice?month=10-2026")
         self.assertEqual(cm.exception.code, 400)
+
+
+class SettleWindow(unittest.TestCase):
+    """`bwkit settle --window`: one window resolved from a node's own copies alone, by the Mint's rule."""
+
+    def setUp(self):
+        self.lab = Lab()
+        self.lab.hop.config["link"] = {"price": 0.10, "margin": 0.10, "min_bytes": 65536, "patience_windows": 0,
+                                       "medium": "wifi", "range_class": "building"}
+
+    def tearDown(self):
+        self.lab.close()
+
+    def test_the_hop_and_the_payer_settle_a_disputed_window_from_their_own_copies(self):
+        lab = self.lab
+        lab.hour(1_000_000_000, 1_000_000_000)                          # agrees, under the pilot defaults
+        rec, h = lab.hop.announce(now=lab.t + 1, since=lab.t)            # 10% from the window starting now on
+        lab.hour(2_000_000_000, 2_050_000_000)                           # 5%: settled under the announcement
+        lab.step(600, 2_500_000_000, 2_150_000_000)                      # the hop's meter reset mid-window: 500 MB against 100 MB
+        t_first = lab.t - 600
+        mint = [e for e in lab.mint.ledger_lines() if e["kind"] == "settlement"][-1]
+        self.assertEqual((mint["status"], mint["settled_bytes"], mint["link"]), ("disputed", 100_000_000, h))
+        for env in (hop_env(lab), payer_env(lab)):
+            rc, text = cli(["settle", "--window", str(lab.t - 60)], env)
+            self.assertEqual(rc, 0, text)
+            self.assertIn("the receipt, signed by bw-house: 500000000 bytes, ok", text)
+            self.assertIn("the ack, signed by bw-forest: 100000000 bytes, ok", text)
+            self.assertIn("settled at 100000000 bytes, DISPUTED beyond the margin: $0.010000, the Steward's fee $0.000500", text)
+            s = json.loads(text[text.index("{"):])
+            self.assertEqual((s["status"], s["settled_bytes"], s["t_first"], s["receipt_sig"], s["ack_sig"]),
+                             ("disputed", 100_000_000, t_first, mint["receipt_sig"], mint["ack_sig"]))
+        # the hop holds the announcement; the payer keeps none, so it settles under the pilot defaults and says so
+        rc, hop_text = cli(["settle", "--window", str(lab.t - 60)], hop_env(lab))
+        self.assertIn("the announcement in force: %s, margin 0.1, 0.1 USD/GB" % h[:16], hop_text)
+        self.assertEqual(json.loads(hop_text[hop_text.index("{"):])["link"], h)
+        rc, payer_text = cli(["settle", "--window", str(lab.t - 60)], payer_env(lab))
+        self.assertIn("no announcement of mine in force at its start: the pilot defaults, margin 0.01, 0.1 USD/GB", payer_text)
+        # the moment as a local time, to the minute, lands in the same window
+        local = time.strftime("%Y-%m-%dT%H:%M", time.localtime(lab.t - 60))
+        rc, text = cli(["settle", "--window", local], hop_env(lab))
+        self.assertEqual(rc, 0, text)
+        self.assertIn("settled at 100000000 bytes, DISPUTED", text)
+        # the settled window before it, by the same door
+        rc, text = cli(["settle", "--window", str(t_first - 1800)], hop_env(lab))
+        self.assertEqual(rc, 0, text)
+        self.assertIn("the ack, signed by bw-forest: 1050000000 bytes, ok", text)
+        self.assertIn("settled at 1000000000 bytes, SETTLED within the margin: $0.100000, the Steward's fee $0.005000", text)
+
+    def test_a_moment_no_window_holds_and_an_altered_copy_are_named(self):
+        lab = self.lab
+        lab.hour(1_000_000_000, 1_000_000_000)
+        rc, text = cli(["settle", "--window", str(lab.t + 7200)], hop_env(lab))
+        self.assertEqual(rc, 1)
+        self.assertIn("no window of my copies holds", text)
+        self.assertIn("the receipts here run", text)
+        with self.assertRaises(SystemExit):
+            cli(["settle", "--window", "yesterday"], hop_env(lab))
+        with self.assertRaises(SystemExit) as cm:
+            cli(["settle"], hop_env(lab))
+        self.assertIn("settle takes a receipt file and an ack file, or --window", str(cm.exception))
+        # a byte changed in the hop's ack: the copy fails its check and the window does not settle
+        path = os.path.join(lab.hop.dir, "acks.jsonl")
+        lines = open(path).read().splitlines()
+        a = json.loads(lines[-1]); a["receipt"]["bytes"] += 1
+        with open(path, "w") as f:
+            f.write("\n".join(lines[:-1] + [json.dumps(a)]) + "\n")
+        rc, text = cli(["settle", "--window", str(lab.t - 60)], hop_env(lab))
+        self.assertEqual(rc, 1, text)
+        self.assertIn("the ack in my copies fails its check: bad signature", text)
+        # the ack gone: the receipt stands alone
+        with open(path, "w") as f:
+            f.write("")
+        rc, text = cli(["settle", "--window", str(lab.t - 60)], hop_env(lab))
+        self.assertEqual(rc, 1, text)
+        self.assertIn("no ack chains to it in my copies", text)
 
 
 class Owed(unittest.TestCase):
