@@ -2183,7 +2183,8 @@ class Node:
             return []
         return sorted(n[:-4] for n in os.listdir(d) if re.match(r"^\d{4}-\d{2}\.txt$", n))
 
-    def owed(self, month, purchases_path=None, invoice_path=None, links_path=None, price=DEFAULT_PRICE_USD_PER_GB, fee=DEFAULT_STEWARD_FEE):
+    def owed(self, month, purchases_path=None, invoice_path=None, links_path=None, price=DEFAULT_PRICE_USD_PER_GB, fee=DEFAULT_STEWARD_FEE,
+             receipts_path=None, acks_path=None):
         """Hop or payer: the month's invoice line from this node's own copies alone, set against the Mint's.
 
         The receipts and acks this node kept (its own and the other side's,
@@ -2199,6 +2200,12 @@ class Node:
         proxy (signed records, checked like everything else); without them a
         purchased window's premium cannot be computed and the text says so.
         A payer keeps no announcements, so --links or the Mint's /links.
+        A window from before profile 1 (its receipt carries no `proto`) is
+        summed without a fee, as the Mint of its day took none. A hop keeps
+        the payer's receipt only since bwkit 0.4.0, so an older ack stands
+        alone and its window is not rebuilt: the other party's copy of its
+        file, --receipts or --acks, is added to this node's own to fill such
+        a gap (every record is still checked by its signature).
 
         Returns (text, rc): 0 when every figure of every line agrees, 1 when
         one differs, 2 when the Mint's invoice could not be read or compared.
@@ -2214,6 +2221,14 @@ class Node:
         receipts, bad_r = own("receipts.jsonl")
         acks, bad_a = own("acks.jsonl")
         sources = []
+        if receipts_path:
+            more, bad = read_jsonl(receipts_path)
+            receipts, bad_r = receipts + more, bad_r + bad                  # rebuild keeps each signature once
+            sources.append("receipts from %s added to mine" % os.path.basename(receipts_path))
+        if acks_path:
+            more, bad = read_jsonl(acks_path)
+            acks, bad_a = acks + more, bad_a + bad
+            sources.append("acks from %s added to mine" % os.path.basename(acks_path))
         if links_path:
             links, bad_l = read_jsonl(links_path)
             sources.append("announcements from %s" % os.path.basename(links_path))
@@ -2256,13 +2271,29 @@ class Node:
         place_of = place_lookup(self.load_map(), self.peers()) if self.map_path_exists() else None
         entries, rep = rebuild(receipts, acks, links, price, fee, purchases=purchases, place_of=place_of)
         left_out = bad_r + bad_a + bad_l + bad_p + rep["bad"]
+        # a window whose receipt is from before profile 1 was settled by a Mint that took no fee: summed as the Mint summed it
+        pre = {env["sig"] for _, env in receipts if isinstance(env, dict) and "proto" not in env and env.get("sig")}
+        before = 0
+        settled = []
+        for e in entries:
+            if e.get("kind") == "settlement" and e.get("receipt_sig") in pre:
+                e = dict(e, fee_usd=0.0)
+                before += 1
+            settled.append(e)
         names = dict(self.peers())
         names.setdefault(me, my_name)
-        mine = {k: v for k, v in invoice_sums(entries, month).items() if (k[1] if self.role == "hop" else k[0]) == me}
+        mine = {k: v for k, v in invoice_sums(settled, month).items() if (k[1] if self.role == "hop" else k[0]) == me}
         lines = ["from my own copies: %d receipts and %d acks under %d announcements and %d purchases (%s) rebuilt into %d settlements, %d of them mine in %s%s" % (
             rep["receipts"], rep["acks"], rep["links"], rep["purchases"], "; ".join(sources) or "nothing else",
             rep["settlements"], sum(o["windows"] for o in mine.values()), month,
             "; %d lines left out" % len(left_out) if left_out else "")]
+        if rep["acks_without_receipt"]:
+            lines.append("%d acks have no receipt in my copies, so their windows are not rebuilt here (a hop keeps the payer's receipt since bwkit 0.4.0, Oct 18, 2026; "
+                         "the payer's receipts.jsonl fills the gap: --receipts <file>)" % rep["acks_without_receipt"])
+        if rep["receipts_without_ack"]:
+            lines.append("%d receipts have no ack in my copies: a window the hop declined or never answered, or a gap the hop's acks.jsonl fills (--acks <file>)" % rep["receipts_without_ack"])
+        if before:
+            lines.append("%d settlements are from before profile 1 (no `proto` on the receipt): summed without a fee, as the Mint of their day took none" % before)
         for line in left_out:
             lines.append("left out: " + line)
         if not purchases_known:
@@ -3484,6 +3515,8 @@ def main(argv=None):
     ow.add_argument("--invoice", metavar="FILE", help="the Mint's invoice as a text file, when the Mint cannot be reached through this node")
     ow.add_argument("--purchases", metavar="FILE", help="the Mint's purchases.jsonl, when it cannot be reached; without purchases no premium is computed")
     ow.add_argument("--links", metavar="FILE", help="announcements to settle under (a payer keeps none; the Mint's /links otherwise)")
+    ow.add_argument("--receipts", metavar="FILE", help="the payer's receipts.jsonl, added to this node's own copies to fill a gap in them")
+    ow.add_argument("--acks", metavar="FILE", help="the hop's acks.jsonl, added to this node's own copies to fill a gap in them")
     ow.add_argument("--price", type=float, default=DEFAULT_PRICE_USD_PER_GB, help="the default price when no announcement is in force")
     ow.add_argument("--fee", type=float, default=DEFAULT_STEWARD_FEE, help="the Steward's fraction f")
     vf = sub.add_parser("verify", help="check the signature on receipt files (no node state needed)")
@@ -3810,7 +3843,8 @@ def main(argv=None):
         month = args.month or previous_month()
         if not re.match(r"^\d{4}-\d{2}$", month):
             raise SystemExit("the month is YYYY-MM, as in 2026-10")
-        text, rc = node.owed(month, purchases_path=args.purchases, invoice_path=args.invoice, links_path=args.links, price=args.price, fee=args.fee)
+        text, rc = node.owed(month, purchases_path=args.purchases, invoice_path=args.invoice, links_path=args.links, price=args.price, fee=args.fee,
+                             receipts_path=args.receipts, acks_path=args.acks)
         print(text, end="")
         return rc
     elif args.cmd == "prove":

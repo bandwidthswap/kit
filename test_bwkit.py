@@ -1095,6 +1095,40 @@ class Owed(unittest.TestCase):
         rc, text = cli(["owed", month, "--invoice", path, "--purchases", lab.mint.path("purchases.jsonl")], {"BWKIT_DIR": lab.hop.dir, "BWKIT_CONFIG": cfg})
         self.assertEqual(rc, 0, text)
 
+    def test_a_gap_in_my_copies_is_named_and_the_other_partys_copy_fills_it(self):
+        lab = self.lab
+        lab.hour(1_000_000_000, 1_000_000_000)
+        lab.hour(2_000_000_000, 2_000_000_000)
+        lab.hour(3_000_000_000, 3_000_000_000)
+        month = time.strftime("%Y-%m", time.localtime(lab.t))
+        # the hop's copy of the payer's receipt for the first window is gone, as on a hop from before 0.4.0 kept it
+        p = lab.hop.path("receipts.jsonl")
+        with open(p) as f:
+            lines = [l for l in f.read().split("\n") if l]
+        with open(p, "w") as f:
+            f.write("\n".join(lines[1:]) + "\n")
+        rc, text = cli(["owed", month], hop_env(lab))
+        self.assertEqual(rc, 1, text)
+        self.assertIn("1 acks have no receipt in my copies, so their windows are not rebuilt here", text)
+        self.assertIn("windows with bw-house: 2 here, 3 on the Mint", text)
+        rc, text = cli(["owed", month, "--receipts", lab.payer.path("receipts.jsonl")], hop_env(lab))
+        self.assertEqual(rc, 0, text)
+        self.assertIn("receipts from receipts.jsonl added to mine", text)
+        self.assertNotIn("have no receipt", text)
+        self.assertIn("matches the Mint's invoice, figure for figure: the relay's $0.2850", text)
+        # a receipt from before profile 1 (no `proto` on the envelope; the signature covers the tuple, not the envelope) is
+        # summed without a fee, and the text says so; this lab's Mint took one, so the comparison names the fee alone
+        p = lab.payer.path("receipts.jsonl")
+        with open(p) as f:
+            envs = [json.loads(l) for l in f.read().split("\n") if l]
+        del envs[0]["proto"]
+        with open(p, "w") as f:
+            f.write("\n".join(json.dumps(e, sort_keys=True) for e in envs) + "\n")
+        rc, text = cli(["owed", month], payer_env(lab))
+        self.assertEqual(rc, 1, text)
+        self.assertIn("1 settlements are from before profile 1 (no `proto` on the receipt): summed without a fee", text)
+        self.assertIn("DIFFERS from the Mint's invoice:\n  relay with bw-forest: $0.2900 here, $0.2850 on the Mint\n  fee with bw-forest: $0.0100 here, $0.0150 on the Mint\n", text)
+
     def test_the_mint_declines_and_the_proxy_carries_the_invoice(self):
         lab = self.lab
         with self.assertRaises(SystemExit):
