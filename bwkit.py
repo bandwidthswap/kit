@@ -2290,8 +2290,11 @@ class Node:
         if rep["acks_without_receipt"]:
             lines.append("%d acks have no receipt in my copies, so their windows are not rebuilt here (a hop keeps the payer's receipt since bwkit 0.4.0, Oct 18, 2026; "
                          "the payer's receipts.jsonl fills the gap: --receipts <file>)" % rep["acks_without_receipt"])
-        if rep["receipts_without_ack"]:
-            lines.append("%d receipts have no ack in my copies: a window the hop declined or never answered, or a gap the hop's acks.jsonl fills (--acks <file>)" % rep["receipts_without_ack"])
+        answered = {a["receipt"].get("prev_sig") for _, a in acks if isinstance(a, dict) and isinstance(a.get("receipt"), dict)}
+        unanswered = sum(1 for _, r in receipts if isinstance(r, dict) and isinstance(r.get("receipt"), dict)
+                         and r["receipt"].get("hop" if self.role == "hop" else "payer") == me and r.get("sig") not in answered)
+        if unanswered:
+            lines.append("%d of my receipts have no ack in my copies: a window the hop declined or never answered, or a gap the hop's acks.jsonl fills (--acks <file>)" % unanswered)
         if before:
             lines.append("%d settlements are from before profile 1 (no `proto` on the receipt): summed without a fee, as the Mint of their day took none" % before)
         for line in left_out:
