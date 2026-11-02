@@ -373,6 +373,7 @@ class StatusReport(unittest.TestCase):
         self.assertEqual(by["bw-house"]["role"], "payer")
         self.assertEqual(by["bw-forest"]["role"], "hop")
         self.assertEqual(by["bw-mint"]["role"], "mint")
+        self.assertEqual(rep["prepaid"], {})                 # no deposit, no lock: the prepayment book is empty (Section 16)
         self.assertEqual(by["bw-house"]["receipts"], 2)
         self.assertEqual(by["bw-house"]["window_bytes"], 2_000_000)
         self.assertEqual((by["bw-house"]["window_t_first"], by["bw-house"]["window_t_last"]), (self.lab.t - 3600, self.lab.t))
@@ -719,7 +720,7 @@ class Commitments(unittest.TestCase):
         self.lab.step(600, 2_500_000, 2_500_000)             # a second window in the latest hour
         rep = self.lab.mint.status_report(now=self.lab.t + 60, service=True)
         self.assertEqual(set(rep), {"v", "generated_at", "bwkit", "proto", "phase", "window_s", "since", "service", "ledger", "nodes",
-                                    "mint", "commitment", "proof", "steward"})
+                                    "mint", "commitment", "proof", "steward", "prepaid"})
         self.assertEqual((rep["mint"], rep["steward"]), (self.lab.mint.nym, None))
         c = self.lab.mint.ledger_lines()[-1]
         self.assertEqual(rep["commitment"], {"t": c["t"], "window": self.lab.t - 600, "root": c["root"], "count": 1,
@@ -1257,6 +1258,12 @@ class Prepay(unittest.TestCase):
             text = lab.mint.invoice_text(month)
         self.assertIn("bw-house pays bw-forest: 2 windows (0 disputed), 300.00 MB, $0.0300: the relay's $0.0285, the Steward's $0.0015", text)
         self.assertIn("%s  bw-house prepaid: deposits $0.000000, drawn $0.030000 on 2 covered windows, balance $0.020000; on credit $0.0000 on 0 windows" % month, text)
+        # the public report carries the book per payer, by name and in micro-units: what the page's Prepayment section draws from the feed
+        with mock.patch("time.time", return_value=lab.t + 3600 + 14400):
+            rep = lab.mint.status_report(now=lab.t + 3600 + 14400)
+        self.assertEqual(list(rep["prepaid"]), ["bw-house"])
+        self.assertEqual((rep["prepaid"]["bw-house"]["balance"], rep["prepaid"]["bw-house"]["debited"], rep["prepaid"]["bw-house"]["covered"], rep["prepaid"]["bw-house"]["released"]), (20000, 30000, 2, 15000))
+        bwkit.assert_public(json.dumps(rep))
         # `owed` on the payer, with the registry through its proxy, agrees figure for figure, the prepayment line too
         with mock.patch("time.time", return_value=lab.t + 3600 + 14400):
             lab.mint.invoice_save(month)                                   # written at the same moment the payer reads it: the balance is of a moment
@@ -2953,9 +2960,9 @@ class Dashboard(unittest.TestCase):
         st.run(lab.t + 300)
         lab.hop.flush()                                                                             # its own copy of the ack, otherwise sent 5 s later
         here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard")
-        shapes = {"mint": ["taken_at", "status", "ledger", "commitments", "purchases", "steward", "steward_runs", "map", "proofs"],
-                  "hop": ["taken_at", "status", "acks", "receipts", "links", "outbox", "mint", "map", "proofs"],
-                  "payer": ["taken_at", "status", "receipts", "acks", "purchases", "outbox", "mint", "map", "proofs"]}
+        shapes = {"mint": ["taken_at", "status", "ledger", "commitments", "purchases", "prepay", "steward", "steward_runs", "map", "proofs"],
+                  "hop": ["taken_at", "status", "acks", "receipts", "links", "outbox", "prepay", "mint", "map", "proofs"],
+                  "payer": ["taken_at", "status", "receipts", "acks", "purchases", "outbox", "prepay", "mint", "map", "proofs"]}
         w = bwkit.commit_hour(list(lab.mint.index["settled"].values())[0])
         proof_text = bwkit.http_get(lab.mint_url + "/proof?window=%d" % w)[1]
         mint_ledger = bwkit.http_get(lab.mint_url + "/ledger")[1]

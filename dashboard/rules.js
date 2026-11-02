@@ -15,6 +15,7 @@ window.BW = window.BW || {};
   // Money by magnitude: dollars to two places from a dollar up, cents to two places from a mill up, cents to three below.
   F.money=function(x){ if(x==null||isNaN(x)) return '–'; var a=Math.abs(x), sign=x<0?'−':''; if(a===0) return '0'; if(a>=1) return sign+'$'+a.toFixed(2); if(a>=0.001) return sign+(a*100).toFixed(2)+'¢'; return sign+(a*100).toFixed(3)+'¢'; };
   F.usd=F.money;
+  F.micro=function(n){ return n==null ? '–' : F.money(n/1e6); };   // Section 16's integers, micro-units of a dollar
   F.pct=function(x, d){ return (100*x).toFixed(d==null?1:d)+'%'; };
   F.sortBy=function(arr, key, desc){ return arr.slice().sort(function(a,b){ var x=key(a), y=key(b); return x<y ? (desc?1:-1) : x>y ? (desc?-1:1) : 0; }); };
   F.median=function(a){ if(!a.length) return 0; var s=a.slice().sort(function(x,y){ return x-y; }); return s[Math.floor(s.length/2)]; };

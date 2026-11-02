@@ -13,7 +13,30 @@ window.BW = window.BW || {};
     // a window's refund_usd is the premium on its shortfall, which the Mint never drew from the escrow, so it is not owed and not subtracted
     var mine = hop ? carriage-fee+prem : carriage+prem;
     var cells=[[hop?'owed to me':'I owe', money(mine), hop?'carriage less the fee, plus premiums':'carriage plus premiums'],['windows', String(W.length), disputed+' settled disputed'],['carried', bytes(gb), 'settled bytes'],['the Steward\'s fee', money(fee), 'f of every window'+(hop?', out of my share':', out of what I paid')],['premiums', money(prem), hop?'earned on purchased windows':'paid on my purchases']];
-    return '<h2>My month <small>'+month+', as the Mint settled it</small></h2><div class="now">'+cells.map(function(c){ return '<div><span class="k">'+c[0]+'</span><span class="v">'+esc(c[1])+'</span><span class="s">'+esc(c[2])+'</span></div>'; }).join('')+'</div>';
+    return '<h2>My month <small>'+month+', as the Mint settled it</small></h2><div class="now">'+cells.concat(prepayCells(X, now)).map(function(c){ return '<div><span class="k">'+c[0]+'</span><span class="v">'+esc(c[1])+'</span><span class="s">'+esc(c[2])+'</span></div>'; }).join('')+'</div>';
+  }
+
+  // Prepayment (spec, Section 16), beside My month: a payer's balance at the Mint and the lock it holds for the coming
+  // window; a hop's door, and which payers are covered for the window open now. Nothing until the registry holds a record
+  // or the hop asks for locks: prepayment is off unless used.
+  function prepayCells(X, now){
+    var P=X.prepay, st=X.st, hop=X.role==='hop', cells=[];
+    if(!hop){
+      if(!P.on) return cells;
+      var b=P.payers[X.me], next=P.nextLock(X.me);
+      if(!b) return [['balance at the Mint', '–', 'no deposit and no lock of mine in the registry']];
+      cells.push(['balance at the Mint', F.micro(b.balance), F.micro(b.deposits)+' deposited, less what locks hold and covered windows drew']);
+      cells.push(['locked ahead', next ? F.micro(next.amount) : 'none', next ? 'for the '+F.hm(next.t_first)+' window with '+X.name(next.hop) : 'no lock open; the next window settles on credit']);
+      cells.push(['covered', b.covered+' window'+(b.covered===1?'':'s'), 'drew '+F.micro(b.debited)+(P.onCredit?' · on credit '+money(P.creditUsd)+' on '+P.onCredit+' window'+(P.onCredit===1?'':'s'):'')+(b.released?' · '+F.micro(b.released)+' released unused':'')]);
+      return cells;
+    }
+    var pp=st.prepay; if(!pp) return cells;
+    var payers=Object.keys(pp.covered||{}), any=payers.some(function(p){ return pp.covered[p]!=null; });
+    if(!pp.require_lock && !any && !P.on) return cells;
+    cells.push(['locks', pp.require_lock?'required':'taken, not required', pp.require_lock?'a receipt without a lock for its window is declined (409 lock)':'a payer\'s lock is kept; windows settle on credit without one']);
+    payers.forEach(function(p){ var t=pp.covered[p]; cells.push(['covered: '+X.name(p), t!=null?'for the '+F.hm(t)+' window':'no lock', t!=null?'the payer locked this window\'s value at the Mint':(pp.require_lock?'its next receipt is declined until one arrives':'its windows settle on credit')]); });
+    (pp.uncovered||[]).forEach(function(p){ cells.push(['declined for want of a lock', X.name(p), 'served again when its lock arrives (on_cover)']); });
+    return cells;
   }
 
   // The invoice: the Mint's text for the month before this one (written on the first) and this month so far, read through
@@ -25,9 +48,11 @@ window.BW = window.BW || {};
       var lines=t.split('\n').filter(Boolean), mine=lines.filter(function(l){ var mm=/^\S+  (\S+) pays (\S+):/.exec(l); return mm && (hop ? mm[2]===me : mm[1]===me); });
       var written=lines.filter(function(l){ return /^written /.test(l); })[0], sofar=lines.some(function(l){ return /computed now/.test(l); });
       var paid=lines.map(function(l){ return /^\S+  (\S+) paid (\S+): (.*) \(noted (.*)\)$/.exec(l); }).filter(function(mm){ return mm && (hop ? mm[2]===me : mm[1]===me); });
+      var pre=hop ? null : lines.map(function(l){ return /^\S+  (\S+) prepaid: deposits \$([0-9.]+), drawn \$([0-9.]+) on (\d+) covered windows?, balance \$([0-9.]+); on credit \$([0-9.]+) on (\d+) windows?$/.exec(l); }).filter(function(mm){ return mm && mm[1]===me; })[0];
+      var preCell = pre ? '<div><span class="k">prepaid</span><span class="v">$'+esc(pre[3])+'</span><span class="s">drawn on '+esc(pre[4])+' covered window'+(pre[4]==='1'?'':'s')+'; balance $'+esc(pre[5])+'; on credit $'+esc(pre[6])+' on '+esc(pre[7])+' window'+(pre[7]==='1'?'':'s')+'</span></div>' : '';
       var paidCell = !mine.length ? '' : paid.length ? paid.map(function(mm){ return '<div><span class="k">paid</span><span class="v">'+esc(mm[3])+'</span><span class="s">noted '+esc(mm[4])+'</span></div>'; }).join('') : (written ? '<div><span class="k">paid</span><span class="v">not yet</span><span class="s">'+(hop?'the Mint notes it when the house settles up':'the Mint notes it when I settle up')+'</span></div>' : '');
       return '<h3>'+esc(m)+' <small>'+(written?'as the Mint wrote it, '+esc(written.replace(/^written /,'')):(sofar?'this month so far, computed by the Mint now':'as the Mint serves it'))+'</small></h3>'
-        +(mine.length?'<div class="now">'+mine.map(function(l){ var mm=/: the relay's \$([0-9.]+), the Steward's \$([0-9.]+)$/.exec(l), am=/\$([0-9.]+)(?: \+ \$([0-9.]+) premium)?:/.exec(l); return '<div><span class="k">'+(hop?'owed to me':'I owe')+'</span><span class="v">$'+esc(hop?(mm?mm[1]:'?'):(am?(Number(am[1])+Number(am[2]||0)).toFixed(4):'?'))+'</span><span class="s">'+esc(l.replace(/^\S+  /,''))+'</span></div>'; }).join('')+paidCell+'</div>':'<div class="empty">No line of mine on the Mint\'s invoice for '+esc(m)+'.</div>')
+        +(mine.length?'<div class="now">'+mine.map(function(l){ var mm=/: the relay's \$([0-9.]+), the Steward's \$([0-9.]+)$/.exec(l), am=/\$([0-9.]+)(?: \+ \$([0-9.]+) premium)?:/.exec(l); return '<div><span class="k">'+(hop?'owed to me':'I owe')+'</span><span class="v">$'+esc(hop?(mm?mm[1]:'?'):(am?(Number(am[1])+Number(am[2]||0)).toFixed(4):'?'))+'</span><span class="s">'+esc(l.replace(/^\S+  /,''))+'</span></div>'; }).join('')+preCell+paidCell+'</div>':'<div class="empty">No line of mine on the Mint\'s invoice for '+esc(m)+'.</div>')
         +'<pre class="invoice">'+esc(lines.filter(function(l){ return !/^written |computed now/.test(l); }).join('\n'))+'</pre>';
     });
     return '<h2>The invoice <small>the Mint\'s, through this node; `bwkit owed` here recomputes my line from my own copies</small></h2>'+blocks.join('');

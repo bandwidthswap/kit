@@ -78,6 +78,37 @@ function noThrow(label, fn) { let out; try { out = fn(); } catch (e) { throw new
     const X2 = BW.derive(claimed.t_last + 10), h2 = noThrow('the Mint\'s view with a claimed window', () => BW.views.mint(X2, claimed.t_last + 10));
     ok(h2.includes('<span class="st claimed">claimed</span>'), 'the window is marked claimed');
     ok(h2.includes('<td class="n">–</td><td class="n">250.00 MB</td>'), 'no payer count, the hop\'s count: ' + (h2.match(/<td class="n">[^<]*<\/td><td class="n">250.00 MB<\/td>/) || [''])[0]);
+    ok(h2.includes('<span class="st covered" title="drew 2.00¢ on lock aaaaaaaa">covered</span>'), 'and covered, with what it drew on its lock: ' + (h2.match(/<span class="st claimed">claimed<\/span>.{0,120}/) || [''])[0]);
+    { const det = BW.sec.windowDetail(X2, BW.keyOf(claimed));
+      ok(det.includes('<dt>rule</dt><dd>the hop\'s count, up to what the payer locked; the payer never closed the window</dd><dt>lock</dt><dd>drew 2.00¢ on lock aaaaaaaaaaaaaaaaaaaaaa…</dd>'), 'the detail of a claimed window, which has no receipt and no ack, states the claim rule and the draw: ' + det.slice(0, 200));
+      eq(count(det, 'not held here'), 2, 'and says the receipt and the ack are not held, rather than refusing to draw'); }
+    D.ledger.pop();
+  }
+  // Prepayment (Section 16), from the registry the fixture carries: a dollar deposited, one lock released unused, one open for the window open now
+  {
+    eq(D.prepay.length, 3, 'the snapshot carries the registry as text and it parses: a deposit and two locks');
+    const P = X.prepay, house = D.prepay[0].payer;
+    ok(P.on, 'the book is on once the registry holds a record');
+    const b = P.payers[house]; ok(b, 'the payer has a line in the book');
+    eq([b.deposits, b.locked, b.debited, b.released, b.balance, b.covered].join(' '), '1000000 15000 0 12000 985000 0', 'deposits − open locks − debits = the balance, in micro-units; the old lock released, the new one open');
+    eq(b.locks.map((l) => l.state).join(' '), 'released open', 'each lock\'s state as of the snapshot\'s moment');
+    eq(P.nextLock(house).t_first, D.prepay[2].t_first, 'the lock ahead is the newest open one');
+    eq(P.covered, 0, 'no settled window in the fixture drew on a lock'); eq(P.onCredit, 50, 'so every one of the 50 settled on credit');
+    ok(html.includes('<h2>Prepayment <small>deposits held at this Mint, locks and claims · 0 covered windows, 50 on credit</small></h2>'), 'the Prepayment section is drawn');
+    ok(html.includes('<td class="n">$1.00</td><td class="n">1.50¢ <span class="m">1 open</span></td><td class="n">0 <span class="m">0 covered</span></td><td class="n">1.20¢</td><td class="n"><b>98.50¢</b></td>'), 'the payer\'s row: $1.00 deposited, 1.50¢ in one open lock, nothing drawn, 1.20¢ released, 98.50¢ balance: ' + (html.match(/<td class="n">\$1\.00<\/td>.{0,200}/) || [''])[0]);
+    ok(html.includes('<h3>Open locks <small>'), 'the open lock is listed'); eq(count(html, '<span class="st credit">on credit</span>'), 48, 'every settled row drawn (the last 48) says on credit');
+    ok(html.includes(' prepaid</td><td colspan="6" class="m">drawn 0 on 0 covered windows, balance 98.50¢; on credit '), 'the invoice table carries the prepaid row');
+    // before the deposit, the book is empty and the page is as it was
+    const before = BW.derive(D.prepay[0].posted_at - 1), hb = BW.views.mint(before, D.prepay[0].posted_at - 1);
+    ok(!before.prepay.on && !hb.includes('<h2>Prepayment') && !hb.includes('on credit</span>'), 'as of a moment before the deposit nothing of it is drawn');
+    // a covered window: the lock debited, the row marked, the balance down by the draw
+    const s0 = D.ledger.filter((e) => e.kind === 'settlement').slice(-1)[0];
+    const cov = Object.assign({}, s0, { t: now - 100, t_first: D.prepay[2].t_first, t_last: D.prepay[2].t_first + 3600, lock: D.prepay[2].id, debit: 13300, covered: true });
+    D.ledger.push(cov);
+    const Xc = BW.derive(now), bc = Xc.prepay.payers[house];
+    eq([bc.locked, bc.debited, bc.balance, bc.covered].join(' '), '0 13300 986700 1', 'the open lock is debited by the settlement: 1.33¢ drawn, nothing locked, the balance is the dollar less the draw');
+    eq(bc.locks[1].state, 'settled', 'and its state is settled');
+    ok(BW.views.mint(Xc, now).includes('<span class="st covered" title="drew 1.33¢ on lock ffffffff">covered</span>'), 'the row says covered and what it drew');
     D.ledger.pop();
   }
   // the Steward as of a moment: the run nearest before it, from the history the Mint serves; between runs the book does not change
@@ -141,6 +172,14 @@ function noThrow(label, fn) { let out; try { out = fn(); } catch (e) { throw new
   eq(X.S.length, 12, 'the hop\'s 12 settled windows'); eq(X.S.filter((s) => s.status === 'disputed').length, 5, '5 of them disputed');
   const html = noThrow('the hop\'s view', () => BW.views.node(X, now));
   ok(html.includes('<span class="k">owed to me</span><span class="v">15.15¢</span>'), 'owed to me: 15.15¢ (carriage less the fee, plus premiums)');
+  // prepayment on a hop: its door and who is covered for the window open now, from /status; the registry through its proxy
+  ok(html.includes('<span class="k">locks</span><span class="v">taken, not required</span>'), 'the hop\'s door: locks taken, not required');
+  ok(html.includes('<span class="k">covered: bw-house</span><span class="v">for the ' + BW.fmt.hm(D.status.prepay.covered[D.prepay[0].payer]) + ' window</span>'), 'bw-house is covered for the window open now');
+  eq(count(html, '<span class="st credit">on credit</span>'), 12, 'the hop\'s 12 settled windows say on credit, since the registry is on and none drew a lock');
+  { const pp = D.status.prepay; D.status.prepay = { require_lock: true, covered: { [D.prepay[0].payer]: null }, uncovered: [D.prepay[0].payer] };
+    const h3 = BW.views.node(BW.derive(now), now);
+    ok(h3.includes('<span class="k">locks</span><span class="v">required</span>') && h3.includes('<span class="k">covered: bw-house</span><span class="v">no lock</span><span class="s">its next receipt is declined until one arrives</span>') && h3.includes('<span class="k">declined for want of a lock</span><span class="v">bw-house</span>'), 'with the door shut and no lock: required, no lock, declined');
+    D.status.prepay = pp; }
   ok(html.includes('<span class="k">windows</span><span class="v">12</span><span class="s">5 settled disputed</span>'), 'My month: 12 windows, 5 disputed');
   ok(html.includes('<h2>My month <small>2026-10'), 'the month named');
   ok(html.includes('<h2>The Mint <small>who keeps my books</small></h2>'), 'the Mint card');
@@ -189,6 +228,19 @@ function noThrow(label, fn) { let out; try { out = fn(); } catch (e) { throw new
   eq(items.length, 0, 'no attention item on the payer: ' + JSON.stringify(items));
   const html = noThrow('the payer\'s view', () => BW.views.node(X, now));
   ok(html.includes('<span class="k">I owe</span><span class="v">16.13¢</span>'), 'I owe: 16.13¢');
+  // prepayment on the payer: its balance at the Mint and the lock ahead, from the registry read through this node
+  const house = D.prepay[0].payer, b0 = X.prepay.payers[house];
+  eq([b0.balance, b0.locked, b0.released].join(' '), '985000 15000 12000', 'the payer\'s book: 98.50¢ balance, 1.50¢ locked ahead, 1.20¢ released unused');
+  ok(html.includes('<span class="k">balance at the Mint</span><span class="v">98.50¢</span><span class="s">$1.00 deposited, less what locks hold and covered windows drew</span>'), 'balance at the Mint: 98.50¢');
+  ok(html.includes('<span class="k">locked ahead</span><span class="v">1.50¢</span><span class="s">for the ' + BW.fmt.hm(D.prepay[2].t_first) + ' window with bw-neighbor</span>'), 'locked ahead: 1.50¢ for the window open now, with the hop named');
+  ok(html.includes('<span class="k">covered</span><span class="v">0 windows</span><span class="s">drew 0 · on credit '), 'covered: none yet; what is on credit');
+  eq(count(html, '<span class="st credit">on credit</span>'), 48, 'the payer\'s rows say on credit');
+  // the Mint's invoice through this node: the payer's prepaid line becomes a cell
+  { const months = BW.invoiceMonths(now), m = months[1];
+    D.mintInvoice = {}; D.mintInvoice[m] = m + '  bw-house pays bw-neighbor: 50 windows (7 disputed), 5.00 GB, $0.1613: the relay\'s $0.1532, the Steward\'s $0.0081\n' + m + '  bw-house prepaid: deposits $1.000000, drawn $0.000000 on 0 covered windows, balance $0.985000; on credit $0.1613 on 50 windows\n' + m + '  the Network Steward\'s share: $0.0081 (f = 0.05 of every settlement since 0.3.0; none before)\nthe month so far, computed now; the Mint writes ' + m + '.txt on the first of the next month\n';
+    const hi = BW.views.node(X, now);
+    ok(hi.includes('<span class="k">prepaid</span><span class="v">$0.000000</span><span class="s">drawn on 0 covered windows; balance $0.985000; on credit $0.1613 on 50 windows</span>'), 'the prepaid line of the Mint\'s invoice, picked out as mine: ' + (hi.match(/<span class="k">prepaid<\/span>.{0,160}/) || [''])[0]);
+    D.mintInvoice = {}; }
   ok(html.includes('<h2>My purchases'), 'the payer\'s purchases section'); ok(html.includes('<h2>The Mint '), 'the Mint card');
   eq(X.purchases.length, 1, 'one purchase of its own');
   // a short window's refund is the premium the Mint never drew: it does not lower what the payer owes

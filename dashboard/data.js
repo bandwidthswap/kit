@@ -8,6 +8,7 @@ window.BW = window.BW || {};
     mode: 'live',          // 'live' (this node), 'snapshot' (data embedded in the page), 'fleet' (many nodes)
     base: '',              // the origin the JSON comes from; '' is this node
     status: null, ledger: [], commitments: [], purchases: [], steward: null, stewardRuns: [], map: null,
+    prepay: [],            // the Mint's prepayment registry (deposits, locks, claims; spec, Section 16), its own or read through the node
     links: [], acks: [], receipts: [], outbox: [], proofs: {},     // a node's own records (hop, payer)
     mint: null,            // for a hop or payer: the Mint's ledger and commitments, as proxied by the node
     nodes: [],             // fleet: [{url, name, status, steward, map, ledger, error}]
@@ -37,6 +38,7 @@ window.BW = window.BW || {};
     D.ledger=typeof s.ledger==='string'?parseJsonl(s.ledger):(s.ledger||[]);
     D.commitments=s.commitments||[]; D.purchases=typeof s.purchases==='string'?parseJsonl(s.purchases):(s.purchases||[]);
     D.steward=s.steward||null; D.stewardRuns=s.steward_runs||[]; D.map=s.map||null; D.proofs=s.proofs||{};   // proofs are kept as the Mint's own text, never re-serialised
+    D.prepay=typeof s.prepay==='string'?parseJsonl(s.prepay):(s.prepay||[]);
     D.links=typeof s.links==='string'?parseJsonl(s.links):(s.links||[]);
     D.acks=typeof s.acks==='string'?parseJsonl(s.acks):(s.acks||[]);
     D.receipts=typeof s.receipts==='string'?parseJsonl(s.receipts):(s.receipts||[]);
@@ -60,6 +62,7 @@ window.BW = window.BW || {};
         jobs.push(opt(b, '/steward', false, null).then(function(v){ D.steward=v; }));
         jobs.push(opt(b, '/steward/history', false, []).then(function(v){ D.stewardRuns=v||[]; }));   // every run, so the as-of control can move the Steward too
         jobs.push(opt(b, '/map', false, null).then(function(v){ D.map=v; }));
+        jobs.push(opt(b, '/prepay', true, '').then(function(v){ D.prepay=parseJsonl(v); }));
       } else {
         jobs.push(opt(b, '/acks', true, '').then(function(v){ D.acks=parseJsonl(v); }));
         jobs.push(opt(b, '/receipts', true, '').then(function(v){ D.receipts=parseJsonl(v); }));
@@ -69,6 +72,7 @@ window.BW = window.BW || {};
         jobs.push(opt(b, '/mint/ledger', true, '').then(function(t){ D.mint={ledger: parseJsonl(t), commitments: [], name: st.mint_name||null}; return opt(b, '/mint/commitments', false, []).then(function(c){ D.mint.commitments=c||[]; }); }));
         jobs.push(Promise.all(BW.invoiceMonths(Math.floor(Date.now()/1000)).map(function(m){ return opt(b, '/mint/invoice?month='+m, true, null).then(function(t){ return [m, t]; }); })).then(function(pairs){ var inv={}; pairs.forEach(function(x){ if(typeof x[1]==='string') inv[x[0]]=x[1]; }); D.mintInvoice=inv; }));
         jobs.push(opt(b, '/map', false, null).then(function(v){ D.map=v; }));
+        jobs.push(opt(b, '/mint/prepay', true, '').then(function(v){ D.prepay=parseJsonl(v); }));
       }
       return Promise.all(jobs);
     }).then(function(){ D.fetchedAt=Math.floor(Date.now()/1000); D.error=null; });
@@ -132,7 +136,32 @@ window.BW = window.BW || {};
     recs.forEach(function(p){ if(p.kind==='purchase'){ var q=Object.assign({}, p); q.escrow_posted=p.escrow; q.topups=[]; q.closed=false; byId[q.id]=q; } });
     recs.forEach(function(p){ var q=byId[p.purchase]; if(!q) return; if(p.kind==='close'){ q.closed=true; q.closed_at=p.posted_at; } else if(p.kind==='top-up'){ q.escrow=(q.escrow||0)+(p.escrow||0); q.topups.push(p); } });
     var purchases=Object.keys(byId).map(function(k){ return byId[k]; });
+    var prepay=BW.prepayBook(D.prepay, S, now, role==='mint' ? null : me);
     var firstAt=0; L.concat(myR, myA).forEach(function(e){ var t=at(e)||(e.receipt&&e.receipt.t_first)||0; if(t && (!firstAt || t<firstAt)) firstAt=t; }); D.firstAt=firstAt;
-    return { st:st, role:role, me:me, names:names, name:name, S:S, R:R, A:A, C:C, myR:myR, myA:myA, pending:pending, links:links, peers:peers, paidOn:paidOn, place:place, recByKey:recByKey, acked:acked, settledKey:settledKey, purchases:purchases, now:now };
+    return { st:st, role:role, me:me, names:names, name:name, S:S, R:R, A:A, C:C, myR:myR, myA:myA, pending:pending, links:links, peers:peers, paidOn:paidOn, place:place, recByKey:recByKey, acked:acked, settledKey:settledKey, purchases:purchases, prepay:prepay, now:now };
+  };
+
+  // The prepayment book as of `now`, by the Mint's own arithmetic (spec, Section 16; bwkit's PrepayBook): a lock is open from
+  // its registration until a settlement or a claim debits it, released when its claim window closes with neither; the balance
+  // is deposits less open locks less debits, every amount an integer in micro-units. `me` keeps one payer's locks and deposits
+  // (a payer's own page); null keeps every payer's (the Mint). `on` says whether anything was ever registered: with nothing,
+  // every section that would draw it stays away, since prepayment is off unless used.
+  BW.LOST_AFTER=7200;
+  BW.prepayBook=function(records, S, now, me){
+    var R=(records||[]).filter(function(r){ return r && (r.posted_at||0)<=now && (!me || r.payer===me || r.hop===me); });   // a payer's own deposits and locks; the locks naming a hop and its claims
+    var deposits=R.filter(function(r){ return r.kind==='deposit'; }), locks={}, claims={};
+    R.forEach(function(r){ if(r.kind==='lock') locks[r.id]=r; else if(r.kind==='claim') claims[r.lock]=r; });
+    var debits={}, byLock={}; S.forEach(function(s){ if(s.lock && s.debit!=null){ debits[s.lock]=s.debit; byLock[s.lock]=s; } });
+    var stateOf=function(l){ if(l.id in debits) return byLock[l.id].status==='claimed' ? 'claimed' : 'settled'; if(claims[l.id]) return 'claimed'; return now>=l.t_first+2*BW.LOST_AFTER ? 'released' : 'open'; };
+    var payers={}, slot=function(p){ return payers[p]=payers[p]||{payer:p, deposits:0, locked:0, debited:0, released:0, balance:0, covered:0, open:[], locks:[]}; };
+    deposits.forEach(function(d){ slot(d.payer).deposits+=d.amount; });
+    Object.keys(locks).map(function(k){ return locks[k]; }).sort(function(a,b){ return a.t_first-b.t_first; }).forEach(function(l){
+      var p=slot(l.payer), st=stateOf(l), row={id:l.id, hop:l.hop, t_first:l.t_first, amount:l.amount, state:st, debit:debits[l.id]!=null?debits[l.id]:null, settlement:byLock[l.id]||null};
+      p.locks.push(row); if(st==='open'){ p.locked+=l.amount; p.open.push(row); } else if(st==='released') p.released+=l.amount; else { p.debited+=(debits[l.id]||0); p.covered++; } });
+    Object.keys(payers).forEach(function(p){ var b=payers[p]; b.balance=b.deposits-b.locked-b.debited; });
+    var covered=S.filter(function(s){ return s.covered; }).length, credit=S.filter(function(s){ return !s.covered && s.status!=='claimed'; });
+    return { on: R.length>0, records:R, payers:payers, deposits:deposits, locks:locks, claims:claims, debits:debits, covered:covered, onCredit:credit.length,
+             creditUsd: credit.reduce(function(a,s){ return a+(s.amount_usd||0)+(s.premium_usd||0); }, 0),
+             nextLock:function(p){ var b=payers[p]; if(!b||!b.open.length) return null; return b.open.slice().sort(function(x,y){ return y.t_first-x.t_first; })[0]; } };
   };
 })(window.BW);

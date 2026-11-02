@@ -91,6 +91,8 @@ Asked of each view on its own, on a snapshot of the real node, after the first l
 - Every listed node is "mine". An operator who also lists a counterparty's node to watch it would mis-count their position; a per-node switch is small and should come with the list editor. Done Nov 1, 2026: a mine/theirs button per node in the list editor, kept in the browser beside the list (`bw.fleet.theirs`); a node marked theirs stays on the grid and the map's highlight drops it, Position leaves it out and names it as watched, not mine.
 - The list lives in one browser. That is by design, since no node should know the fleet, but it means a second device starts empty; a paste-able `?nodes=` link is the way to carry it.
 
+**Prepayment (Nov 2, 2026).** Section 16's registry reaches every view through one derivation, `BW.prepayBook`, which reads the Mint's `/prepay` (a node: `/mint/prepay`, carried in snapshots as `prepay`) with the settlements and gives each lock's state and each payer's balance as of any moment, the as-of control included; the sections that draw it stay away while the registry is empty, so a page on a lab that never deposited is unchanged. The hop's door and covered payers come from its `/status` (`prepay`), the rest from the book.
+
 ## 8. Is this the best we can do? The whole
 
 Asked of the three views together.

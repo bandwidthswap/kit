@@ -3278,8 +3278,12 @@ class Node:
         for that hour, so a browser can check the commitment against the
         Mint's key with nothing else; `mint` is the Mint's NYM; `steward` is
         the Steward's book (Steward.feed: names and places only, None until
-        the Steward has a key). NYMs are public keys and may appear;
-        addresses may not (assert_public).
+        the Steward has a key); `prepaid` is the prepayment book per payer
+        (Section 16), by name: deposits, what open locks hold, what covered
+        windows drew, what released, the balance, every amount an integer in
+        micro-units, and how many windows were covered; {} until a deposit or
+        a lock exists. NYMs are public keys and may appear; addresses may not
+        (assert_public).
         """
         now = int(now if now is not None else time.time())
         self.load_index(skip_partial=True)
@@ -3353,6 +3357,13 @@ class Node:
                 steward = Steward(self).feed(now)
             except (SystemExit, ValueError, OSError) as e:
                 log("steward: no book for the report: %s" % e)
+        prepaid = {}
+        for nym in ix["prepay"].payers():
+            if nym not in peers:
+                continue
+            b = ix["prepay"].balance(nym, now)
+            prepaid[peers[nym]] = {k: b[k] for k in ("deposits", "locked", "debited", "released", "balance")}
+            prepaid[peers[nym]]["covered"] = sum(1 for l in b["locks"] if l["state"] in ("settled", "claimed"))
         return {
             "v": 1, "generated_at": now, "bwkit": VERSION, "proto": PROTO, "phase": 0, "window_s": 3600,
             "since": min((e["received_at"] for e in entries), default=None),
@@ -3361,6 +3372,7 @@ class Node:
             "commitment": {k: last[k] for k in ("t", "window", "root", "count", "signature", "mint")} if last else None,
             "proof": proof,
             "steward": steward,
+            "prepaid": prepaid,
             "ledger": {"receipts": sum(1 for e in entries if e["kind"] == "receipt"),
                        "acks": sum(1 for e in entries if e["kind"] == "ack"),
                        "settlements": len(ix["settled"]), "disputed": me["disputed"],
@@ -3710,7 +3722,7 @@ class Node:
         Mint's text, the proofs are the Mint's text, for the hours that hold this node's windows (the newest
         SNAPSHOT_PROOFS), and `invoice` is {month: text} for the month before this one and this one so far."""
         info = self.mint_info()
-        out = {"mint": {"ledger": "", "commitments": [], "name": info["name"], "invoice": {}}, "map": None, "proofs": {}}
+        out = {"mint": {"ledger": "", "commitments": [], "name": info["name"], "invoice": {}}, "map": None, "proofs": {}, "prepay": ""}
         try:
             status, data, _ = self.proxy_get("/ledger")
             if status == 200:
@@ -3726,6 +3738,9 @@ class Node:
                 status, data, _ = self.proxy_get("/map")
                 if status == 200:
                     out["map"] = json.loads(data.decode("utf-8"))
+            status, data, _ = self.proxy_get("/prepay")                # the registry (Section 16), the Mint's text; empty when it holds none
+            if status == 200:
+                out["prepay"] = data.decode("utf-8")
         except (urlerror.URLError, socket.timeout, OSError, ValueError):
             return out
         me = self.nym if self.priv else None
@@ -3761,6 +3776,7 @@ class Node:
             snap["ledger"] = self.file_bytes("ledger.jsonl").decode("utf-8")
             snap["commitments"] = self.commitments()
             snap["purchases"] = self.file_bytes("purchases.jsonl").decode("utf-8")
+            snap["prepay"] = self.file_bytes("prepay.jsonl").decode("utf-8")
             snap["steward"] = self.steward_view()
             snap["steward_runs"] = self.steward_runs()
             snap["map"] = self.load_map() if self.map_path_exists() else None
@@ -3772,7 +3788,7 @@ class Node:
                     pass                                     # an hour settled since its commitment: the next one has both
             snap["proofs"] = proofs
             return snap
-        remote = remote or {"mint": {"ledger": "", "commitments": [], "name": self.mint_info()["name"], "invoice": {}}, "map": None, "proofs": {}}
+        remote = remote or {"mint": {"ledger": "", "commitments": [], "name": self.mint_info()["name"], "invoice": {}}, "map": None, "proofs": {}, "prepay": ""}
         if self.role == "payer":
             snap["receipts"] = self.file_bytes("receipts.jsonl").decode("utf-8")
             snap["acks"] = self.file_bytes("acks.jsonl").decode("utf-8")
@@ -3782,6 +3798,7 @@ class Node:
             snap["receipts"] = self.file_bytes("receipts.jsonl").decode("utf-8")
             snap["links"] = self.file_bytes("links.jsonl").decode("utf-8")
         snap["outbox"] = self.outbox_list()
+        snap["prepay"] = remote.get("prepay", "")
         snap["mint"] = remote["mint"]
         snap["map"] = self.load_map() if self.map_path_exists() else remote["map"]
         snap["proofs"] = remote["proofs"]
