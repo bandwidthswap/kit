@@ -96,7 +96,9 @@ Each step is one PR to `main` with its tests, on the convention of this repo, an
 
 ## 10. Decisions for the owner before step 1
 
+*One of the four is decided; the other three are open.*
+
 - **The lock's size.** The draft's estimate (the larger of the last window and the purchase minimum, times 1.25) is a guess; too small and every window runs over its lock onto credit, too large and the payer's dollar locks more than it needs. The link report's week of window sizes says what headroom the house's fetch needs.
-- **Custody.** Whether a dollar handed to the house and written by `bw-mint` as a deposit is the right pilot, or whether the deposit should stay a signed promise (the invoice as lock, as now) with only the mechanism built and nothing held. The first measures the cost B2 asks about on real value; the second measures the same cost with no custody question raised. The draft takes the first and names the custody.
+- **Custody. Decided Nov 1, 2026: dollars at the Mint.** A dollar handed to the house and written by `bw-mint` as a deposit is the pilot; the mechanism runs on real value, and the Mint is a custodian of it, which Section 8 says and the paper's B8 keeps open for the day a second party joins. (The alternative was a signed promise with nothing held, the invoice as lock as now, which would have measured the same cost and raised no custody question.)
 - **The claim's bend.** A claimed settlement pays a hop on its own count, bounded by the lock. If that bend to "neither party is bound beyond what it signed" is not wanted, the alternative is forfeiture without payment: the lock's amount goes to the Steward as a fee, and the hop is still paid nothing for a window it carried, which is what the paper's 3.3 would say about a window with no countersignature.
 - **Units.** Six-place doubles are kept. If integer micro-units are ever to come, a registry that holds balances is the moment, and this draft would change with them.
