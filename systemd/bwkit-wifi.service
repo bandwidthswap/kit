@@ -1,0 +1,7 @@
+[Unit]
+Description=bwkit: bring wlan0 back when its gateway has been silent ten minutes (never a reboot)
+After=network.target NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/bwkit-wifi-watchdog

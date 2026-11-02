@@ -24,6 +24,8 @@
 #   phase0/neighbor.sh key      < their.pub   put the operator's own public key on bw-neighbor beside the lab keys: one line
 #                               (the .pub file's contents) on stdin, checked with ssh-keygen before it goes, then `keys`
 #   phase0/neighbor.sh keys     the keys that open bw-neighbor, by fingerprint and comment; never the key itself
+#   phase0/neighbor.sh watchdog install the Wi-Fi watchdog on N (bwkit-wifi.timer, every minute: when wlan0's gateway has been
+#                               silent ten minutes, the wireless profile is brought back up; never a reboot), then show it
 #
 # Environment:
 #   TS_AUTHKEY       required for prep: a Tailscale pre-authentication key from the admin console (one-off keys are best;
@@ -306,6 +308,12 @@ step_keys() {
   run $N 'ssh-keygen -lf ~/.ssh/authorized_keys'
 }
 
+step_watchdog() {
+  say "the Wi-Fi watchdog on $N: bwkit-wifi.timer every minute; a silent gateway for ten minutes brings the wireless profile back up"
+  COPYFILE_DISABLE=1 tar --no-xattrs -C "$kit/systemd" -cf - bwkit-wifi-watchdog bwkit-wifi.service bwkit-wifi.timer | $SSH "$(host_of $N)" 'mkdir -p ~/kit/wifi && tar -C ~/kit/wifi -xf - && sudo install -m 0755 ~/kit/wifi/bwkit-wifi-watchdog /usr/local/bin/bwkit-wifi-watchdog && sudo install -m 0644 ~/kit/wifi/bwkit-wifi.service ~/kit/wifi/bwkit-wifi.timer /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable -q --now bwkit-wifi.timer && sudo /usr/local/bin/bwkit-wifi-watchdog; echo "$(hostname): $(systemctl is-active bwkit-wifi.timer), gateway last answered $(cat /run/bwkit-wifi/ok 2>/dev/null || echo never)"'
+  run $N 'systemctl list-timers --no-pager | grep bwkit-wifi'
+}
+
 step_check() {
   say "the tailnet, as bw-house sees it"
   run bw-house 'tailscale status | head -5'
@@ -329,6 +337,6 @@ case "${1:-}" in
   prep)  step_upgrade; step_time; step_logs; step_tailnet; step_kit; step_peers; step_house; step_check; step_wifi ;;
   check) step_check ;;
   bench) step_bench ;;
-  upgrade|time|logs|wifi|tailnet|kit|peers|house|fetch|update|announce|key|keys) "step_$1" ;;
+  upgrade|time|logs|wifi|tailnet|kit|peers|house|fetch|update|announce|key|keys|watchdog) "step_$1" ;;
   *) sed -n '2,20p' "$0"; exit 2 ;;
 esac

@@ -221,7 +221,7 @@ ssh -i ~/.ssh/bw-neighbor bw@bw-neighbor.local
 
 ### What runs on it
 
-Raspberry Pi OS, and on it four services and one timer. `systemctl status <name>` shows each.
+Raspberry Pi OS, and on it four services and two timers. `systemctl status <name>` shows each.
 
 | Name | What it is |
 |---|---|
@@ -230,6 +230,7 @@ Raspberry Pi OS, and on it four services and one timer. `systemctl status <name>
 | `chrony` | The clock, set from the public time pool. The receipts carry times, and when the house's receipt is more than fifteen seconds from the box's own clock the box refuses to sign it. |
 | `avahi-daemon` | Answers to `bw-neighbor.local` on your Wi-Fi. |
 | `bwkit-linklog.timer` | Every ten minutes, one line of byte counters and the clock's offset into `/var/lib/bwkit/linklog.jsonl`. It stays on the box; the house reads it over SSH when it wants the week's figures. |
+| `bwkit-wifi.timer` | Every minute, a ping to your router. If the router has not answered for ten minutes the Pi brings its Wi-Fi connection back up by itself, and if that does not help, turns the radio off and on first. It never reboots. It is there because in October a Pi next door lost your Wi-Fi for five days after a one-second drop and someone had to drive over. |
 
 Nothing else of the house's runs on it. `sudo journalctl -u bwkit -n 20` shows the last twenty lines the hop wrote, one per hour: `ack for bw-house <window>: payer says N, we say M`.
 

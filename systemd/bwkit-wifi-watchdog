@@ -1,0 +1,51 @@
+#!/bin/sh
+# The Wi-Fi watchdog on a node that reaches everything over wlan0 (the three next door). bwkit-wifi.timer runs it
+# every minute. It pings the gateway of wlan0's default route; while the gateway answers it does nothing but note
+# the time. When the gateway has not answered for GRACE seconds (ten minutes) it brings the wireless profile back up
+# with NetworkManager, and when that has not helped by the next grace period it turns the radio off and on first.
+# Never a reboot: the node's journal is in RAM and a reboot would take the evidence with it.
+#
+# Why: on Oct 26, 2026, the access point next door dropped its clients for a second; bw-neighbor reassociated
+# within the second, bw-cabin never did, and sat unreachable for five days until someone drove over.
+#
+# State lives under /run (gone at boot): ok, the last time the gateway answered; tries, how many restarts in a row.
+set -u
+DEV="${DEV:-wlan0}"
+GRACE="${GRACE:-600}"
+RUN="${RUN:-/run/bwkit-wifi}"
+mkdir -p "$RUN"
+now=$(date +%s)
+log() { logger -t bwkit-wifi "$*"; echo "$*"; }
+
+# GW overrides the gateway, for a forced test (GW=10.255.255.1 GRACE=0 RUN=/tmp/wd bwkit-wifi-watchdog brings the profile up now)
+gw="${GW:-$(ip -4 route show default dev "$DEV" 2>/dev/null | awk '{print $3; exit}')}"
+if [ -n "$gw" ] && ping -c 1 -W 3 "$gw" >/dev/null 2>&1; then
+  echo "$now" > "$RUN/ok"
+  if [ -s "$RUN/tries" ]; then log "$DEV: the gateway $gw answers again"; rm -f "$RUN/tries"; fi
+  exit 0
+fi
+
+# the gateway did not answer (or there is no route): how long has that been?
+if [ -s "$RUN/ok" ]; then last=$(cat "$RUN/ok"); else
+  # no answer yet since boot: count from boot, so a node that comes up without its network is not reset at once
+  last=$(( now - $(cut -d. -f1 /proc/uptime) ))
+  echo "$last" > "$RUN/ok"
+fi
+down=$(( now - last ))
+[ "$down" -ge "$GRACE" ] || exit 0
+
+tries=$(cat "$RUN/tries" 2>/dev/null || echo 0)
+if [ "$tries" -gt 0 ] && [ "$down" -lt $(( GRACE * (tries + 1) )) ]; then exit 0; fi   # one try per grace period
+tries=$(( tries + 1 )); echo "$tries" > "$RUN/tries"
+
+# the wireless profile NetworkManager used last for this device
+profile=$(nmcli -t -f NAME,TYPE,TIMESTAMP connection show 2>/dev/null | awk -F: '$2=="802-11-wireless" && $3>t {t=$3; p=$1} END {print p}')
+if [ -z "$profile" ]; then log "$DEV: gateway ${gw:-unknown} silent ${down}s, but no wireless profile to bring up"; exit 1; fi
+if [ "$tries" -ge 2 ]; then
+  log "$DEV: gateway ${gw:-unknown} silent ${down}s, try $tries: radio off and on, then profile '$profile' up"
+  nmcli radio wifi off; sleep 3; nmcli radio wifi on; sleep 5
+else
+  log "$DEV: gateway ${gw:-unknown} silent ${down}s, try $tries: profile '$profile' up"
+fi
+nmcli connection up "$profile" ifname "$DEV" >/dev/null 2>&1 && log "$DEV: profile '$profile' is up" || log "$DEV: profile '$profile' did not come up; next try in ${GRACE}s"
+exit 0
