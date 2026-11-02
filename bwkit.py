@@ -151,7 +151,7 @@ DASHBOARD_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; chars
 DASHBOARD_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")      # a file of the directory itself, never a path
 SNAPSHOT_PROOFS = {"mint": 24, "hop": 2, "payer": 2}  # how many committed hours' proofs a snapshot embeds: the Mint's own are cheap, a node's come over the wire
 BSP_MODULE = """<script type="module">import * as bsp from './dash/bsp.js'; window.bsp = bsp;</script>"""   # index.html's verifier line
-DECLINE_WORDS = ("clock", "patience", "since", "domain", "profile", "replay", "route", "duplicate", "balance")   # 409 reasons, the word before the colon
+DECLINE_WORDS = ("clock", "patience", "since", "domain", "profile", "replay", "route", "duplicate", "balance", "lock")   # 409 reasons, the word before the colon
 TOKEN_RE = re.compile(r"^[a-z0-9-]{1,32}$")   # a medium or range class
 HTTP_TIMEOUT_S = 10
 MINT_INFO_S = (600, 60)                 # a hop or payer re-reads its Mint's name and NYM this often: after an answer, after none
@@ -374,8 +374,10 @@ def link_hash(rec):
 
 def check_link(rec):
     """Raise ValueError unless rec has exactly an announcement's fields with sane types. Signature not checked here."""
-    if not isinstance(rec, dict) or set(rec) != set(LINK_FIELDS):
-        raise ValueError("an announcement has exactly the fields %s" % ", ".join(LINK_FIELDS))
+    if not isinstance(rec, dict) or set(rec) - {"prepay"} != set(LINK_FIELDS):
+        raise ValueError("an announcement has exactly the fields %s (and prepay, true or false, when the hop asks for locks: Section 16)" % ", ".join(LINK_FIELDS))
+    if "prepay" in rec and not isinstance(rec["prepay"], bool):
+        raise ValueError("prepay is true or false")
     if rec["kind"] != "link":
         raise ValueError("kind must be link")
     check_proto(rec)
@@ -415,9 +417,11 @@ def profile_1_link(rec):
 def link_params(link):
     """The parameters that govern a window: the pilot's defaults, or the announcement's."""
     p = dict(PILOT_LINK)
+    p["prepay"] = False
     if link:
         for k in LINK_PARAMS:
             p[k] = link[k]
+        p["prepay"] = bool(link.get("prepay", False))
     return p
 
 
@@ -2114,9 +2118,10 @@ class Node:
         if not cmd:
             return
         try:
-            subprocess.Popen([cmd, str(arg)])
+            subprocess.Popen(shlex.split(cmd) + [str(arg)], stdin=subprocess.DEVNULL)
+            log("%s: ran %s for %s" % (name, cmd, arg))
         except OSError as e:
-            log("%s hook %s did not run: %s" % (name, cmd, e))
+            log("%s: could not run %s: %s" % (name, cmd, e))
 
     def balance_text(self):
         """A payer's balance at its Mint through the proxy, as `bwkit balance` prints it. Returns (text, rc)."""
@@ -2206,6 +2211,8 @@ class Node:
         for k in LINK_PARAMS:
             if k in cfg:
                 p[k] = cfg[k]
+        if "prepay" in cfg:
+            p["prepay"] = bool(cfg["prepay"])              # the hop asks payers to lock each window (spec, Section 16)
         return p
 
     def patience_state(self):
@@ -2265,6 +2272,9 @@ class Node:
             self.decline_payer(signer, now)
             raise Decline("patience: payer %s fell short of our count beyond the margin in %d windows (patience %d); declined" % (
                 signer, ps["short"], link["patience_windows"]))
+        if self.require_lock() and self.hop_lock_for(signer, r["t_first"]) is None:
+            self.mark_uncovered(signer, now)
+            raise Decline("lock: no lock held for the window starting at %d; a payer locks the window with the Mint and shows the countersigned lock here (POST /lock)" % r["t_first"])
         try:
             _, nbytes, meter = self.window(now)
         except NoBaseline:
@@ -2287,6 +2297,155 @@ class Node:
         if self.config.get("mint"):
             self.flush_later(HOP_FLUSH_DELAY_S)   # our own copy, in case the payer drops an ack it dislikes
         return ack
+
+    # prepayment on the hop (spec, Section 16; step 4): the locks payers show it, the gate, the claim
+
+    def hop_locks(self):
+        """The countersigned locks payers have shown this hop (locks.jsonl), by id."""
+        out = {}
+        for rec in self.read_lines("locks.jsonl", skip_partial=True):
+            if isinstance(rec, dict) and rec.get("kind") == "lock" and rec.get("hop") == self.nym:
+                out[rec["id"]] = rec
+        return out
+
+    def hop_lock_for(self, payer, t_first):
+        for rec in self.hop_locks().values():
+            if rec["payer"] == payer and rec["t_first"] == t_first:
+                return rec
+        return None
+
+    def require_lock(self):
+        return bool((self.config.get("prepay") or {}).get("require_lock"))
+
+    def uncovered_state(self):
+        """Per payer: whether this hop declined its last receipt for want of a lock, and when."""
+        return self.state().get("uncovered", {})
+
+    def mark_uncovered(self, payer, now):
+        """Decline a payer for want of a lock, once until a lock arrives: the on_decline hook withdraws the service."""
+        st = self.state()
+        u = st.setdefault("uncovered", {})
+        if u.get(payer):
+            return
+        u[payer] = {"since": int(now)}
+        self.write_json("state.json", st)
+        self.run_hook("on_decline", payer)
+
+    def mark_covered(self, payer):
+        """A lock arrived for a payer this hop had declined: the on_cover hook offers the service again."""
+        st = self.state()
+        u = st.get("uncovered", {})
+        if payer not in u:
+            return
+        u.pop(payer)
+        self.write_json("state.json", st)
+        self.run_hook("on_cover", payer)
+
+    def take_lock(self, rec, now=None):
+        """POST /lock on a hop: a countersigned lock for a window with this hop, kept once it checks out. Raises Decline or ValueError."""
+        now = int(now if now is not None else time.time())
+        check_prepay(rec)
+        if rec.get("kind") != "lock" or "mint_sig" not in rec:
+            raise ValueError("a hop takes a lock the Mint has countersigned")
+        if not verify_prepay(rec):
+            raise ValueError("bad signature")
+        if rec["hop"] != self.nym:
+            raise ValueError("this lock names another hop")
+        if rec["payer"] not in self.peers():
+            raise Decline("unknown payer %s" % rec["payer"])
+        mint = self.config.get("mint_nym") or self.mint_info()["nym"]
+        if not mint:
+            raise Decline("domain: this hop does not know its Mint's NYM yet (the Mint has not answered /status)")
+        if rec["mint"] != mint or not verify_lock_mint(rec):
+            raise Decline("domain: the countersignature is not my Mint's (%s)" % mint[:20])
+        tol = self.my_link()["clock_tolerance_s"]
+        if not now - 3600 - tol <= rec["t_first"] <= now + LOCK_AHEAD_S + tol:
+            raise Decline("since: the lock's window at %d is not the one open now or the next (my clock is %d)" % (rec["t_first"], now))
+        with self.lock:
+            held = self.hop_locks()
+            if rec["id"] not in held:
+                self.append("locks.jsonl", rec)
+        log("lock %s held: %s by %s for the window at %d" % (rec["id"][:16], micro_usd(rec["amount"]), self.peers().get(rec["payer"], rec["payer"][:20]), rec["t_first"]))
+        self.mark_covered(rec["payer"])
+        return {"held": rec["id"]}
+
+    def prepay_status(self, now=None):
+        """GET /status on a hop: whether it requires a lock, which payers are covered for the window open now, and who it declined."""
+        now = int(now if now is not None else time.time())
+        tol = self.my_link()["clock_tolerance_s"]
+        covered = {}
+        for rec in self.hop_locks().values():
+            if rec["t_first"] >= now - 3600 - tol and rec["t_first"] > (covered.get(rec["payer"]) or -1):
+                covered[rec["payer"]] = rec["t_first"]
+        for payer, name in self.peers().items():
+            if payer != self.nym:
+                covered.setdefault(payer, None)
+        return {"require_lock": self.require_lock(), "covered": covered, "uncovered": sorted(self.uncovered_state())}
+
+    def claims_held(self):
+        """What this hop has claimed or had refused, by lock id (claims.jsonl)."""
+        out = {}
+        for rec in self.read_lines("claims.jsonl", skip_partial=True):
+            if isinstance(rec, dict) and rec.get("lock"):
+                out[rec["lock"]] = rec
+        return out
+
+    def claim_due(self, now=None, only=None):
+        """Claim every lock whose window this hop never acknowledged, once two windows have passed and before the claim window closes.
+
+        The claim carries this hop's own count since its last sample, as its
+        acknowledgement would have, and the sample moves on so the next window
+        starts fresh. `only` names one lock's t_first. Returns the claims posted.
+        """
+        now = int(now if now is not None else time.time())
+        mint = self.mint_url()
+        acked = {(a["receipt"]["payer"], a["receipt"]["t_first"]) for a in self.read_lines("acks.jsonl", skip_partial=True)
+                 if isinstance(a, dict) and a.get("kind") == "ack"}
+        done = self.claims_held()
+        posted = []
+        for rec in sorted(self.hop_locks().values(), key=lambda l: l["t_first"]):
+            if only is not None and rec["t_first"] != only:
+                continue
+            if (rec["payer"], rec["t_first"]) in acked or rec["id"] in done:
+                continue
+            opens, closes = rec["t_first"] + HEALTH["lost_after_s"], rec["t_first"] + 2 * HEALTH["lost_after_s"]
+            if now < opens or now >= closes:
+                continue
+            if not mint:
+                log("claim for the window at %d: no Mint configured" % rec["t_first"])
+                continue
+            try:
+                _, nbytes, meter = self.window(now)
+            except NoBaseline:
+                continue
+            body = {"kind": "claim", "proto": PROTO, "hop": self.nym, "payer": rec["payer"], "lock": rec["id"], "bytes": nbytes,
+                    "meter": meter, "posted_at": now}
+            claim = dict(body, id=prepay_id(body))
+            claim["sig"] = sign_prepay(self.priv, claim)
+            try:
+                status, ans = http_post(mint + "/prepay", claim)
+            except (urlerror.URLError, socket.timeout, OSError) as e:
+                log("claim for the window at %d: the Mint did not answer (%s); next time" % (rec["t_first"], e))
+                continue
+            with self.lock:
+                if status == 200:
+                    self.append("claims.jsonl", claim)
+                    self.commit_sample(now, meter)
+                    posted.append(claim)
+                    log("claim %s posted: %d bytes on lock %s for the window at %d" % (claim["id"][:16], nbytes, rec["id"][:16], rec["t_first"]))
+                else:
+                    detail = (ans.get("detail") or ans.get("error")) if isinstance(ans, dict) else str(ans)
+                    self.append("claims.jsonl", {"kind": "claim-refused", "lock": rec["id"], "t_first": rec["t_first"], "why": detail, "t": now})
+                    log("claim for the window at %d refused by the Mint: %s" % (rec["t_first"], detail))
+        return posted
+
+    def claims_quietly(self):
+        """The daemon's own claim, beside the outbox retry: never raises."""
+        try:
+            if self.hop_locks():
+                self.claim_due()
+        except (OSError, SystemExit, ValueError) as e:
+            log("claim pass failed: %s" % e)
 
     def held_ack(self, receipt_sig):
         """Hop: the acknowledgement this node already signed for the receipt with this signature, or None."""
@@ -3360,6 +3519,7 @@ class Node:
             if self.role == "hop":
                 st["link"] = self.my_link()
                 st["patience"] = self.patience_state()
+                st["prepay"] = self.prepay_status(st["time"])
             else:
                 st["purchases"] = sum(1 for r in self.load_purchases(skip_partial=True) if r.get("kind") == "purchase")
         st["health"] = self.health(st, st["time"])
@@ -3878,6 +4038,8 @@ class Node:
                         return self.reply(404, {"error": "a payer takes no records; its page is at /"})
                     if self.path == "/ack" and node.role == "hop":
                         return self.reply(200, node.ack(body))
+                    if self.path == "/lock" and node.role == "hop":
+                        return self.reply(200, node.take_lock(body))
                     if self.path == "/receipt" and node.role == "mint":
                         return self.reply(200, node.receive(body))
                     if self.path == "/link" and node.role == "mint":
@@ -3908,6 +4070,7 @@ class Node:
                 while True:
                     time.sleep(FLUSH_EVERY_S)
                     self.flush_quietly()
+                    self.claims_quietly()                       # a lock whose window the payer never closed, two windows on
             threading.Thread(target=retry, daemon=True).start()
         log("%s %s serving on %s:%d as %s" % (self.role, self.name, host, srv.server_address[1], self.nym))
         if block:
@@ -4283,6 +4446,8 @@ def main(argv=None):
     lk = sub.add_parser("lock", help="payer: the lock for the coming window (spec, Section 16), as the hourly job posts it after the receipt when prepay.enabled is set")
     lk.add_argument("--print", dest="print_only", action="store_true", help="print the signed record and the estimate instead of posting it")
     sub.add_parser("balance", help="payer: my balance at the Mint through this node's proxy, and the state of my locks")
+    cl = sub.add_parser("claim", help="hop: claim the lock of a window the payer never closed, two windows on (spec, Section 16); the daemon does this by itself every five minutes")
+    cl.add_argument("t_first", nargs="?", help="one lock's window, Unix seconds or YYYY-MM-DDTHH:MM local; every due lock by default")
     sub.add_parser("locks", help="payer: the countersigned locks this node keeps (locks.jsonl)")
     dp = sub.add_parser("deposit", help="mint: note that a payer put value on its balance here (spec, Section 16); signed by this Mint, kept in prepay.jsonl")
     dp.add_argument("payer", help="the payer, by peer name or NYM")
@@ -4544,6 +4709,15 @@ def main(argv=None):
             return 1
         print("locked %s for the window at %s, countersigned by the Mint; the hop: %s" % (
             micro_usd(out["lock"]["amount"]), time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(out["lock"]["t_first"])), out["lock_hop"] or "not asked"))
+    elif args.cmd == "claim":
+        if node.role != "hop":
+            raise SystemExit("only a hop claims")
+        posted = node.claim_due(only=parse_moment(args.t_first) if args.t_first else None)
+        if not posted:
+            print("nothing to claim: every lock held is acknowledged, claimed, refused, or outside its claim window (two windows after its start, for two more)")
+        for c in posted:
+            print("claimed %d bytes on lock %s for the window at %s" % (c["bytes"], c["lock"][:16], time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(
+                next(l["t_first"] for l in node.hop_locks().values() if l["id"] == c["lock"])))))
     elif args.cmd == "balance":
         if node.role != "payer":
             raise SystemExit("`balance` is a payer's; the Mint has `bwkit prepay balance`")

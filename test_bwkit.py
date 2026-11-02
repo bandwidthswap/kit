@@ -1304,7 +1304,7 @@ class Prepay(unittest.TestCase):
         self.assertEqual((held["payer"], held["hop"], held["t_first"], held["amount"], held["link"], held["mint"]),
                          (lab.payer.nym, lab.hop.nym, lab.t, 12500, None, lab.mint.nym))           # 100 MB x 1.25 at 10c/GB; no announcement
         self.assertTrue(bwkit.verify_lock_mint(held))
-        self.assertEqual(out["lock_hop"], "the hop takes no locks yet (404)")                    # step 4 gives the hop its door
+        self.assertEqual(out["lock_hop"], "held")                                                  # the hop keeps it, requiring none (step 4)
         self.assertEqual([r["id"] for r in lab.payer.read_lines("locks.jsonl")], [held["id"]])
         # the window the lock covers settles covered, and the next lock follows it
         with mock.patch("time.time", return_value=lab.t):
@@ -1330,6 +1330,83 @@ class Prepay(unittest.TestCase):
         with mock.patch("time.time", return_value=lab.t):
             out = lab.hour(200_000_000, 200_000_000)
         self.assertNotIn("lock", out)
+
+    def test_the_hop_takes_locks_gates_on_them_and_claims_a_window_never_closed(self):
+        """Step 4: the hop keeps the locks payers show it, declines a receipt with no lock when it requires one (the on_decline hook),
+        offers the service again when a lock arrives (on_cover), says who is covered in its status, and claims a window the payer
+        never closed two windows on; the announcement may carry `prepay: true`."""
+        lab = self.lab
+        root = lab.root
+        hooks = {}
+        for name in ("on_decline", "on_cover"):
+            path = os.path.join(root, name + ".sh"); hooks[name] = os.path.join(root, name + ".txt")
+            with open(path, "w") as f:
+                f.write('#!/bin/sh\necho "$1" >> "%s"\n' % hooks[name])
+            os.chmod(path, 0o755)
+            lab.hop.config[name] = path
+        lab.hop.config["prepay"] = {"require_lock": True}
+        lab.hop.config["link"] = {"margin": 0.1, "medium": "wifi", "range_class": "building", "prepay": True}
+        lab.mint.config["steward_mint"] = lab.mint_url
+        lab.payer.config["prepay"] = {"enabled": True}
+        cli(["deposit", "bw-house", "0.10", "cash"], mint_env(lab))
+        # the announcement carries the flag; an old one without it still checks
+        with mock.patch("time.time", return_value=lab.t):
+            rec, h = lab.hop.announce(now=lab.t, since=lab.t)
+        self.assertIs(rec["prepay"], True); bwkit.check_link(rec); self.assertTrue(bwkit.link_params(rec)["prepay"])
+        old = {k: v for k, v in rec.items() if k != "prepay"}; bwkit.check_link(old); self.assertFalse(bwkit.link_params(old)["prepay"])
+        self.assertEqual(json.loads(bwkit.http_get(lab.mint_url + "/links")[1])[-1]["prepay"], True)
+        with self.assertRaises(ValueError):
+            bwkit.check_link(dict(rec, prepay="yes"))
+        # the first receipt after the switch has no lock: declined, the service withdrawn; the payer still locks the next window and shows it
+        with mock.patch("time.time", return_value=lab.t):
+            out = lab.hour(100_000_000, 100_000_000)
+        self.assertIsNone(out["ack"])
+        def hook_lines(name):                                                                   # the hooks run as processes: give them a moment
+            for _ in range(50):
+                if os.path.exists(hooks[name]):
+                    return open(hooks[name]).read().split()
+                time.sleep(0.05)
+            return []
+        self.assertEqual(hook_lines("on_decline"), [lab.payer.nym])
+        self.assertIsNotNone(out["lock"], out["lock_error"]); self.assertEqual(out["lock_hop"], "held")   # the same job locked the next window and showed it
+        self.assertEqual(hook_lines("on_cover"), [lab.payer.nym])                            # the lock arrived: offered again
+        self.assertEqual(lab.hop.uncovered_state(), {})
+        self.assertEqual(list(lab.hop.hop_locks()), [out["lock"]["id"]])
+        with mock.patch("time.time", return_value=lab.t + 5):
+            st = json.loads(bwkit.http_get(lab.hop_url + "/status")[1])["prepay"]
+        self.assertEqual(st, {"require_lock": True, "covered": {lab.payer.nym: lab.t}, "uncovered": []})
+        # the covered window is acknowledged and settles covered; the next lock follows
+        with mock.patch("time.time", return_value=lab.t):
+            out = lab.hour(200_000_000, 200_000_000)
+        self.assertIsNotNone(out["ack"])
+        s = [e for e in lab.mint.ledger_lines() if e["kind"] == "settlement"][-1]
+        self.assertEqual((s["status"], s.get("covered"), s.get("debit")), ("disputed", True, 10000))       # the hop's count holds the declined window too: disputed, paid at the payer's 100 MB, $0.01 drawn
+        lock_next = out["lock"]; self.assertEqual(lock_next["t_first"], lab.t)
+        # the lock door refuses what is not its own: another hop's lock, a stranger's countersignature, a window far off, a plain lock
+        status, ans = bwkit.http_post(lab.hop_url + "/lock", dict(lock_next, mint="ed25519:" + "A" * 43))
+        self.assertEqual((status, ans["error"]), (409, "domain"))
+        far = dict(lock_next); far["t_first"] += 86400
+        status, ans = bwkit.http_post(lab.hop_url + "/lock", far)
+        self.assertEqual(status, 400)                                                             # its id no longer fits
+        status, ans = bwkit.http_post(lab.hop_url + "/lock", {k: v for k, v in lock_next.items() if k not in ("mint", "mint_sig")})
+        self.assertEqual(status, 400)
+        with mock.patch("time.time", return_value=lab.t + 5):
+            self.assertEqual(bwkit.http_post(lab.hop_url + "/lock", lock_next), (200, {"held": lock_next["id"]}))   # shown twice: held once
+        # the payer goes quiet: no receipt for the locked window; two windows on the hop claims it with its own count, then the sample moves on
+        lab.meters(260_000_000, 230_000_000)                                                     # the hop saw 30 MB more since its last ack
+        self.assertEqual(lab.hop.claim_due(lab.t + 7199), [])                                     # not yet
+        with mock.patch("time.time", return_value=lab.t + 7200 + 1):
+            posted = lab.hop.claim_due(lab.t + 7200 + 1)
+        self.assertEqual([(c["lock"], c["bytes"]) for c in posted], [(lock_next["id"], 30_000_000)])
+        c = [e for e in lab.mint.ledger_lines() if e["kind"] == "settlement"][-1]
+        self.assertEqual((c["status"], c["hop_bytes"], c["settled_bytes"], c["lock"], c["debit"]), ("claimed", 30_000_000, 30_000_000, lock_next["id"], 3000))
+        self.assertEqual(lab.hop.claim_due(lab.t + 7200 + 2), [])                                 # claimed once
+        self.assertEqual(lab.hop.state()["sample"]["t"], lab.t + 7200 + 1)                        # the baseline moved with the claim
+        with mock.patch("time.time", return_value=lab.t + 7200 + 3):
+            rc, text = cli(["claim"], hop_env(lab))
+        self.assertIn("nothing to claim", text)
+        with self.assertRaises(SystemExit):
+            cli(["claim"], payer_env(lab))
 
     def test_shapes_are_refused_with_the_reason(self):
         lab = self.lab

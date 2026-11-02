@@ -17,7 +17,8 @@
 #   phase0/neighbor.sh fetch    (re)install the hourly purchase script and its timer on bw-house, nothing else
 #   phase0/neighbor.sh update   copy a newer bwkit.py and units to bw-neighbor and restart its hop (the Mint first:
 #                               SSH_SUFFIX=-ts UPDATE_HOSTS=bw-mint phase0/provision.sh update)
-#   phase0/neighbor.sh announce write the link's terms (LINK_* below) and the on_decline hook into the hop's config, then
+#   phase0/neighbor.sh announce write the link's terms (LINK_* below), the prepay flag (LINK_PREPAY=yes) and whether locks are
+#                               required (PREPAY_REQUIRE_LOCK=yes), and the on_decline/on_cover hooks into the hop's config, then
 #                               `bwkit announce`: the signed announcement is registered with the Mint and governs every
 #                               window that starts from now
 #   phase0/neighbor.sh bench    put bw-house's payer back on bw-forest over wg0 (the bench as it was)
@@ -254,33 +255,47 @@ step_update() {
 step_announce() {
   price="${LINK_PRICE:-0.10}"; margin="${LINK_MARGIN:-0.03}"; minb="${LINK_MIN_BYTES:-65536}"; patience="${LINK_PATIENCE:-0}"
   medium="${LINK_MEDIUM:-wifi}"; range="${LINK_RANGE:-building}"; tol="${LINK_CLOCK_TOL:-15}"
-  say "the link's terms on $N: $price USD/GB, margin $margin, min_bytes $minb, patience $patience, $medium/$range, clock tolerance $tol s; the on_decline hook"
-  # The hook: declining a receipt costs the hop the window and the payer nothing, so the remedy with teeth is to stop
-  # offering the exit node. It runs as the bwkit user, so one sudoers line lets it run that one command and no other.
-  sudo_sh $N "$price" "$margin" "$minb" "$patience" "$medium" "$range" "$tol" <<'EOS'
+  prepay="${LINK_PREPAY:-no}"; require="${PREPAY_REQUIRE_LOCK:-no}"
+  say "the link's terms on $N: $price USD/GB, margin $margin, min_bytes $minb, patience $patience, $medium/$range, clock tolerance $tol s, prepay $prepay (locks required: $require); the on_decline and on_cover hooks"
+  # The hooks: declining a receipt costs the hop the window and the payer nothing, so the remedy with teeth is to stop
+  # offering the exit node (on_decline), and to offer it again when a lock arrives (on_cover, spec Section 16). They run as
+  # the bwkit user, so two sudoers lines let it run those two commands and no other.
+  sudo_sh $N "$price" "$margin" "$minb" "$patience" "$medium" "$range" "$tol" "$prepay" "$require" <<'EOS'
 set -e
-price="$1"; margin="$2"; minb="$3"; patience="$4"; medium="$5"; range="$6"; tol="$7"
+price="$1"; margin="$2"; minb="$3"; patience="$4"; medium="$5"; range="$6"; tol="$7"; prepay="$8"; require="$9"
 ts="$(command -v tailscale || echo /usr/bin/tailscale)"
 cat > /usr/local/bin/bwkit-on-decline <<EOC
 #!/bin/sh
-# bwkit's on_decline hook: the hop has stopped serving the payer named in \$1 (its patience is spent). A declined receipt
-# costs the hop the window and the payer nothing, so this withdraws the service the receipts pay for: the exit node.
+# bwkit's on_decline hook: the hop has stopped serving the payer named in \$1 (its patience is spent, or it showed no lock
+# for the window). A declined receipt costs the hop the window and the payer nothing, so this withdraws the service the
+# receipts pay for: the exit node.
 logger -t bwkit-decline "payer \$1 declined; withdrawing the exit node"
 sudo -n $ts set --advertise-exit-node=false
 EOC
-chmod 755 /usr/local/bin/bwkit-on-decline
-printf 'bwkit ALL=(root) NOPASSWD: %s set --advertise-exit-node=false\n' "$ts" > /etc/sudoers.d/bwkit-decline
+cat > /usr/local/bin/bwkit-on-cover <<EOC
+#!/bin/sh
+# bwkit's on_cover hook: the payer named in \$1 showed a lock for the coming window after being declined for want of one
+# (spec, Section 16), so the exit node is offered again.
+logger -t bwkit-cover "payer \$1 locked the coming window; offering the exit node again"
+sudo -n $ts set --advertise-exit-node=true
+EOC
+chmod 755 /usr/local/bin/bwkit-on-decline /usr/local/bin/bwkit-on-cover
+printf 'bwkit ALL=(root) NOPASSWD: %s set --advertise-exit-node=false\nbwkit ALL=(root) NOPASSWD: %s set --advertise-exit-node=true\n' "$ts" "$ts" > /etc/sudoers.d/bwkit-decline
 chmod 440 /etc/sudoers.d/bwkit-decline
 visudo -cf /etc/sudoers.d/bwkit-decline >/dev/null
-python3 - "$price" "$margin" "$minb" "$patience" "$medium" "$range" "$tol" <<'PYC'
+python3 - "$price" "$margin" "$minb" "$patience" "$medium" "$range" "$tol" "$prepay" "$require" <<'PYC'
 import json, sys
 p = '/etc/bwkit/config.json'
 c = json.load(open(p))
 c['link'] = {'price': float(sys.argv[1]), 'margin': float(sys.argv[2]), 'min_bytes': int(sys.argv[3]), 'patience_windows': int(sys.argv[4]),
              'medium': sys.argv[5], 'range_class': sys.argv[6], 'clock_tolerance_s': int(sys.argv[7])}
+if sys.argv[8] == 'yes':
+    c['link']['prepay'] = True
 c['on_decline'] = '/usr/local/bin/bwkit-on-decline'
+c['on_cover'] = '/usr/local/bin/bwkit-on-cover'
+c['prepay'] = {'require_lock': sys.argv[9] == 'yes'}
 json.dump(c, open(p, 'w'), indent=2)
-print('hop config: link', c['link'], 'on_decline', c['on_decline'])
+print('hop config: link', c['link'], 'prepay', c['prepay'], 'hooks', c['on_decline'], c['on_cover'])
 PYC
 systemctl restart bwkit; sleep 1; echo "$(hostname): bwkit $(systemctl is-active bwkit)"
 EOS
