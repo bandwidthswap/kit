@@ -65,7 +65,7 @@ These are the follow-ups in `dashboard/PLAN.md` Sections 7 and 8. Start them onc
 
 ## Protocol, not yet built
 
-- **Prepayment of a window** (backlog B2, option b). The receipt and the monthly invoice are the settlement today (B8, option d).
+- **Prepayment of a window** (backlog B2, option b). The receipt and the monthly invoice are the settlement today (B8, option d). **Designed Nov 1, 2026: `spec/PREPAYMENT-DRAFT.md`**, a future Section 16: deposits the Mint signs, a lock per window the payer posts after each receipt and carries to the hop countersigned, a settlement that debits the lock and releases the rest, a claim that pays a hop on its own count up to the lock when the payer never closed the window, `require_lock` off by default so the lab runs through the rollout; six PRs in order, the cost per window named (two round trips on the tailnet, two packets by radio), and four decisions for the owner before the first (the lock's size, custody at the Mint, the claim's bend to "bound beyond what it signed", units). Nothing built.
 - **What profile 1 left out:** announcements over a gossip layer, places that buy service through an anchor, proving allowances that pay, and a second Mint. `spec/PROTOCOL.md` marks each as not in profile 1.
 
 ## Waiting on the site repo

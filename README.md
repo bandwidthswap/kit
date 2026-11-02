@@ -227,7 +227,7 @@ Config (`/etc/bwkit/config.json`):
 | `map` | mint | The map's path; `/etc/bwkit/map.json` (or `BWKIT_MAP`) by default |
 | `status_url` | mint | Where `bwkit report` posts: the feed's `/report` (`https://status.bandwidthswap.com/report` for the pilot's); `bwkit map post` posts to the `/map` beside it. `BWKIT_STATUS_URL` overrides it. Without one, `bwkit report` posts nothing and says so. |
 
-What is deliberately not here: prepayment of a window (backlog B2 b), a payment rail, more than one hop, onion routing, a token, a chain. The outbox means a node that cannot reach the Mint keeps its receipts and sends them next hour; a hop that was down for a window acks the next one with both windows' bytes, and the Mint settles that window at the payer's count, so the hop loses the window it missed. The HTTP is plain, on a private LAN; the signatures are what protect the receipts.
+What is deliberately not here: prepayment of a window (backlog B2 b; designed, not built: `spec/PREPAYMENT-DRAFT.md`), a payment rail, more than one hop, onion routing, a token, a chain. The outbox means a node that cannot reach the Mint keeps its receipts and sends them next hour; a hop that was down for a window acks the next one with both windows' bytes, and the Mint settles that window at the payer's count, so the hop loses the window it missed. The HTTP is plain, on a private LAN; the signatures are what protect the receipts.
 
 ## Keys
 
