@@ -68,6 +68,18 @@ function noThrow(label, fn) { let out; try { out = fn(); } catch (e) { throw new
   ok(html.includes('<span class="k">windows settled</span><span class="v">50</span><span class="s">7 disputed · 14 commitments</span>'), 'Now shows 50 windows, 7 disputed, 14 commitments');
   eq(count(html, 'data-verify="'), 14, 'a verify button per committed hour');
   eq(count(html, 'data-verify-day="1"'), 1, 'and one button for the last day');
+  // a claimed window (Section 16): no payer count, the hop's count up to the lock, drawn on the lock; the row draws without a number for the payer
+  {
+    const s0 = D.ledger.filter((e) => e.kind === 'settlement').slice(-1)[0];
+    const claimed = Object.assign({}, s0, { t: s0.t + 1, t_first: s0.t_first + 86400 * 365, t_last: s0.t_last + 86400 * 365, payer_bytes: null, hop_bytes: 250000000, settled_bytes: 200000000,
+      status: 'claimed', rule: 'the hop\'s count, up to what the payer locked; the payer never closed the window', receipt_sig: null, ack_sig: null, claim_sig: 'c'.repeat(86),
+      amount_usd: 0.02, fee_usd: 0.001, lock: 'a'.repeat(64), debit: 20000, covered: true });
+    D.ledger.push(claimed);
+    const X2 = BW.derive(claimed.t_last + 10), h2 = noThrow('the Mint\'s view with a claimed window', () => BW.views.mint(X2, claimed.t_last + 10));
+    ok(h2.includes('<span class="st claimed">claimed</span>'), 'the window is marked claimed');
+    ok(h2.includes('<td class="n">–</td><td class="n">250.00 MB</td>'), 'no payer count, the hop\'s count: ' + (h2.match(/<td class="n">[^<]*<\/td><td class="n">250.00 MB<\/td>/) || [''])[0]);
+    D.ledger.pop();
+  }
   // the Steward as of a moment: the run nearest before it, from the history the Mint serves; between runs the book does not change
   ok(html.includes('<h2>The Steward <small>runs on this host after each hour\'s commitment</small></h2>'), 'now: the Steward\'s book as the feed carries it');
   const S0 = D.steward;

@@ -65,6 +65,7 @@ envelope, which carries the Mint's signed commitment when one was made.
 
 import argparse
 import base64
+import fractions
 import hashlib
 import json
 import os
@@ -916,9 +917,16 @@ def invoice_sums(entries, month):
             continue
         k = (e["payer"], e["hop"])
         o = out.setdefault(k, {"windows": 0, "disputed": 0, "settled_bytes": 0, "amount_usd": 0.0, "fee_usd": 0.0, "relay_usd": 0.0,
-                               "premium_usd": 0.0, "refund_usd": 0.0, "from_steward_usd": 0.0, "purchases": 0})
+                               "premium_usd": 0.0, "refund_usd": 0.0, "from_steward_usd": 0.0, "purchases": 0,
+                               "claimed": 0, "covered": 0, "drawn": 0, "credit_usd": 0.0})
         o["windows"] += 1
         o["disputed"] += 1 if e["status"] == "disputed" else 0
+        o["claimed"] += 1 if e["status"] == "claimed" else 0
+        if e.get("lock"):
+            o["covered"] += 1
+            o["drawn"] += int(e.get("debit") or 0)
+        else:
+            o["credit_usd"] = round(o["credit_usd"] + e["amount_usd"] + (e.get("premium_usd") or 0.0), 6)
         o["settled_bytes"] += e["settled_bytes"]
         fee = e.get("fee_usd", 0.0)
         o["amount_usd"] = round(o["amount_usd"] + e["amount_usd"], 6)
@@ -960,8 +968,27 @@ def parse_invoice_line(line):
             "from_steward": d["from_steward"] or "0.0000", "relay": d["relay"], "fee": d["fee"]}
 
 
-def invoice_lines(tot, peers, month, fee):
-    """The invoice's text from its sums: one line per payer and hop, a refund line under a pair with short windows, the Steward's line last."""
+def invoice_prepaid_line(month, payer_name, deposits, drawn, covered, credit_usd, credit_windows, balance):
+    """A payer's prepayment line of the invoice (spec, Section 16), the form `parse_prepaid_line` reads back. Amounts are micro-units but the credit."""
+    return "%s  %s prepaid: deposits %s, drawn %s on %d covered window%s, balance %s; on credit $%.4f on %d window%s" % (
+        month, payer_name, micro_usd(deposits), micro_usd(drawn), covered, "" if covered == 1 else "s", micro_usd(balance),
+        credit_usd, credit_windows, "" if credit_windows == 1 else "s")
+
+
+PREPAID_LINE_RE = re.compile(
+    r"^(?P<month>\d{4}-\d{2})  (?P<payer>\S+) prepaid: deposits \$(?P<deposits>[0-9.]+), drawn \$(?P<drawn>[0-9.]+) on (?P<covered>\d+) covered windows?, "
+    r"balance \$(?P<balance>-?[0-9.]+); on credit \$(?P<credit>[0-9.]+) on (?P<credit_windows>\d+) windows?$")
+
+
+def parse_prepaid_line(line):
+    """A payer's prepayment line back into its figures (the strings as printed), or None for any other line."""
+    m = PREPAID_LINE_RE.match(line.rstrip("\n"))
+    return m.groupdict() if m else None
+
+
+def invoice_lines(tot, peers, month, fee, prepay=None, now=None):
+    """The invoice's text from its sums: one line per payer and hop, a refund line under a pair with short windows, a prepayment
+    line per payer that holds a balance or had a covered window (spec, Section 16), the Steward's line last."""
     lines = []
     if not tot:
         lines.append("no settlements in %s" % month)
@@ -971,6 +998,20 @@ def invoice_lines(tot, peers, month, fee):
         lines.append(invoice_pair_line(month, peers.get(payer, payer), peers.get(hop, hop), o))
         if o["refund_usd"]:
             lines.append("%s    returned to %s on short windows: $%.4f" % (month, peers.get(payer, payer), o["refund_usd"]))
+    if prepay is not None:
+        now = now if now is not None else time.time()
+        by_payer = {}
+        for (payer, hop), o in tot.items():
+            b = by_payer.setdefault(payer, {"drawn": 0, "covered": 0, "credit_usd": 0.0, "credit_windows": 0})
+            b["drawn"] += o["drawn"]; b["covered"] += o["covered"]
+            b["credit_usd"] = round(b["credit_usd"] + o["credit_usd"], 6); b["credit_windows"] += o["windows"] - o["covered"]
+        for payer in sorted(set(by_payer) | set(prepay.payers())):
+            b = by_payer.get(payer, {"drawn": 0, "covered": 0, "credit_usd": 0.0, "credit_windows": 0})
+            bal = prepay.balance(payer, now)
+            deposits = sum(d["amount"] for d in prepay.deposits if d["payer"] == payer and time.strftime("%Y-%m", time.localtime(d["posted_at"])) == month)
+            if not (b["covered"] or deposits or bal["deposits"]):
+                continue
+            lines.append(invoice_prepaid_line(month, peers.get(payer, payer), deposits, b["drawn"], b["covered"], b["credit_usd"], b["credit_windows"], bal["balance"]))
     if tot:
         lines.append("%s  the Network Steward's share: $%.4f (f = %s of every settlement since 0.3.0; none before)" % (month, fees, fee))
     return "\n".join(lines) + "\n"
@@ -1199,6 +1240,117 @@ def micro_usd(n):
     return "$%.6f" % (n / MICRO)
 
 
+class PrepayBook:
+    """The deposits, locks and claims a Mint holds and what the settlements have drawn on the locks, kept in order.
+
+    Pure bookkeeping shared by the Mint and the rebuild (spec, Section 16). A
+    lock is open from its registration until a settlement or a claim debits
+    it, or until its claim window closes with neither, when it is released;
+    the balance is deposits less open locks less debits, integers.
+    """
+
+    def __init__(self, lost_after_s=None):
+        self.lost_after_s = HEALTH["lost_after_s"] if lost_after_s is None else lost_after_s
+        self.ids, self.records = set(), []
+        self.deposits, self.locks, self.lock_by_window, self.claims = [], {}, {}, {}
+        self.debits = {}                      # lock id -> what a settlement or a claim drew, micro-units
+
+    def add(self, rec):
+        """A deposit, a lock or a claim, in registration order. Returns False when its id is already held."""
+        if not isinstance(rec, dict) or rec.get("kind") not in PREPAY_KINDS or rec.get("id") in self.ids:
+            return False
+        self.ids.add(rec["id"])
+        self.records.append(rec)
+        if rec["kind"] == "deposit":
+            self.deposits.append(rec)
+        elif rec["kind"] == "lock":
+            self.locks[rec["id"]] = rec
+            self.lock_by_window[(rec["payer"], rec["hop"], rec["t_first"])] = rec
+        else:
+            self.claims[rec["lock"]] = rec
+        return True
+
+    def lock_for(self, payer, hop, t_first):
+        return self.lock_by_window.get((payer, hop, t_first))
+
+    def note(self, s):
+        """A settlement happened: what it drew on its lock, if it had one."""
+        if s.get("lock") and s.get("debit") is not None:
+            self.debits[s["lock"]] = s["debit"]
+
+    def claim_window(self, lock):
+        """When a hop may claim a lock's window: from two windows after its start (the payer's receipt may be in its outbox) for two more."""
+        return lock["t_first"] + self.lost_after_s, lock["t_first"] + 2 * self.lost_after_s
+
+    def state(self, lock, now):
+        """open, settled, claimed, or released (its claim window closed with no settlement and no claim)."""
+        if lock["id"] in self.debits:
+            return "claimed" if lock["id"] in self.claims else "settled"
+        return "released" if now >= self.claim_window(lock)[1] else "open"
+
+    def balance(self, payer, now):
+        """A payer's balance, every amount an integer in micro-units."""
+        now = int(now)
+        mine = sorted((l for l in self.locks.values() if l["payer"] == payer), key=lambda l: (l["t_first"], l["id"]))
+        deposits = sum(d["amount"] for d in self.deposits if d["payer"] == payer)
+        states = {l["id"]: self.state(l, now) for l in mine}
+        open_locks = [l for l in mine if states[l["id"]] == "open"]
+        locked = sum(l["amount"] for l in open_locks)
+        debited = sum(self.debits[l["id"]] for l in mine if l["id"] in self.debits)
+        released = sum(l["amount"] for l in mine if states[l["id"]] == "released")
+        return {"payer": payer, "unit": "USD", "deposits": deposits, "locked": locked, "debited": debited, "released": released,
+                "balance": deposits - locked - debited,
+                "open_locks": [{"id": l["id"], "hop": l["hop"], "t_first": l["t_first"], "amount": l["amount"]} for l in open_locks],
+                "locks": [{"id": l["id"], "hop": l["hop"], "t_first": l["t_first"], "amount": l["amount"], "state": states[l["id"]],
+                           "debit": self.debits.get(l["id"])} for l in mine]}
+
+    def payers(self):
+        return sorted({d["payer"] for d in self.deposits} | {l["payer"] for l in self.locks.values()})
+
+
+def apply_lock(s, lock):
+    """A settlement against a lock: it names the lock and draws the window's carriage and premium from it, in micro-units.
+
+    Only a covered window carries these three fields; an uncovered one is the
+    settlement of Section 8 unchanged, so a ledger from before Section 16 and
+    its rebuild still agree.
+    """
+    s["lock"] = lock["id"]
+    s["debit"] = int(round((s["amount_usd"] + s.get("premium_usd", 0.0)) * MICRO))
+    s["covered"] = True
+    return s
+
+
+CLAIM_RULE = "the hop's count, up to what the payer locked; the payer never closed the window"
+
+
+def claimed_settlement(lock, claim, link=None, price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB, fee=DEFAULT_STEWARD_FEE, now=None):
+    """The settlement of a window the payer never closed, from the hop's claim on the lock (spec, Section 16).
+
+    The hop is paid for what it counted, up to what the payer locked at the
+    link's price; there is no payer count and no receipt, and the record says
+    so in its rule. Pure, like resolve.
+    """
+    now = int(now if now is not None else time.time())
+    p = link_params(link)
+    price = p["price"] if link else price_usd_per_gb
+    cap = int(fractions.Fraction(lock["amount"]) * 10 ** 9 / (fractions.Fraction(str(price)) * MICRO)) if price > 0 else claim["bytes"]   # exact: the Mint and a rebuild agree
+    settled = min(claim["bytes"], cap)
+    amount = round(settled / 1e9 * price, 6)
+    s = {"kind": "settlement", "proto": PROTO, "t": now,
+         "payer": lock["payer"], "hop": lock["hop"], "hop_index": 1, "t_first": lock["t_first"], "t_last": lock["t_first"] + 3600,
+         "payer_bytes": None, "hop_bytes": claim["bytes"], "settled_bytes": settled, "status": "claimed", "rule": CLAIM_RULE,
+         "receipt_sig": None, "ack_sig": None, "claim_sig": claim["sig"],
+         "price_usd_per_gb": price, "amount_usd": amount, "steward_fee": fee, "fee_usd": round(amount * fee, 6),
+         "margin": p["margin"], "min_bytes": p["min_bytes"], "link": link_hash(link) if link else None}
+    return apply_lock(s, lock)
+
+
+def settlement_key(s):
+    """What a settlement is keyed by in an index: the receipt it settles, or the claim it settles when the payer never closed the window."""
+    return s.get("receipt_sig") or s.get("claim_sig")
+
+
 # ---------------------------------------------------------------- the rebuild
 
 def read_jsonl(path):
@@ -1223,8 +1375,8 @@ def place_lookup(map_obj, peers):
 
 
 def rebuild(receipts, acks, links=(), price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB, fee=DEFAULT_STEWARD_FEE, now=None,
-            names=("receipts.jsonl", "acks.jsonl", "links.jsonl", "purchases.jsonl"), purchases=(), place_of=None,
-            steward_margin=DEFAULT_STEWARD["margin"]):
+            names=("receipts.jsonl", "acks.jsonl", "links.jsonl", "purchases.jsonl", "prepay.jsonl"), purchases=(), place_of=None,
+            steward_margin=DEFAULT_STEWARD["margin"], prepay=()):
     """A Mint's ledger from the payer's receipts, the hop's acks and the announcements alone (spec, Section 11).
 
     receipts, acks and links are lists of (line number, record), as
@@ -1265,6 +1417,18 @@ def rebuild(receipts, acks, links=(), price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB,
             bad.append("%s line %d: %s" % (names[3] if len(names) > 3 else "purchases.jsonl", i, e))
             continue
         book.add(rec)
+    pbook = PrepayBook()
+    for i, rec in prepay:
+        try:
+            check_prepay(rec)
+            if not verify_prepay(rec):
+                raise ValueError("bad signature")
+            if rec["kind"] == "lock" and ("mint" not in rec or not verify_lock_mint(rec)):
+                raise ValueError("a lock in the registry carries the Mint's countersignature")
+        except ValueError as e:
+            bad.append("%s line %d: %s" % (names[4] if len(names) > 4 else "prepay.jsonl", i, e))
+            continue
+        pbook.add(rec)
     for i, rec in links:
         try:
             check_link(rec)
@@ -1306,7 +1470,7 @@ def rebuild(receipts, acks, links=(), price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB,
                 acks_by_prev[env["receipt"]["prev_sig"]] = env
             seen.add(env["sig"])
             good[kind].append(env)
-    rep = {"receipts": len(good["receipt"]), "acks": len(good["ack"]), "links": len(good["link"]), "purchases": len(book.order),
+    rep = {"receipts": len(good["receipt"]), "acks": len(good["ack"]), "links": len(good["link"]), "purchases": len(book.order), "prepay": len(pbook.records),
            "settlements": 0, "disputed": 0, "hours": 0, "receipts_without_ack": 0, "acks_without_receipt": 0, "bad": bad}
 
     def entry(env):
@@ -1328,11 +1492,34 @@ def rebuild(receipts, acks, links=(), price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB,
         except ValueError as e:
             bad.append("%s %s does not settle receipt %s: %s" % (names[1], ack["sig"][:12], env["sig"][:12], e))
             continue
+        lock = pbook.lock_for(r["payer"], r["hop"], r["t_first"])
+        if lock is not None and lock["id"] not in pbook.debits:
+            apply_lock(s, lock)
         book.note(s)
+        pbook.note(s)
         entries.append(s)
         rep["settlements"] += 1
         rep["disputed"] += 1 if s["status"] == "disputed" else 0
         by_hour.setdefault(commit_hour(s), []).append(s)
+    # a claim on a lock whose window never settled: the claimed settlement, in the window's place among the others
+    claimed = []
+    for lock_id, claim in sorted(pbook.claims.items(), key=lambda kv: (pbook.locks.get(kv[0], {}).get("t_first", 0), kv[0])):
+        lock = pbook.locks.get(lock_id)
+        if lock is None or lock_id in pbook.debits:
+            continue
+        opens, closes = pbook.claim_window(lock)
+        if not opens <= claim["posted_at"] < closes:
+            bad.append("%s: claim %s is outside its lock's claim window (%d..%d)" % (names[4] if len(names) > 4 else "prepay.jsonl", claim["id"][:12], opens, closes))
+            continue
+        s = claimed_settlement(lock, claim, link_in_force(good["link"], lock["payer"], lock["hop"], lock["t_first"]), price_usd_per_gb, fee, claim["posted_at"])
+        pbook.note(s)
+        claimed.append(s)
+        rep["settlements"] += 1
+        by_hour.setdefault(commit_hour(s), []).append(s)
+    if claimed:
+        for s in claimed:                                            # after the receipts and acks it follows in time, before later ones
+            at = next((i for i, e in enumerate(entries) if e.get("kind") == "settlement" and settlement_order(e) > settlement_order(s)), len(entries))
+            entries.insert(at, s)
     last = {}
     for i, e in enumerate(entries):
         if e["kind"] == "settlement":
@@ -1414,7 +1601,7 @@ def compare(rebuilt, mint_entries):
     for the hour's root is taken over the pre-profile members.
     """
     def settlements(entries):
-        return {e["receipt_sig"]: e for e in entries if e.get("kind") == "settlement"}
+        return {settlement_key(e): e for e in entries if e.get("kind") == "settlement"}
 
     def commitments(entries):
         out = {}
@@ -1462,7 +1649,7 @@ def compare(rebuilt, mint_entries):
     committed = 0
     for h in sorted(set(my_hours) | set(their_c)):
         ss = sorted(my_hours.get(h, []), key=settlement_order)
-        m = (merkle_root([my_leaf[s["receipt_sig"]] for s in ss]).hex(), len(ss)) if ss else None
+        m = (merkle_root([my_leaf[settlement_key(s)] for s in ss]).hex(), len(ss)) if ss else None
         c = their_c.get(h)
         if c is None:
             notes.append("hour %d: no commitment on the Mint's ledger (%s rebuilt)" % (h, plural(m[1], "settlement")))
@@ -2086,9 +2273,9 @@ class Node:
               "steward_nym": self.steward_nym()}
         for rec in self.load_purchases(skip_partial):
             ix["book"].add(rec)
-        ix["prepay"] = {"ids": set(), "deposits": [], "locks": {}, "lock_by_window": {}, "claims": {}}
+        ix["prepay"] = PrepayBook()
         for rec in self.load_prepay(skip_partial):
-            self._index_prepay(ix, rec)
+            ix["prepay"].add(rec)
         for entry in self.read_lines("ledger.jsonl", skip_partial):
             self._index_line(ix, entry)
         self.index = ix
@@ -2107,8 +2294,9 @@ class Node:
             ix["acks_by_prev"][entry["receipt"]["prev_sig"]] = entry
             ix["first_seen"].setdefault(entry["receipt"]["hop"], entry["received_at"])
         elif k == "settlement":
-            ix["settled"][entry["receipt_sig"]] = entry
+            ix["settled"][settlement_key(entry)] = entry
             ix["book"].note(entry)
+            ix["prepay"].note(entry)
         elif k == "commitment":
             ix["commitments"][entry["window"]] = entry     # the newest for an hour is the Mint's current word
             ix["last_commitment"] = entry
@@ -2279,38 +2467,13 @@ class Node:
     def load_prepay(self, skip_partial=False):
         return self.read_lines("prepay.jsonl", skip_partial)
 
-    @staticmethod
-    def _index_prepay(ix, rec):
-        p = ix["prepay"]
-        if not isinstance(rec, dict) or rec.get("kind") not in PREPAY_KINDS or rec.get("id") in p["ids"]:
-            return
-        p["ids"].add(rec["id"])
-        if rec["kind"] == "deposit":
-            p["deposits"].append(rec)
-        elif rec["kind"] == "lock":
-            p["locks"][rec["id"]] = rec
-            p["lock_by_window"][(rec["payer"], rec["hop"], rec["t_first"])] = rec
-        else:
-            p["claims"][rec["lock"]] = rec
-
-    def prepay_balance(self, payer):
-        """A payer's balance at this Mint, every amount an integer in micro-units: deposits less open locks less debits.
-
-        Step 1 holds no debits: a lock stays open until step 2 settles, releases or claims it.
-        """
-        p = self.index["prepay"]
-        deposits = sum(d["amount"] for d in p["deposits"] if d["payer"] == payer)
-        open_locks = sorted((l for l in p["locks"].values() if l["payer"] == payer), key=lambda l: (l["t_first"], l["id"]))
-        locked = sum(l["amount"] for l in open_locks)
-        debited = 0
-        return {"payer": payer, "unit": "USD", "deposits": deposits, "locked": locked, "debited": debited,
-                "balance": deposits - locked - debited,
-                "open_locks": [{"id": l["id"], "hop": l["hop"], "t_first": l["t_first"], "amount": l["amount"]} for l in open_locks]}
+    def prepay_balance(self, payer, now=None):
+        """A payer's balance at this Mint (PrepayBook.balance): deposits less open locks less debits, integers in micro-units."""
+        return self.index["prepay"].balance(payer, now if now is not None else time.time())
 
     def prepay_payers(self):
         """Every payer with a deposit or a lock at this Mint."""
-        p = self.index["prepay"]
-        return sorted({d["payer"] for d in p["deposits"]} | {l["payer"] for l in p["locks"].values()})
+        return self.index["prepay"].payers()
 
     def register_prepay(self, rec, now=None):
         """The Mint's /prepay (spec, Section 16): a deposit, a lock or a claim. Appends it to prepay.jsonl, returns the record as stored.
@@ -2325,8 +2488,9 @@ class Node:
             raise ValueError("bad signature")
         peers = self.peers()
         p = self.index["prepay"]
+        claimed = None
         with self.lock:
-            if rec["id"] in p["ids"]:
+            if rec["id"] in p.ids:
                 raise Decline("duplicate")
             if rec["posted_at"] < now - CLOCK_TOLERANCE_S:
                 raise Decline("since: posted_at %d is in the past (the Mint's clock is %d); a %s cannot be backdated" % (rec["posted_at"], now, rec["kind"]))
@@ -2345,34 +2509,44 @@ class Node:
                     raise Decline("unknown hop %s" % rec["hop"])
                 if not now - CLOCK_TOLERANCE_S <= rec["t_first"] <= now + LOCK_AHEAD_S + CLOCK_TOLERANCE_S:
                     raise Decline("since: a lock names the window about to open; t_first %d against the Mint's clock %d" % (rec["t_first"], now))
-                if (rec["payer"], rec["hop"], rec["t_first"]) in p["lock_by_window"]:
+                if p.lock_for(rec["payer"], rec["hop"], rec["t_first"]) is not None:
                     raise Decline("duplicate: a lock for that window with that hop is held")
                 link = link_in_force(self.index["links"], rec["payer"], rec["hop"], rec["t_first"])
                 want = link_hash(link) if link else None
                 if rec["link"] != want:
                     raise Decline("route: the announcement in force at %d is %s, not %s" % (rec["t_first"], want[:16] if want else "none", rec["link"][:16] if rec["link"] else "none"))
-                bal = self.prepay_balance(rec["payer"])
+                bal = self.prepay_balance(rec["payer"], now)
                 if bal["balance"] < rec["amount"]:
                     raise Decline("balance: %s on hand, %s asked (deposits %s, locked %s, debited %s)" % (
                         micro_usd(bal["balance"]), micro_usd(rec["amount"]), micro_usd(bal["deposits"]), micro_usd(bal["locked"]), micro_usd(bal["debited"])))
                 stored = dict(rec, mint=self.nym)
                 stored["mint_sig"] = sign_lock_mint(self.priv, stored)
             else:
-                lock = p["locks"].get(rec["lock"])
+                lock = p.locks.get(rec["lock"])
                 if lock is None:
                     raise Decline("route: no lock %s is held" % rec["lock"][:16])
                 if rec["hop"] != lock["hop"] or rec["payer"] != lock["payer"]:
                     raise Decline("route: the claim's hop and payer are not the lock's")
-                if any(s["payer"] == lock["payer"] and s["hop"] == lock["hop"] and s["t_first"] == lock["t_first"] for s in self.index["settled"].values()):
+                if rec["lock"] in p.claims:
+                    raise Decline("duplicate: that lock is claimed")
+                if lock["id"] in p.debits or any(s["payer"] == lock["payer"] and s["hop"] == lock["hop"] and s["t_first"] == lock["t_first"]
+                                                  for s in self.index["settled"].values()):
                     raise Decline("since: the window starting at %d settled; nothing to claim" % lock["t_first"])
-                if rec["posted_at"] < lock["t_first"] + HEALTH["lost_after_s"]:
+                opens, closes = p.claim_window(lock)
+                if rec["posted_at"] < opens:
                     raise Decline("since: a claim waits %d s after the window's start (%d), in case the payer's receipt is in its outbox" % (
                         HEALTH["lost_after_s"], lock["t_first"]))
-                if rec["lock"] in p["claims"]:
-                    raise Decline("duplicate: that lock is claimed")
+                if rec["posted_at"] >= closes or now >= closes:
+                    raise Decline("since: the claim window on that lock closed at %d and its amount went back to the payer" % closes)
                 stored = rec
+                link = link_in_force(self.index["links"], lock["payer"], lock["hop"], lock["t_first"])
+                claimed = claimed_settlement(lock, rec, link, self.config.get("price_usd_per_gb", DEFAULT_PRICE_USD_PER_GB),
+                                             self.config.get("steward_fee", DEFAULT_STEWARD_FEE), now)
             self.append("prepay.jsonl", stored)
-            self._index_prepay(self.index, stored)
+            p.add(stored)
+            if claimed is not None:
+                self.ledger_append(claimed)                        # the window settles on the hop's count, up to the lock, and joins its hour
+                self.commit(commit_hour(claimed), now)
         who = lambda n: peers.get(n, n[:20])
         if rec["kind"] == "deposit":
             log("deposit %s registered: %s for %s (%s); balance %s" % (rec["id"][:16], micro_usd(rec["amount"]), who(rec["payer"]), rec["note"],
@@ -2381,7 +2555,8 @@ class Node:
             log("lock %s registered: %s by %s with %s for the window at %d, countersigned; balance %s" % (
                 rec["id"][:16], micro_usd(rec["amount"]), who(rec["payer"]), who(rec["hop"]), rec["t_first"], micro_usd(self.prepay_balance(rec["payer"])["balance"])))
         else:
-            log("claim %s registered: %s counts %d bytes on lock %s of %s" % (rec["id"][:16], who(rec["hop"]), rec["bytes"], rec["lock"][:16], who(rec["payer"])))
+            log("claim %s registered: %s counts %d bytes on lock %s of %s; settled claimed at %d bytes, %s drawn" % (
+                rec["id"][:16], who(rec["hop"]), rec["bytes"], rec["lock"][:16], who(rec["payer"]), claimed["settled_bytes"], micro_usd(claimed["debit"])))
         return stored
 
     def try_settle(self, env, now):
@@ -2402,12 +2577,16 @@ class Node:
         except ValueError as e:
             log("receipt %s and ack %s do not settle: %s" % (rec["sig"][:12], ack["sig"][:12], e))
             return None
+        lock = ix["prepay"].lock_for(r["payer"], r["hop"], r["t_first"])
+        if lock is not None and lock["id"] not in ix["prepay"].debits:
+            apply_lock(s, lock)                                   # the window was covered: its value is drawn from the lock (spec, Section 16)
         self.ledger_append(s)
         log("%s %s..%d: payer %d, hop %d, settled %d bytes ($%.6f, fee $%.6f, margin %s%s%s)" % (
             s["status"], s["t_first"], s["t_last"], s["payer_bytes"], s["hop_bytes"], s["settled_bytes"], s["amount_usd"],
             s["fee_usd"], s["margin"], " from link %s" % s["link"][:16] if s["link"] else ", the default",
             "; purchase %s: premium $%.6f (poster $%.6f, Steward $%.6f), $%.6f returned" % (
-                s["purchase"][:16], s["premium_usd"], s["from_poster_usd"], s["from_steward_usd"], s["refund_usd"]) if s.get("purchase") else ""))
+                s["purchase"][:16], s["premium_usd"], s["from_poster_usd"], s["from_steward_usd"], s["refund_usd"]) if s.get("purchase") else "")
+            + ("; lock %s: %s drawn" % (s["lock"][:16], micro_usd(s["debit"])) if s.get("lock") else ""))
         return s
 
     def commit(self, window, now):
@@ -2490,9 +2669,13 @@ class Node:
         """Sum the settlements of a month (YYYY-MM) per payer and hop, in local time, with the Steward's share apart (invoice_sums)."""
         return invoice_sums(self.ledger_lines(), month)
 
-    def invoice_text(self, month):
-        """The invoice as `bwkit invoice` prints it: one line per payer and hop, a refund line under a pair with short windows, the Steward's line last."""
-        return invoice_lines(self.invoice(month), self.peers(), month, self.config.get("steward_fee", DEFAULT_STEWARD_FEE))
+    def invoice_text(self, month, now=None):
+        """The invoice as `bwkit invoice` prints it: one line per payer and hop, a refund line under a pair with short windows,
+        a prepayment line per payer with a balance or a covered window, the Steward's line last."""
+        if self.index is None:
+            self.load_index(skip_partial=True)
+        return invoice_lines(self.invoice(month), self.peers(), month, self.config.get("steward_fee", DEFAULT_STEWARD_FEE),
+                             prepay=self.index["prepay"], now=now)
 
     def invoice_save(self, month, now=None):
         """Write the month's invoice to invoices/<month>.txt (bwkit-invoice.timer does this on the first of the next month) and return the path.
@@ -2583,7 +2766,7 @@ class Node:
         return sorted(n[:-4] for n in os.listdir(d) if re.match(r"^\d{4}-\d{2}\.txt$", n))
 
     def owed(self, month, purchases_path=None, invoice_path=None, links_path=None, price=DEFAULT_PRICE_USD_PER_GB, fee=DEFAULT_STEWARD_FEE,
-             receipts_path=None, acks_path=None):
+             receipts_path=None, acks_path=None, prepay_path=None):
         """Hop or payer: the month's invoice line from this node's own copies alone, set against the Mint's.
 
         The receipts and acks this node kept (its own and the other side's,
@@ -2641,6 +2824,10 @@ class Node:
             purchases, bad_p = read_jsonl(purchases_path)
             purchases_known = True
             sources.append("purchases from %s" % os.path.basename(purchases_path))
+        prepay, bad_pp = [], []
+        if prepay_path:
+            prepay, bad_pp = read_jsonl(prepay_path)
+            sources.append("the prepayment registry from %s" % os.path.basename(prepay_path))
         mint_text = None
         if invoice_path:
             with open(invoice_path) as f:
@@ -2663,13 +2850,25 @@ class Node:
                 if status == 200:
                     mint_text = data.decode("utf-8")
                     proxied.append("the invoice")
+            if not prepay_path:
+                status, data, _ = self.proxy_get("/prepay")
+                if status == 200:
+                    prepay = [(i, json.loads(line)) for i, line in enumerate(data.decode("utf-8").split("\n"), 1) if line.strip()]
+                    proxied.append("the prepayment registry")
         except (urlerror.URLError, socket.timeout, OSError, ValueError):
             pass
         if proxied:
             sources.append("from the Mint through this node: " + ", ".join(proxied))
         place_of = place_lookup(self.load_map(), self.peers()) if self.map_path_exists() else None
-        entries, rep = rebuild(receipts, acks, links, price, fee, purchases=purchases, place_of=place_of)
-        left_out = bad_r + bad_a + bad_l + bad_p + rep["bad"]
+        entries, rep = rebuild(receipts, acks, links, price, fee, purchases=purchases, place_of=place_of, prepay=prepay)
+        left_out = bad_r + bad_a + bad_l + bad_p + bad_pp + rep["bad"]
+        pbook = PrepayBook()
+        for _, rec in prepay:
+            if isinstance(rec, dict) and rec.get("kind") in PREPAY_KINDS and verify_prepay(rec):
+                pbook.add(rec)
+        for e in entries:
+            if e.get("kind") == "settlement":
+                pbook.note(e)                                            # what the rebuilt settlements drew on the locks
         # a window whose receipt is from before profile 1 was settled by a Mint that took no fee: summed as the Mint summed it
         pre = {env["sig"] for _, env in receipts if isinstance(env, dict) and "proto" not in env and env.get("sig")}
         before = 0
@@ -2708,6 +2907,15 @@ class Node:
             lines.append("%s  no window of mine settled" % month)
         total = round(sum(o["relay_usd"] if self.role == "hop" else o["amount_usd"] + o["premium_usd"] for o in mine.values()), 6)
         lines.append("%s  %s: $%.4f" % (month, "owed to me, the relay's share of every line" if self.role == "hop" else "I owe, carriage and premiums of every line", total))
+        my_prepaid = None
+        if self.role == "payer" and (pbook.payers() or any(o["covered"] for o in mine.values())):
+            drawn = sum(o["drawn"] for o in mine.values()); covered = sum(o["covered"] for o in mine.values())
+            credit = round(sum(o["credit_usd"] for o in mine.values()), 6); credit_windows = sum(o["windows"] - o["covered"] for o in mine.values())
+            bal = pbook.balance(me, time.time())
+            deposits = sum(d["amount"] for d in pbook.deposits if d["payer"] == me and time.strftime("%Y-%m", time.localtime(d["posted_at"])) == month)
+            my_prepaid = parse_prepaid_line(invoice_prepaid_line(month, my_name, deposits, drawn, covered, credit, credit_windows, bal["balance"]))
+            lines.append(invoice_prepaid_line(month, my_name, deposits, drawn, covered, credit, credit_windows, bal["balance"]))
+            lines.append("%s  the deposits and the balance are the Mint's own registry read back; the drawn and credit figures are from my copies" % month)
         # against the Mint's invoice
         if mint_text is None:
             lines.append("the Mint's invoice was not read (no Mint answered through this node; pass --invoice <file>), so nothing was compared")
@@ -2736,6 +2944,16 @@ class Node:
                     diffs.append("%s with %s: %s%s here, %s%s on the Mint" % (field, other, unit, own_line[field], unit, r[field]))
         for other in by_other:
             diffs.append("the Mint has a line for %s that my copies do not" % other)
+        if my_prepaid is not None:
+            theirs_pp = [parse_prepaid_line(l) for l in mint_text.split("\n")]
+            theirs_pp = next((r for r in theirs_pp if r and r["payer"] == my_name), None)
+            if theirs_pp is None:
+                diffs.append("prepaid: my copies and the registry give a prepayment line, the Mint's invoice has none for %s" % my_name)
+            else:
+                for field in ("deposits", "drawn", "covered", "balance", "credit", "credit_windows"):
+                    if my_prepaid[field] != theirs_pp[field]:
+                        unit = "" if field in ("covered", "credit_windows") else "$"
+                        diffs.append("prepaid %s: %s%s here, %s%s on the Mint" % (field, unit, my_prepaid[field], unit, theirs_pp[field]))
         if diffs:
             lines.append("DIFFERS from the Mint's invoice:")
             lines.extend("  " + d for d in diffs)
@@ -3969,6 +4187,7 @@ def main(argv=None):
     ow.add_argument("--links", metavar="FILE", help="announcements to settle under (a payer keeps none; the Mint's /links otherwise)")
     ow.add_argument("--receipts", metavar="FILE", help="the payer's receipts.jsonl, added to this node's own copies to fill a gap in them")
     ow.add_argument("--acks", metavar="FILE", help="the hop's acks.jsonl, added to this node's own copies to fill a gap in them")
+    ow.add_argument("--prepay", metavar="FILE", help="the Mint's prepay.jsonl, when it cannot be reached; without it no window is rebuilt as covered")
     ow.add_argument("--price", type=float, default=DEFAULT_PRICE_USD_PER_GB, help="the default price when no announcement is in force")
     ow.add_argument("--fee", type=float, default=DEFAULT_STEWARD_FEE, help="the Steward's fraction f")
     vf = sub.add_parser("verify", help="check the signature on receipt files (no node state needed)")
@@ -4002,6 +4221,7 @@ def main(argv=None):
     rb.add_argument("acks", help="the hop's acks.jsonl")
     rb.add_argument("links", nargs="?", help="links.jsonl, the announcements (the Mint's or the hop's copy); none means the pilot defaults")
     rb.add_argument("purchases", nargs="?", help="purchases.jsonl, the purchases (the Mint's copy); none means no premiums")
+    rb.add_argument("--prepay", metavar="FILE", help="prepay.jsonl, the Mint's prepayment registry; without it no window is rebuilt as covered and no claim settles")
     rb.add_argument("--map", help="the map (map.json), needed for the Steward's place-routed purchases")
     rb.add_argument("--peers", help="peers.json, to put nodes at their places on the map")
     rb.add_argument("--ledger", help="write the rebuilt ledger here instead of printing it")
@@ -4069,8 +4289,9 @@ def main(argv=None):
         acks, bad_a = read_jsonl(args.acks)
         links, bad_l = read_jsonl(args.links) if args.links else ([], [])
         purchases, bad_p = read_jsonl(args.purchases) if args.purchases else ([], [])
+        prepay, bad_pp = read_jsonl(args.prepay) if args.prepay else ([], [])
         names = (os.path.basename(args.receipts), os.path.basename(args.acks), os.path.basename(args.links or "links.jsonl"),
-                 os.path.basename(args.purchases or "purchases.jsonl"))
+                 os.path.basename(args.purchases or "purchases.jsonl"), os.path.basename(args.prepay or "prepay.jsonl"))
         place_of = None
         if args.map:
             with open(args.map) as f:
@@ -4080,7 +4301,8 @@ def main(argv=None):
                 with open(args.peers) as f:
                     peers = json.load(f)
             place_of = place_lookup(map_obj, peers)
-        entries, rep = rebuild(receipts, acks, links, args.price, args.fee, names=names, purchases=purchases, place_of=place_of)
+        entries, rep = rebuild(receipts, acks, links, args.price, args.fee, names=names, purchases=purchases, place_of=place_of, prepay=prepay)
+        bad_p = bad_p + bad_pp
         rep["bad"] = bad_r + bad_a + bad_l + bad_p + rep["bad"]
         for line in rep["bad"]:
             print("left out: " + line, file=sys.stderr)
@@ -4338,7 +4560,7 @@ def main(argv=None):
             elif e["kind"] == "settlement":
                 print("%s  %s  %d..%d  payer %s  hop %s  settled %s  $%.6f%s" % (
                     time.strftime("%Y-%m-%d %H:%M", time.localtime(e["t_last"])), e["status"].upper(),
-                    e["t_first"], e["t_last"], fmt_bytes(e["payer_bytes"]), fmt_bytes(e["hop_bytes"]),
+                    e["t_first"], e["t_last"], fmt_bytes(e["payer_bytes"]) if e["payer_bytes"] is not None else "no count", fmt_bytes(e["hop_bytes"]),
                     fmt_bytes(e["settled_bytes"]), e["amount_usd"],
                     "  fee $%.6f  margin %s%s" % (e["fee_usd"], e["margin"], "" if e.get("link") else " (default)") if "fee_usd" in e else ""))
             else:
@@ -4366,7 +4588,7 @@ def main(argv=None):
         if not re.match(r"^\d{4}-\d{2}$", month):
             raise SystemExit("the month is YYYY-MM, as in 2026-10")
         text, rc = node.owed(month, purchases_path=args.purchases, invoice_path=args.invoice, links_path=args.links, price=args.price, fee=args.fee,
-                             receipts_path=args.receipts, acks_path=args.acks)
+                             receipts_path=args.receipts, acks_path=args.acks, prepay_path=args.prepay)
         print(text, end="")
         return rc
     elif args.cmd == "prove":

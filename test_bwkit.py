@@ -840,7 +840,7 @@ class Rebuild(unittest.TestCase):
 
     def test_rebuild_agrees_with_the_mint(self):
         entries, rep = self.rebuild()
-        self.assertEqual(rep, {"receipts": 5, "acks": 4, "links": 0, "purchases": 0, "settlements": 4, "disputed": 2, "hours": 3,
+        self.assertEqual(rep, {"receipts": 5, "acks": 4, "links": 0, "purchases": 0, "prepay": 0, "settlements": 4, "disputed": 2, "hours": 3,
                                "receipts_without_ack": 1, "acks_without_receipt": 0, "bad": []})
         self.assertEqual([e["kind"] for e in entries],
                          ["receipt", "ack", "settlement", "commitment"] * 2 + ["receipt"] + ["receipt", "ack", "settlement"] * 2 + ["commitment"])
@@ -1125,7 +1125,7 @@ class Prepay(unittest.TestCase):
         now = int(time.time())
         # nothing yet
         self.assertEqual(json.loads(bwkit.http_get(lab.mint_url + "/balance?payer=bw-house")[1]),
-                         {"payer": lab.payer.nym, "unit": "USD", "deposits": 0, "locked": 0, "debited": 0, "balance": 0, "open_locks": []})
+                         {"payer": lab.payer.nym, "unit": "USD", "deposits": 0, "locked": 0, "debited": 0, "released": 0, "balance": 0, "open_locks": [], "locks": []})
         rc, text = cli(["prepay", "list"], mint_env(lab))
         self.assertIn("no deposit, lock or claim held", text)
         # the operator's deposit: signed by the Mint, kept, served, on the balance in micro-units
@@ -1181,7 +1181,7 @@ class Prepay(unittest.TestCase):
         status, ans = self.post(self.signed(lab.hop.priv, claim))
         self.assertEqual((status, ans["error"]), (409, "since"))
         self.assertIn("a claim waits 7200 s", ans["detail"])
-        late = now + 3 * 3600 + 7200
+        late = t_first + 7200 + 60                                      # inside the lock's claim window: two windows after its start, for two more
         with mock.patch("time.time", return_value=late):
             status, ans = self.post(self.signed(lab.hop.priv, dict(claim, posted_at=late)))
             self.assertEqual(status, 200, ans)
@@ -1197,10 +1197,92 @@ class Prepay(unittest.TestCase):
         self.assertIn(", countersigned", text)
         self.assertIn("claim   ", text); self.assertIn("bw-forest counts 1000000 bytes on lock %s of bw-house" % rec["id"][:16], text)
         rc, text = cli(["prepay", "balance"], mint_env(lab))
-        self.assertIn("bw-house  deposits $0.050000  locked $0.012500 (1 open)  debited $0.000000  balance $0.037500", text)
+        self.assertIn("bw-house  deposits $0.050000  locked $0.000000 (0 open)  debited $0.000100  balance $0.049900", text)   # the claim settled 1 MB at 10c/GB and drew it
         lab.mint.load_index()
-        self.assertEqual(lab.mint.prepay_balance(lab.payer.nym)["balance"], 37500)
-        self.assertEqual(sorted(lab.mint.index["prepay"]["claims"]), [rec["id"]])
+        self.assertEqual(lab.mint.prepay_balance(lab.payer.nym)["balance"], 49900)
+        self.assertEqual(sorted(lab.mint.index["prepay"].claims), [rec["id"]])
+
+    def test_a_covered_window_draws_on_its_lock_a_claim_settles_and_a_lock_releases(self):
+        """Step 2: the settlement debits the lock, a claim settles the window the payer never closed, an unclaimed lock releases,
+        the invoice carries the prepayment line, the payer's `owed` agrees, and the rebuild from the files agrees with the Mint."""
+        lab = self.lab
+        lab.mint.config["steward_mint"] = lab.mint_url
+        cli(["deposit", "bw-house", "0.05", "cash"], mint_env(lab))
+        # a lock for the window about to open, posted just before it opens (the Mint's clock is the test's)
+        with mock.patch("time.time", return_value=lab.t - 1):
+            status, ans = self.post(self.signed(lab.payer.priv, self.lock_body(lab.t, 12500, now=lab.t - 1)))
+        self.assertEqual(status, 200, ans)
+        lock_a = ans["record"]
+        lab.hour(100_000_000, 100_000_000)                                 # the window settles: $0.0100 carriage, drawn from the lock
+        s = [e for e in lab.mint.ledger_lines() if e["kind"] == "settlement"][-1]
+        self.assertEqual((s["lock"], s["debit"], s["covered"], s["status"]), (lock_a["id"], 10000, True, "settled"))
+        bal = json.loads(bwkit.http_get(lab.mint_url + "/balance?payer=bw-house")[1])
+        self.assertEqual((bal["deposits"], bal["locked"], bal["debited"], bal["released"], bal["balance"], bal["locks"][0]["state"]),
+                         (50000, 0, 10000, 0, 40000, "settled"))
+        # a lock for the next window; the payer never closes it; the hop claims after two windows: settled on the hop's count, up to the lock
+        with mock.patch("time.time", return_value=lab.t - 1):
+            status, ans = self.post(self.signed(lab.payer.priv, self.lock_body(lab.t, 20000, now=lab.t - 1)))
+        self.assertEqual(status, 200, ans)
+        lock_b = ans["record"]
+        claim = {"kind": "claim", "proto": 1, "hop": lab.hop.nym, "payer": lab.payer.nym, "lock": lock_b["id"], "bytes": 250_000_000, "meter": None, "posted_at": lab.t + 7200 + 1}
+        with mock.patch("time.time", return_value=lab.t + 7200 + 1):
+            status, ans = self.post(self.signed(lab.hop.priv, claim))
+        self.assertEqual(status, 200, ans)
+        c = [e for e in lab.mint.ledger_lines() if e["kind"] == "settlement"][-1]
+        self.assertEqual((c["status"], c["payer_bytes"], c["hop_bytes"], c["settled_bytes"], c["amount_usd"], c["fee_usd"], c["lock"], c["debit"], c["receipt_sig"], c["claim_sig"]),
+                         ("claimed", None, 250_000_000, 200_000_000, 0.02, 0.001, lock_b["id"], 20000, None, ans["record"]["sig"]))
+        self.assertEqual(c["rule"], bwkit.CLAIM_RULE)
+        self.assertEqual([e for e in lab.mint.ledger_lines() if e["kind"] == "commitment"][-1]["window"], bwkit.commit_hour(c))   # the hour is committed with it
+        with mock.patch("time.time", return_value=lab.t + 7200 + 2):
+            bal = json.loads(bwkit.http_get(lab.mint_url + "/balance?payer=bw-house")[1])
+        self.assertEqual((bal["debited"], bal["balance"], [l["state"] for l in bal["locks"]]), (30000, 20000, ["settled", "claimed"]))
+        # a lock nobody settles or claims: open through its claim window, released after it
+        with mock.patch("time.time", return_value=lab.t + 3599):
+            status, ans = self.post(self.signed(lab.payer.priv, self.lock_body(lab.t + 3600, 15000, now=lab.t + 3599)))
+        self.assertEqual(status, 200, ans)
+        lock_c = ans["record"]
+        with mock.patch("time.time", return_value=lab.t + 3600 + 14399):
+            bal = json.loads(bwkit.http_get(lab.mint_url + "/balance?payer=bw-house")[1])
+            self.assertEqual((bal["locked"], bal["balance"], bal["locks"][-1]["state"]), (15000, 5000, "open"))
+            claim_c = dict(claim, lock=lock_c["id"], posted_at=lab.t + 3600 + 14399)
+        with mock.patch("time.time", return_value=lab.t + 3600 + 14400):
+            bal = json.loads(bwkit.http_get(lab.mint_url + "/balance?payer=bw-house")[1])
+            self.assertEqual((bal["locked"], bal["released"], bal["balance"], bal["locks"][-1]["state"]), (0, 15000, 20000, "released"))
+            status, ans = self.post(self.signed(lab.hop.priv, dict(claim_c, posted_at=lab.t + 3600 + 14400)))
+            self.assertEqual((status, ans["error"]), (409, "since"))
+            self.assertIn("the claim window on that lock closed", ans["detail"])
+        # the invoice: the payer's prepayment line, and the hop's line counts the claimed window
+        month = time.strftime("%Y-%m", time.localtime(lab.t))
+        with mock.patch("time.time", return_value=lab.t + 3600 + 14400):
+            text = lab.mint.invoice_text(month)
+        self.assertIn("bw-house pays bw-forest: 2 windows (0 disputed), 300.00 MB, $0.0300: the relay's $0.0285, the Steward's $0.0015", text)
+        self.assertIn("%s  bw-house prepaid: deposits $0.000000, drawn $0.030000 on 2 covered windows, balance $0.020000; on credit $0.0000 on 0 windows" % month, text)
+        # `owed` on the payer, with the registry through its proxy, agrees figure for figure, the prepayment line too
+        with mock.patch("time.time", return_value=lab.t + 3600 + 14400):
+            lab.mint.invoice_save(month)                                   # written at the same moment the payer reads it: the balance is of a moment
+            rc, out = cli(["owed", month], payer_env(lab))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("the prepayment registry", out)
+        self.assertIn("bw-house prepaid: deposits $0.000000, drawn $0.030000 on 2 covered windows, balance $0.020000; on credit $0.0000 on 0 windows", out)
+        self.assertIn("matches the Mint's invoice, figure for figure: I owe $0.0300", out)
+        # the rebuild from the parties' files and the registry gives the Mint's ledger, claimed window and all
+        receipts = bwkit.read_jsonl(lab.payer.path("receipts.jsonl"))[0]
+        acks = bwkit.read_jsonl(lab.hop.path("acks.jsonl"))[0]
+        prepay = bwkit.read_jsonl(lab.mint.path("prepay.jsonl"))[0]
+        entries, rep = bwkit.rebuild(receipts, acks, [], 0.1, 0.05, prepay=prepay)
+        self.assertEqual((rep["settlements"], rep["prepay"]), (2, 5))          # a deposit, three locks, a claim
+        agree, verdict, lines = bwkit.compare(entries, lab.mint.ledger_lines())
+        self.assertTrue(agree, (verdict, lines))
+        without, _ = bwkit.rebuild(receipts, acks, [], 0.1, 0.05)
+        agree, verdict, lines = bwkit.compare(without, lab.mint.ledger_lines())
+        self.assertFalse(agree)                                             # without the registry the covered window and the claim are not rebuilt
+        # a changed lock in the registry fails its countersignature and is left out
+        bad = list(prepay); bad[1] = (2, dict(prepay[1][1], amount=1))
+        entries, rep = bwkit.rebuild(receipts, acks, [], 0.1, 0.05, prepay=bad)
+        self.assertEqual(rep["bad"], ["prepay.jsonl line 2: id is not the hash of the record"])   # changed, so its id no longer fits; left out and named
+        bad[1] = (2, dict(prepay[1][1], mint_sig=prepay[1][1]["mint_sig"][:-4] + "AAAA"))
+        entries, rep = bwkit.rebuild(receipts, acks, [], 0.1, 0.05, prepay=bad)
+        self.assertEqual(rep["bad"], ["prepay.jsonl line 2: a lock in the registry carries the Mint's countersignature"])   # a countersignature that fails
 
     def test_shapes_are_refused_with_the_reason(self):
         lab = self.lab
@@ -1321,14 +1403,14 @@ class Owed(unittest.TestCase):
         self.assertIn("3 windows (1 disputed), 2.50 GB, $0.2500: the relay's $0.2375, the Steward's $0.0125", mint_line)
         rc, text = cli(["owed", month], hop_env(lab))
         self.assertEqual(rc, 0, text)
-        self.assertIn("from my own copies: 3 receipts and 3 acks under 0 announcements and 0 purchases (my own announcements; from the Mint through this node: purchases, the invoice) rebuilt into 3 settlements, 3 of them mine in " + month, text)
+        self.assertIn("from my own copies: 3 receipts and 3 acks under 0 announcements and 0 purchases (my own announcements; from the Mint through this node: purchases, the invoice, the prepayment registry) rebuilt into 3 settlements, 3 of them mine in " + month, text)
         self.assertIn(mint_line, text)                              # the hop prints the Mint's line from its own copies
         self.assertIn("%s  owed to me, the relay's share of every line: $0.2375" % month, text)
         self.assertIn("matches the Mint's invoice, figure for figure: the relay's $0.2375", text)
         self.assertNotIn("no purchases at hand", text)              # the Mint's registry was read; it is empty
         rc, text = cli(["owed", month], payer_env(lab))
         self.assertEqual(rc, 0, text)
-        self.assertIn("from the Mint through this node: purchases, announcements, the invoice", text)
+        self.assertIn("from the Mint through this node: purchases, announcements, the invoice, the prepayment registry", text)
         self.assertIn(mint_line, text)
         self.assertIn("%s  I owe, carriage and premiums of every line: $0.2500" % month, text)
         self.assertIn("matches the Mint's invoice, figure for figure: I owe $0.2500", text)
@@ -1385,7 +1467,7 @@ class Owed(unittest.TestCase):
         self.assertIn("+ $0.0024 premium on 2 purchased windows", mint_text)
         rc, text = cli(["owed", month], hop_env(lab))
         self.assertEqual(rc, 0, text)
-        self.assertIn("from the Mint through this node: purchases, the invoice", text)
+        self.assertIn("from the Mint through this node: purchases, the invoice, the prepayment registry", text)
         self.assertIn("+ $0.0024 premium on 2 purchased windows ($0.0000 of it the Steward's)", text)
         self.assertIn("returned to bw-house on short windows: $0.0006", text)
         self.assertIn("matches the Mint's invoice, figure for figure", text)
@@ -1872,7 +1954,7 @@ class Vectors(unittest.TestCase):
         self.assertEqual(set(files), {"keys.json", "receipt.json", "ack.json", "link.json", "deposit.json", "lock.json", "claim.json", "settlement-default.json",
                                       "settlement-disputed.json", "settlement-settled.json", "purchase.json", "settlement-purchased.json",
                                       "commitment.json", "proof.json", "rebuild/receipts.jsonl", "rebuild/acks.jsonl",
-                                      "rebuild/links.jsonl", "rebuild/purchases.jsonl", "rebuild/ledger.jsonl"})
+                                      "rebuild/links.jsonl", "rebuild/purchases.jsonl", "rebuild/prepay.jsonl", "rebuild/ledger.jsonl"})
         sp = files["settlement-purchased.json"]
         self.assertEqual((sp["purchase"], sp["premium_usd"], sp["from_poster_usd"], sp["from_steward_usd"], sp["refund_usd"], sp["fee_usd"]),
                          (files["purchase.json"]["id"], 0.0006, 0.0006, 0.0, 0.0, 0.00033))
