@@ -29,6 +29,16 @@
   "payer": "vec-payer"
  },
  "note": "Test-only seeds; never use these keys on a node. Timestamps are fixed; T0 is an hour boundary.",
+ "prepay": {
+  "claim_at": 1800010800,
+  "claim_bytes": 1000000,
+  "deposit": 50000,
+  "deposit_at": 1800000100,
+  "lock_amount": 12500,
+  "lock_at": 1800003590,
+  "lock_window": 1,
+  "note": "test only"
+ },
  "price_usd_per_gb": 0.1,
  "proto": 1,
  "purchase": {

@@ -1,0 +1,12 @@
+{
+ "bytes": 1000000,
+ "hop": "ed25519:7NXLckho5kxw7Bht2Dcjv_v4-ShUgY1sAdYX3V0RVec",
+ "id": "a677b54d2c685bdef37ac04ba05cf4856d66409a6aff47b7df5fa92e64740f69",
+ "kind": "claim",
+ "lock": "4b8f4e87e21495287498a351daf2902421909bbdbb7592780e85fe465961669e",
+ "meter": null,
+ "payer": "ed25519:IGSk-aXtuMXYJ8tMVPFTPqR2hXXtCjkDgRKur2IWVuM",
+ "posted_at": 1800010800,
+ "proto": 1,
+ "sig": "j19YmHtW__Q4sOLnh8Z9TysJpVmfdG4gJYliogcIsAm6VoMzVxf3dAzK-ls0G-S3Q2oZzlzctnoK2Uk21iC7Bw"
+}

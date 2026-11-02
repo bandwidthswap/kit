@@ -74,6 +74,9 @@ def inputs():
                      "posted_at": T0 + 12700, "steward_margin": 0.01},    # governs the seventh window, the one ending after it
         "standalone": {"receipt": 1, "settlement-default": 0, "settlement-disputed": 1, "settlement-settled": 5, "link": 0,
                        "settlement-purchased": 6, "commitment_hour": T0 + 10800},
+        "prepay": {"deposit": 50_000, "deposit_at": T0 + 100, "note": "test only",          # micro-USD (spec, Section 16)
+                   "lock_window": 1, "lock_amount": 12_500, "lock_at": T0 + 3590,
+                   "claim_bytes": 1_000_000, "claim_at": T0 + 3600 + 7200},
         "rebuild_at": T0 + 20000,
     }
 
@@ -131,8 +134,24 @@ def generate(inp):
                               [(i + 1, l) for i, l in enumerate(links)],
                               inp["price_usd_per_gb"], inp["steward_fee"], inp["rebuild_at"],
                               purchases=[(1, purchase)], steward_margin=pu["steward_margin"])
+    pp = inp["prepay"]
+    body = {"kind": "deposit", "proto": 1, "mint": nym["mint"], "payer": nym["payer"], "amount": pp["deposit"], "unit": "USD",
+            "posted_at": pp["deposit_at"], "note": pp["note"]}
+    deposit = dict(body, id=bwkit.prepay_id(body)); deposit["sig"] = bwkit.sign_prepay(priv["mint"], deposit)
+    lw = inp["windows"][pp["lock_window"]]
+    lk = bwkit.link_in_force(links, nym["payer"], nym["hop"], lw["t_first"])
+    body = {"kind": "lock", "proto": 1, "payer": nym["payer"], "hop": nym["hop"], "t_first": lw["t_first"], "amount": pp["lock_amount"],
+            "unit": "USD", "carry": 0, "link": bwkit.link_hash(lk) if lk else None, "posted_at": pp["lock_at"]}
+    lock = dict(body, id=bwkit.prepay_id(body)); lock["sig"] = bwkit.sign_prepay(priv["payer"], lock)
+    lock["mint"] = nym["mint"]; lock["mint_sig"] = bwkit.sign_lock_mint(priv["mint"], lock)
+    body = {"kind": "claim", "proto": 1, "hop": nym["hop"], "payer": nym["payer"], "lock": lock["id"], "bytes": pp["claim_bytes"],
+            "meter": None, "posted_at": pp["claim_at"]}
+    claim = dict(body, id=bwkit.prepay_id(body)); claim["sig"] = bwkit.sign_prepay(priv["hop"], claim)
     return {
         "keys.json": {r: {"seed": inp["seeds"][r], "nym": nym[r], "name": names[r]} for r in ROLES},
+        "deposit.json": deposit,
+        "lock.json": lock,
+        "claim.json": claim,
         "receipt.json": receipts[sa["receipt"]],
         "ack.json": acks[sa["receipt"]],
         "link.json": links[sa["link"]],
@@ -173,6 +192,7 @@ exactly these files.
 | `keys.json` | the three NYMs with their seeds and names |
 | `receipt.json`, `ack.json` | the second window's receipt and acknowledgement |
 | `link.json` | the first announcement (any payer, 10% margin, since T0+3600) |
+| `deposit.json`, `lock.json`, `claim.json` | prepayment (Section 16): a deposit the Mint signs, a lock the payer signs and the Mint countersigns (the second window, under the first announcement), a claim the hop signs on that lock; amounts in micro-USD |
 | `settlement-default.json` | the first window, no announcement in force |
 | `settlement-disputed.json` | the second window, under the first announcement |
 | `settlement-settled.json` | the sixth window, under the second announcement (price 0.2, margin 5%) |

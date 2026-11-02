@@ -1097,6 +1097,134 @@ class PaidMark(unittest.TestCase):
         self.assertIn("only the Mint keeps the paid mark", str(cm.exception))
 
 
+class Prepay(unittest.TestCase):
+    """Prepayment, step 1 (spec, Section 16): deposits the Mint signs, locks the payer posts and the Mint countersigns, claims
+    the hop posts, the registry and the balance. Settlement against a lock is step 2 and is not here."""
+
+    def setUp(self):
+        self.lab = Lab()
+
+    def tearDown(self):
+        self.lab.close()
+
+    def post(self, rec):
+        return bwkit.http_post(self.lab.mint_url + "/prepay", rec)
+
+    def signed(self, priv, body):
+        rec = dict(body, id=bwkit.prepay_id(body))
+        rec["sig"] = bwkit.sign_prepay(priv, rec)
+        return rec
+
+    def lock_body(self, t_first, amount, link=None, now=None):
+        lab = self.lab
+        return {"kind": "lock", "proto": 1, "payer": lab.payer.nym, "hop": lab.hop.nym, "t_first": t_first, "amount": amount,
+                "unit": "USD", "carry": 0, "link": link, "posted_at": int(now if now is not None else time.time())}
+
+    def test_deposit_lock_balance_and_claim(self):
+        lab = self.lab
+        now = int(time.time())
+        # nothing yet
+        self.assertEqual(json.loads(bwkit.http_get(lab.mint_url + "/balance?payer=bw-house")[1]),
+                         {"payer": lab.payer.nym, "unit": "USD", "deposits": 0, "locked": 0, "debited": 0, "balance": 0, "open_locks": []})
+        rc, text = cli(["prepay", "list"], mint_env(lab))
+        self.assertIn("no deposit, lock or claim held", text)
+        # the operator's deposit: signed by the Mint, kept, served, on the balance in micro-units
+        lab.mint.config["steward_mint"] = lab.mint_url                 # the command posts through the Mint's own server
+        rc, text = cli(["deposit", "bw-house", "0.05", "a dollar's twentieth, in cash"], mint_env(lab))
+        self.assertEqual(rc, 0, text)
+        self.assertIn("$0.050000 for bw-house (a dollar's twentieth, in cash); balance now $0.050000", text)
+        lines = [json.loads(l) for l in bwkit.http_get(lab.mint_url + "/prepay")[1].splitlines() if l]
+        self.assertEqual([(r["kind"], r["amount"], r["mint"], r["payer"]) for r in lines], [("deposit", 50000, lab.mint.nym, lab.payer.nym)])
+        bwkit.check_prepay(lines[0]); self.assertTrue(bwkit.verify_prepay(lines[0]))
+        bal = json.loads(bwkit.http_get(lab.mint_url + "/balance?payer=" + lab.payer.nym)[1])
+        self.assertEqual((bal["deposits"], bal["balance"]), (50000, 50000))
+        # a deposit someone else signed, or for no peer, is refused; a backdated one too
+        body = {"kind": "deposit", "proto": 1, "mint": lab.mint.nym, "payer": lab.payer.nym, "amount": 1, "unit": "USD", "posted_at": now, "note": "forged"}
+        status, ans = self.post(self.signed(lab.payer.priv, body))
+        self.assertEqual((status, ans["error"]), (400, "bad signature"))
+        body = {"kind": "deposit", "proto": 1, "mint": lab.mint.nym, "payer": "ed25519:" + "A" * 43, "amount": 1, "unit": "USD", "posted_at": now, "note": "x"}
+        status, ans = self.post(self.signed(lab.mint.priv, body))
+        self.assertEqual((status, ans["error"]), (403, "unknown payer ed25519:" + "A" * 43))
+        status, ans = self.post(self.signed(lab.mint.priv, dict(body, payer=lab.payer.nym, posted_at=now - 600)))
+        self.assertEqual((status, ans["error"]), (409, "since"))
+        # a lock for the window about to open: countersigned by the Mint, on the balance
+        t_first = now - now % 3600 + 3600
+        rec = self.signed(lab.payer.priv, self.lock_body(t_first, 12500, now=now))
+        status, ans = self.post(rec)
+        self.assertEqual(status, 200, ans)
+        held = ans["record"]
+        self.assertEqual((ans["stored"], held["mint"], held["amount"]), (rec["id"], lab.mint.nym, 12500))
+        bwkit.check_prepay(held)
+        self.assertTrue(bwkit.verify_prepay(held) and bwkit.verify_lock_mint(held))
+        self.assertFalse(bwkit.verify_lock_mint(dict(held, amount=12501)))
+        bal = json.loads(bwkit.http_get(lab.mint_url + "/balance?payer=bw-house")[1])
+        self.assertEqual((bal["locked"], bal["balance"], [(l["hop"], l["t_first"], l["amount"]) for l in bal["open_locks"]]),
+                         (12500, 37500, [(lab.hop.nym, t_first, 12500)]))
+        # the hop reads the balance through its proxy
+        self.assertEqual(json.loads(bwkit.http_get(lab.hop_url + "/mint/balance?payer=bw-house")[1]), bal)
+        # refusals: the same window again, more than the balance, a window too far off, the wrong announcement, a stranger, a lock sent already countersigned
+        status, ans = self.post(self.signed(lab.payer.priv, self.lock_body(t_first, 1, now=now + 1)))
+        self.assertEqual((status, ans["error"]), (409, "duplicate"))
+        status, ans = self.post(self.signed(lab.payer.priv, self.lock_body(now + 1, 40000, now=now + 1)))   # a window starting now, as a forced one does
+        self.assertEqual((status, ans["error"]), (409, "balance"))
+        self.assertIn("$0.037500 on hand, $0.040000 asked", ans["detail"])
+        status, ans = self.post(self.signed(lab.payer.priv, self.lock_body(t_first + 7200, 1, now=now + 1)))
+        self.assertEqual((status, ans["error"]), (409, "since"))
+        status, ans = self.post(self.signed(lab.payer.priv, self.lock_body(now + 2, 1, link="0" * 64, now=now + 1)))
+        self.assertEqual((status, ans["error"]), (409, "route"))
+        status, ans = self.post(self.signed(lab.hop.priv, dict(self.lock_body(t_first, 1, now=now + 1), payer=lab.hop.nym)))
+        self.assertEqual((status, ans["error"]), (409, "balance"))       # a peer with no deposit: nothing on hand
+        status, ans = self.post(held)
+        self.assertEqual((status, ans["error"]), (409, "duplicate"))
+        # a claim: not before two windows have passed, then kept; not twice; not on a lock not held
+        claim = {"kind": "claim", "proto": 1, "hop": lab.hop.nym, "payer": lab.payer.nym, "lock": rec["id"], "bytes": 1_000_000, "meter": None, "posted_at": now}
+        status, ans = self.post(self.signed(lab.hop.priv, claim))
+        self.assertEqual((status, ans["error"]), (409, "since"))
+        self.assertIn("a claim waits 7200 s", ans["detail"])
+        late = now + 3 * 3600 + 7200
+        with mock.patch("time.time", return_value=late):
+            status, ans = self.post(self.signed(lab.hop.priv, dict(claim, posted_at=late)))
+            self.assertEqual(status, 200, ans)
+            status, ans = self.post(self.signed(lab.hop.priv, dict(claim, posted_at=late + 1)))
+            self.assertEqual((status, ans["error"]), (409, "duplicate"))
+            status, ans = self.post(self.signed(lab.hop.priv, dict(claim, lock="f" * 64, posted_at=late + 1)))
+            self.assertEqual((status, ans["error"]), (409, "route"))
+        # the registry and the balances, as the operator reads them; the index survives a reload
+        rc, text = cli(["prepay", "list"], mint_env(lab))
+        self.assertEqual(rc, 0)
+        self.assertIn("deposit %s  $0.050000 for bw-house: a dollar's twentieth, in cash" % lines[0]["id"][:16], text)
+        self.assertIn("lock    %s  $0.012500 by bw-house with bw-forest for the window at" % rec["id"][:16], text)
+        self.assertIn(", countersigned", text)
+        self.assertIn("claim   ", text); self.assertIn("bw-forest counts 1000000 bytes on lock %s of bw-house" % rec["id"][:16], text)
+        rc, text = cli(["prepay", "balance"], mint_env(lab))
+        self.assertIn("bw-house  deposits $0.050000  locked $0.012500 (1 open)  debited $0.000000  balance $0.037500", text)
+        lab.mint.load_index()
+        self.assertEqual(lab.mint.prepay_balance(lab.payer.nym)["balance"], 37500)
+        self.assertEqual(sorted(lab.mint.index["prepay"]["claims"]), [rec["id"]])
+
+    def test_shapes_are_refused_with_the_reason(self):
+        lab = self.lab
+        now = int(time.time())
+        good = self.signed(lab.mint.priv, {"kind": "deposit", "proto": 1, "mint": lab.mint.nym, "payer": lab.payer.nym, "amount": 5, "unit": "USD", "posted_at": now, "note": ""})
+        bwkit.check_prepay(good)
+        for change, words in ((dict(amount=0), "amount must be a positive integer"), (dict(amount=0.5), "amount must be a positive integer"),
+                              (dict(unit="EUR"), "unit must be USD"), (dict(note="n" * 201), "at most 200"), (dict(extra=1), "exactly the fields"),
+                              (dict(id="0" * 64), "id is not the hash")):
+            with self.assertRaises(ValueError) as cm:
+                bwkit.check_prepay(dict(good, **change))
+            self.assertIn(words, str(cm.exception), change)
+        status, ans = self.post(dict(good, amount=7))
+        self.assertEqual(status, 400)
+        with self.assertRaises(ValueError):
+            bwkit.check_prepay(dict(self.lock_body(now, 1), id="0" * 64, sig="x", mint=lab.mint.nym))   # mint without mint_sig
+        with self.assertRaises(ValueError):
+            bwkit.check_prepay({"kind": "release"})
+        with self.assertRaises(SystemExit):
+            cli(["deposit", "bw-house", "0", "nothing"], mint_env(lab))
+        with self.assertRaises(SystemExit):
+            cli(["deposit", "bw-house", "1", "x"], hop_env(lab))
+
+
 class SettleWindow(unittest.TestCase):
     """`bwkit settle --window`: one window resolved from a node's own copies alone, by the Mint's rule."""
 
@@ -1741,7 +1869,7 @@ class Vectors(unittest.TestCase):
     def test_the_committed_vectors_are_what_the_kit_writes(self):
         self.assertEqual(self.vectors.check(), [])
         files = self.vectors.generate(self.vectors.inputs())
-        self.assertEqual(set(files), {"keys.json", "receipt.json", "ack.json", "link.json", "settlement-default.json",
+        self.assertEqual(set(files), {"keys.json", "receipt.json", "ack.json", "link.json", "deposit.json", "lock.json", "claim.json", "settlement-default.json",
                                       "settlement-disputed.json", "settlement-settled.json", "purchase.json", "settlement-purchased.json",
                                       "commitment.json", "proof.json", "rebuild/receipts.jsonl", "rebuild/acks.jsonl",
                                       "rebuild/links.jsonl", "rebuild/purchases.jsonl", "rebuild/ledger.jsonl"})
@@ -2416,10 +2544,10 @@ class Served(unittest.TestCase):
         self.lab.close()
 
     PAGE = ("/", "/fleet", "/snapshot", "/dash/data.js", "/dash/bsp.js", "/dash/style.css", "/dash/nothing.js", "/nothing")
-    PATHS = {"mint": ("/status", "/ledger", "/ledger?since=1", "/commitments", "/purchases", "/links", "/map", "/steward", "/steward/history", "/proof?window=1800000000",
+    PATHS = {"mint": ("/status", "/ledger", "/ledger?since=1", "/commitments", "/purchases", "/links", "/map", "/steward", "/steward/history", "/prepay", "/balance?payer=bw-house", "/proof?window=1800000000",
                       "/proof?window=x") + PAGE,
              "hop": ("/status", "/purchases", "/map", "/ledger", "/acks", "/receipts", "/links", "/outbox", "/mint/ledger", "/mint/commitments",
-                     "/mint/links", "/mint/proof?window=1800000000", "/mint/map") + PAGE,
+                     "/mint/links", "/mint/proof?window=1800000000", "/mint/map", "/mint/balance?payer=bw-house", "/mint/prepay") + PAGE,
              "payer": ("/status", "/purchases", "/map", "/acks", "/receipts", "/outbox", "/mint/ledger?since=1", "/mint/commitments") + PAGE}
 
     def test_every_get_is_cors_open_and_address_free(self):

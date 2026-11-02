@@ -98,6 +98,15 @@ def main(argv=None):
     if "purchase.json" in got:
         checks.append(("purchase.json signed by the payer, id the hash of the record", lambda: (bwkit.check_purchase(got["purchase.json"]), bwkit.verify_purchase(got["purchase.json"]))[1]
                        and got["purchase.json"]["poster"] == nym["payer"]))
+    if "deposit.json" in got:
+        checks.append(("deposit.json signed by the Mint, id the hash of the record", lambda: (bwkit.check_prepay(got["deposit.json"]), bwkit.verify_prepay(got["deposit.json"]))[1]
+                       and got["deposit.json"]["mint"] == nym["mint"]))
+    if "lock.json" in got:
+        checks.append(("lock.json signed by the payer and countersigned by the Mint", lambda: (bwkit.check_prepay(got["lock.json"]), bwkit.verify_prepay(got["lock.json"]))[1]
+                       and bwkit.verify_lock_mint(got["lock.json"]) and got["lock.json"]["mint"] == nym["mint"]))
+    if "claim.json" in got:
+        checks.append(("claim.json signed by the hop, on lock.json", lambda: (bwkit.check_prepay(got["claim.json"]), bwkit.verify_prepay(got["claim.json"]))[1]
+                       and got["claim.json"]["lock"] == got["lock.json"]["id"]))
     if "receipt.json" in got:
         checks.append(("receipt.json signed by the payer", lambda: bwkit.check_envelope(got["receipt.json"]) == nym["payer"]))
     if "ack.json" in got:

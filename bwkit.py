@@ -127,6 +127,17 @@ CLOSE_DOMAIN = b"bandwidthswap/close/v1\n"    # a poster withdraws its own purch
 TOPUP_FIELDS = ("kind", "proto", "id", "poster", "purchase", "escrow", "posted_at", "sig")
 CLOSE_FIELDS = ("kind", "proto", "id", "poster", "purchase", "posted_at", "sig")
 PURCHASE_KEYS = ("purchase", "match", "premium_usd", "refund_usd", "from_poster_usd", "from_steward_usd", "steward_held_usd")
+MICRO = 10 ** 6                         # prepayment amounts are integers in micro-units of USD (spec, Section 16)
+DEPOSIT_DOMAIN = b"bandwidthswap/deposit/v1\n"      # value entering a payer's balance at the Mint, signed by the Mint
+LOCK_DOMAIN = b"bandwidthswap/lock/v1\n"            # a payer's reservation of one window's value with one hop
+LOCK_MINT_DOMAIN = b"bandwidthswap/lock/v1/mint\n"  # the Mint's countersignature over the lock, sig included
+CLAIM_DOMAIN = b"bandwidthswap/claim/v1\n"          # a hop's count for a window the payer never closed
+DEPOSIT_FIELDS = ("kind", "proto", "id", "mint", "payer", "amount", "unit", "posted_at", "note", "sig")
+LOCK_FIELDS = ("kind", "proto", "id", "payer", "hop", "t_first", "amount", "unit", "carry", "link", "posted_at", "sig")
+LOCK_MINT_FIELDS = ("mint", "mint_sig")             # added by the Mint when it registers a lock
+CLAIM_FIELDS = ("kind", "proto", "id", "hop", "payer", "lock", "bytes", "meter", "posted_at", "sig")
+PREPAY_KINDS = ("deposit", "lock", "claim")
+LOCK_AHEAD_S = 3600                     # a lock names the window about to open: t_first within one window of the Mint's clock
 DEFAULT_STEWARD = {                     # the Steward's parameters (paper, Section 7; the mockup's values), under "steward" in the Mint's config
     "m": 0.04, "margin": 0.01, "program_window_s": 7 * 86400, "first_link_usd": 1.0, "first_link_premium": 0.05,
     "min_payer_age_s": 86400, "bounty_deadline_s": 7 * 86400,
@@ -139,7 +150,7 @@ DASHBOARD_TYPES = {".html": "text/html; charset=utf-8", ".css": "text/css; chars
 DASHBOARD_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")      # a file of the directory itself, never a path
 SNAPSHOT_PROOFS = {"mint": 24, "hop": 2, "payer": 2}  # how many committed hours' proofs a snapshot embeds: the Mint's own are cheap, a node's come over the wire
 BSP_MODULE = """<script type="module">import * as bsp from './dash/bsp.js'; window.bsp = bsp;</script>"""   # index.html's verifier line
-DECLINE_WORDS = ("clock", "patience", "since", "domain", "profile", "replay", "route")   # 409 reasons, the word before the colon
+DECLINE_WORDS = ("clock", "patience", "since", "domain", "profile", "replay", "route", "duplicate", "balance")   # 409 reasons, the word before the colon
 TOKEN_RE = re.compile(r"^[a-z0-9-]{1,32}$")   # a medium or range class
 HTTP_TIMEOUT_S = 10
 MINT_INFO_S = (600, 60)                 # a hop or payer re-reads its Mint's name and NYM this often: after an answer, after none
@@ -1073,6 +1084,121 @@ def parse_hour(text):
     return t - t % 3600
 
 
+# ---------------------------------------------------------------- prepayment (spec, Section 16; step 1: the records and the registry)
+
+def is_hex64(x):
+    return isinstance(x, str) and len(x) == 64 and all(c in "0123456789abcdef" for c in x)
+
+
+def prepay_body(rec):
+    """The signed part of a prepayment record: without id and sig, and without the Mint's countersignature on a lock."""
+    return {k: v for k, v in rec.items() if k not in ("id", "sig") + LOCK_MINT_FIELDS}
+
+
+def prepay_id(body):
+    """A prepayment record's id: the SHA-256 of the canonical JSON of the record without id and sig (and the Mint's countersignature)."""
+    return hashlib.sha256(canon_json(prepay_body(body)).encode()).hexdigest()
+
+
+def prepay_domain(kind):
+    return {"deposit": DEPOSIT_DOMAIN, "lock": LOCK_DOMAIN, "claim": CLAIM_DOMAIN}[kind]
+
+
+def prepay_signer(rec):
+    """Who signs each kind: the Mint a deposit, the payer a lock, the hop a claim."""
+    return rec[{"deposit": "mint", "lock": "payer", "claim": "hop"}[rec["kind"]]]
+
+
+def sign_prepay(priv, body):
+    return b64u(priv.sign(prepay_domain(body["kind"]) + canon_json(prepay_body(body)).encode()))
+
+
+def verify_prepay(rec):
+    """True when rec carries its signer's signature (the deposit's Mint, the lock's payer, the claim's hop)."""
+    try:
+        pub_of_nym(prepay_signer(rec)).verify(b64u_dec(rec["sig"]), prepay_domain(rec["kind"]) + canon_json(prepay_body(rec)).encode())
+        return True
+    except (InvalidSignature, ValueError, KeyError, TypeError):
+        return False
+
+
+def sign_lock_mint(priv, rec):
+    """The Mint's countersignature on a registered lock: over the lock with the payer's sig, without mint and mint_sig."""
+    return b64u(priv.sign(LOCK_MINT_DOMAIN + canon_json({k: v for k, v in rec.items() if k not in LOCK_MINT_FIELDS}).encode()))
+
+
+def verify_lock_mint(rec):
+    """True when a lock carries the countersignature of the Mint it names."""
+    try:
+        pub_of_nym(rec["mint"]).verify(b64u_dec(rec["mint_sig"]),
+                                       LOCK_MINT_DOMAIN + canon_json({k: v for k, v in rec.items() if k not in LOCK_MINT_FIELDS}).encode())
+        return True
+    except (InvalidSignature, ValueError, KeyError, TypeError):
+        return False
+
+
+def _check_micro(v, what, positive=True):
+    if not is_int(v) or v < 0 or (positive and v == 0):
+        raise ValueError("%s must be a %s integer, in micro-units" % (what, "positive" if positive else "non-negative"))
+
+
+def check_prepay(rec):
+    """Raise ValueError unless rec is a well-formed deposit, lock or claim with its own id (spec, Section 16). Signatures not checked."""
+    if not isinstance(rec, dict) or rec.get("kind") not in PREPAY_KINDS:
+        raise ValueError("kind must be one of %s" % ", ".join(PREPAY_KINDS))
+    kind = rec["kind"]
+    fields = {"deposit": DEPOSIT_FIELDS, "lock": LOCK_FIELDS, "claim": CLAIM_FIELDS}[kind]
+    have = set(rec)
+    if kind == "lock" and have >= set(LOCK_MINT_FIELDS):
+        have -= set(LOCK_MINT_FIELDS)
+    elif kind == "lock" and have & set(LOCK_MINT_FIELDS):
+        raise ValueError("a registered lock carries both mint and mint_sig")
+    if have != set(fields):
+        raise ValueError("a %s has exactly the fields %s%s" % (kind, ", ".join(fields), " (plus mint and mint_sig once registered)" if kind == "lock" else ""))
+    check_proto(rec)
+    if not is_int(rec["posted_at"]) or rec["posted_at"] < 0:
+        raise ValueError("posted_at must be a non-negative integer")
+    if kind == "deposit":
+        pub_of_nym(rec["mint"])
+        pub_of_nym(rec["payer"])
+        _check_micro(rec["amount"], "amount")
+        if rec["unit"] != "USD":
+            raise ValueError("unit must be USD in profile 1")
+        if not isinstance(rec["note"], str) or len(rec["note"]) > 200:
+            raise ValueError("note is a string of at most 200 characters")
+    elif kind == "lock":
+        pub_of_nym(rec["payer"])
+        pub_of_nym(rec["hop"])
+        if not is_int(rec["t_first"]) or rec["t_first"] < 0:
+            raise ValueError("t_first must be a non-negative integer")
+        _check_micro(rec["amount"], "amount")
+        _check_micro(rec["carry"], "carry", positive=False)
+        if rec["unit"] != "USD":
+            raise ValueError("unit must be USD in profile 1")
+        if rec["link"] is not None and not is_hex64(rec["link"]):
+            raise ValueError("link is an announcement's hash, or null")
+        if "mint" in rec:
+            pub_of_nym(rec["mint"])
+            if not isinstance(rec["mint_sig"], str):
+                raise ValueError("mint_sig is a string")
+    else:
+        pub_of_nym(rec["hop"])
+        pub_of_nym(rec["payer"])
+        if not is_hex64(rec["lock"]):
+            raise ValueError("lock is a lock's id")
+        if not is_int(rec["bytes"]) or rec["bytes"] < 0:
+            raise ValueError("bytes must be a non-negative integer")
+        if rec["meter"] is not None and not isinstance(rec["meter"], dict):
+            raise ValueError("meter is the hop's sample pair, or null")
+    if rec["id"] != prepay_id(rec):
+        raise ValueError("id is not the hash of the record")
+
+
+def micro_usd(n):
+    """An integer in micro-units as dollars, six places."""
+    return "$%.6f" % (n / MICRO)
+
+
 # ---------------------------------------------------------------- the rebuild
 
 def read_jsonl(path):
@@ -1960,6 +2086,9 @@ class Node:
               "steward_nym": self.steward_nym()}
         for rec in self.load_purchases(skip_partial):
             ix["book"].add(rec)
+        ix["prepay"] = {"ids": set(), "deposits": [], "locks": {}, "lock_by_window": {}, "claims": {}}
+        for rec in self.load_prepay(skip_partial):
+            self._index_prepay(ix, rec)
         for entry in self.read_lines("ledger.jsonl", skip_partial):
             self._index_line(ix, entry)
         self.index = ix
@@ -2143,6 +2272,117 @@ class Node:
             rec["id"][:16], rec["program"], peers.get(rec["poster"], "the Steward" if rec["poster"] == steward else rec["poster"]),
             rec["route"]["from"], rec["route"]["to"], rec["min_bytes"], rec["premium_per_gb"], rec["windows"], rec["escrow"], rec["deadline"]))
         return rec["id"]
+
+    # prepayment (spec, Section 16; step 1 of the build: the records and the registry, the balance; settlement, expiry and the
+    # claimed settlement are step 2, the payer's lock step 3, the hop's gate step 4)
+
+    def load_prepay(self, skip_partial=False):
+        return self.read_lines("prepay.jsonl", skip_partial)
+
+    @staticmethod
+    def _index_prepay(ix, rec):
+        p = ix["prepay"]
+        if not isinstance(rec, dict) or rec.get("kind") not in PREPAY_KINDS or rec.get("id") in p["ids"]:
+            return
+        p["ids"].add(rec["id"])
+        if rec["kind"] == "deposit":
+            p["deposits"].append(rec)
+        elif rec["kind"] == "lock":
+            p["locks"][rec["id"]] = rec
+            p["lock_by_window"][(rec["payer"], rec["hop"], rec["t_first"])] = rec
+        else:
+            p["claims"][rec["lock"]] = rec
+
+    def prepay_balance(self, payer):
+        """A payer's balance at this Mint, every amount an integer in micro-units: deposits less open locks less debits.
+
+        Step 1 holds no debits: a lock stays open until step 2 settles, releases or claims it.
+        """
+        p = self.index["prepay"]
+        deposits = sum(d["amount"] for d in p["deposits"] if d["payer"] == payer)
+        open_locks = sorted((l for l in p["locks"].values() if l["payer"] == payer), key=lambda l: (l["t_first"], l["id"]))
+        locked = sum(l["amount"] for l in open_locks)
+        debited = 0
+        return {"payer": payer, "unit": "USD", "deposits": deposits, "locked": locked, "debited": debited,
+                "balance": deposits - locked - debited,
+                "open_locks": [{"id": l["id"], "hop": l["hop"], "t_first": l["t_first"], "amount": l["amount"]} for l in open_locks]}
+
+    def prepay_payers(self):
+        """Every payer with a deposit or a lock at this Mint."""
+        p = self.index["prepay"]
+        return sorted({d["payer"] for d in p["deposits"]} | {l["payer"] for l in p["locks"].values()})
+
+    def register_prepay(self, rec, now=None):
+        """The Mint's /prepay (spec, Section 16): a deposit, a lock or a claim. Appends it to prepay.jsonl, returns the record as stored.
+
+        A lock comes back with the Mint's countersignature (mint, mint_sig), which is what the payer carries to the hop.
+        """
+        now = int(now if now is not None else time.time())
+        if self.index is None:
+            self.load_index()
+        check_prepay(rec)
+        if not verify_prepay(rec):
+            raise ValueError("bad signature")
+        peers = self.peers()
+        p = self.index["prepay"]
+        with self.lock:
+            if rec["id"] in p["ids"]:
+                raise Decline("duplicate")
+            if rec["posted_at"] < now - CLOCK_TOLERANCE_S:
+                raise Decline("since: posted_at %d is in the past (the Mint's clock is %d); a %s cannot be backdated" % (rec["posted_at"], now, rec["kind"]))
+            if rec["kind"] == "deposit":
+                if rec["mint"] != self.nym:
+                    raise Decline("unknown mint %s: a deposit is signed by this Mint, %s" % (rec["mint"][:20], self.nym[:20]))
+                if rec["payer"] not in peers:
+                    raise Decline("unknown payer %s" % rec["payer"])
+                stored = rec
+            elif rec["kind"] == "lock":
+                if "mint" in rec:
+                    raise Decline("route: a lock is posted before the Mint has countersigned it")
+                if rec["payer"] not in peers:
+                    raise Decline("unknown payer %s" % rec["payer"])
+                if rec["hop"] not in peers:
+                    raise Decline("unknown hop %s" % rec["hop"])
+                if not now - CLOCK_TOLERANCE_S <= rec["t_first"] <= now + LOCK_AHEAD_S + CLOCK_TOLERANCE_S:
+                    raise Decline("since: a lock names the window about to open; t_first %d against the Mint's clock %d" % (rec["t_first"], now))
+                if (rec["payer"], rec["hop"], rec["t_first"]) in p["lock_by_window"]:
+                    raise Decline("duplicate: a lock for that window with that hop is held")
+                link = link_in_force(self.index["links"], rec["payer"], rec["hop"], rec["t_first"])
+                want = link_hash(link) if link else None
+                if rec["link"] != want:
+                    raise Decline("route: the announcement in force at %d is %s, not %s" % (rec["t_first"], want[:16] if want else "none", rec["link"][:16] if rec["link"] else "none"))
+                bal = self.prepay_balance(rec["payer"])
+                if bal["balance"] < rec["amount"]:
+                    raise Decline("balance: %s on hand, %s asked (deposits %s, locked %s, debited %s)" % (
+                        micro_usd(bal["balance"]), micro_usd(rec["amount"]), micro_usd(bal["deposits"]), micro_usd(bal["locked"]), micro_usd(bal["debited"])))
+                stored = dict(rec, mint=self.nym)
+                stored["mint_sig"] = sign_lock_mint(self.priv, stored)
+            else:
+                lock = p["locks"].get(rec["lock"])
+                if lock is None:
+                    raise Decline("route: no lock %s is held" % rec["lock"][:16])
+                if rec["hop"] != lock["hop"] or rec["payer"] != lock["payer"]:
+                    raise Decline("route: the claim's hop and payer are not the lock's")
+                if any(s["payer"] == lock["payer"] and s["hop"] == lock["hop"] and s["t_first"] == lock["t_first"] for s in self.index["settled"].values()):
+                    raise Decline("since: the window starting at %d settled; nothing to claim" % lock["t_first"])
+                if rec["posted_at"] < lock["t_first"] + HEALTH["lost_after_s"]:
+                    raise Decline("since: a claim waits %d s after the window's start (%d), in case the payer's receipt is in its outbox" % (
+                        HEALTH["lost_after_s"], lock["t_first"]))
+                if rec["lock"] in p["claims"]:
+                    raise Decline("duplicate: that lock is claimed")
+                stored = rec
+            self.append("prepay.jsonl", stored)
+            self._index_prepay(self.index, stored)
+        who = lambda n: peers.get(n, n[:20])
+        if rec["kind"] == "deposit":
+            log("deposit %s registered: %s for %s (%s); balance %s" % (rec["id"][:16], micro_usd(rec["amount"]), who(rec["payer"]), rec["note"],
+                                                                      micro_usd(self.prepay_balance(rec["payer"])["balance"])))
+        elif rec["kind"] == "lock":
+            log("lock %s registered: %s by %s with %s for the window at %d, countersigned; balance %s" % (
+                rec["id"][:16], micro_usd(rec["amount"]), who(rec["payer"]), who(rec["hop"]), rec["t_first"], micro_usd(self.prepay_balance(rec["payer"])["balance"])))
+        else:
+            log("claim %s registered: %s counts %d bytes on lock %s of %s" % (rec["id"][:16], who(rec["hop"]), rec["bytes"], rec["lock"][:16], who(rec["payer"])))
+        return stored
 
     def try_settle(self, env, now):
         ix = self.index
@@ -3222,7 +3462,7 @@ class Node:
                         return self.raw(node.file_bytes(url.path[1:] + ".jsonl"), "application/x-ndjson")
                     if url.path == "/outbox":
                         return self.reply(200, node.outbox_list())
-                    if url.path in ("/mint/ledger", "/mint/commitments", "/mint/links", "/mint/proof", "/mint/map", "/mint/invoice", "/mint/invoices") or (url.path == "/map" and not node.map_path_exists()):
+                    if url.path in ("/mint/ledger", "/mint/commitments", "/mint/links", "/mint/proof", "/mint/map", "/mint/invoice", "/mint/invoices", "/mint/prepay", "/mint/balance") or (url.path == "/map" and not node.map_path_exists()):
                         path = url.path[5:] if url.path.startswith("/mint/") else url.path
                         try:
                             status, data, ctype = node.proxy_get(path + ("?" + url.query if url.query else ""))
@@ -3240,6 +3480,17 @@ class Node:
                     return self.reply(200, node.commitments())
                 if url.path == "/links" and node.role == "mint":
                     return self.reply(200, node.index["links"])
+                if url.path == "/prepay" and node.role == "mint":
+                    return self.raw(node.file_bytes("prepay.jsonl"), "application/x-ndjson")
+                if url.path == "/balance" and node.role == "mint":
+                    q = urlparse.parse_qs(url.query).get("payer", [""])[0]
+                    if not q:
+                        return self.reply(400, {"error": "payer=<NYM or peer name> is required"})
+                    nym = q if q.startswith("ed25519:") else next((n for n, name in node.peers().items() if name == q), None)
+                    if nym is None or nym not in node.peers():
+                        return self.reply(404, {"error": "no peer %s" % q})
+                    with node.lock:
+                        return self.reply(200, node.prepay_balance(nym))
                 if url.path == "/steward/history" and node.role == "mint":
                     q = urlparse.parse_qs(url.query).get("since", ["0"])[0]
                     if not q.isdigit():
@@ -3296,6 +3547,9 @@ class Node:
                         return self.reply(200, {"stored": node.register_link(body)})
                     if self.path == "/purchase" and node.role == "mint":
                         return self.reply(200, {"stored": node.register_purchase(body)})
+                    if self.path == "/prepay" and node.role == "mint":
+                        rec = node.register_prepay(body)
+                        return self.reply(200, {"stored": rec["id"], "record": rec})
                     return self.reply(404, {"error": "no such path"})
                 except Decline as e:
                     code = 409
@@ -3689,6 +3943,15 @@ def main(argv=None):
     pt2.add_argument("--escrow", type=float, required=True)
     pc = pus.add_parser("close", help="payer: withdraw a purchase of yours; what it did not spend comes back")
     pc.add_argument("id")
+    dp = sub.add_parser("deposit", help="mint: note that a payer put value on its balance here (spec, Section 16); signed by this Mint, kept in prepay.jsonl")
+    dp.add_argument("payer", help="the payer, by peer name or NYM")
+    dp.add_argument("usd", type=float, help="the amount in USD, kept as micro-units")
+    dp.add_argument("note", help="how it came, in the parties' words (\"a dollar in cash, Nov 2\")")
+    pr = sub.add_parser("prepay", help="mint: the prepayment registry and the balances (spec, Section 16)")
+    prs = pr.add_subparsers(dest="prcmd", required=True)
+    prs.add_parser("list", help="every deposit, lock and claim held, one line each")
+    prb = prs.add_parser("balance", help="each payer's deposits, open locks, debits and balance")
+    prb.add_argument("payer", nargs="?", help="one payer, by peer name or NYM; all by default")
     lg = sub.add_parser("ledger", help="mint: print the ledger")
     lg.add_argument("--disputes", action="store_true", help="only disputed settlements")
     lg.add_argument("--json", action="store_true")
@@ -3914,6 +4177,61 @@ def main(argv=None):
                 declined = [n for n, ps in node.patience_state().items() if ps.get("declined")]
                 if declined:
                     print("declined payers: %s" % ", ".join(declined))
+    elif args.cmd == "deposit":
+        if node.role != "mint":
+            raise SystemExit("only the Mint signs a deposit")
+        node.load_index()
+        nym = args.payer if args.payer.startswith("ed25519:") else node.nym_by_name(args.payer)
+        amount = int(round(args.usd * MICRO))
+        if amount <= 0:
+            raise SystemExit("the amount is a positive number of dollars (at least 0.000001)")
+        body = {"kind": "deposit", "proto": PROTO, "mint": node.nym, "payer": nym, "amount": amount, "unit": "USD",
+                "posted_at": int(time.time()), "note": args.note.strip()}
+        rec = dict(body, id=prepay_id(body))
+        rec["sig"] = sign_prepay(node.priv, rec)
+        # through the Mint's own server when it runs, so its index sees the deposit at once; straight into the file when it does not
+        own = (node.config.get("steward_mint") or "http://127.0.0.1:%d" % int(node.config.get("port", DEFAULT_PORT))).rstrip("/")
+        try:
+            status, ans = http_post(own + "/prepay", rec)
+            if status != 200:
+                raise SystemExit("refused: %s" % (ans.get("detail") or ans.get("error") if isinstance(ans, dict) else ans))
+            node.load_index()
+        except (urlerror.URLError, socket.timeout, OSError):
+            try:
+                node.register_prepay(rec)
+            except (Decline, ValueError) as e:
+                raise SystemExit("refused: %s" % e)
+        bal = node.prepay_balance(nym)
+        print("deposit %s: %s for %s (%s); balance now %s" % (rec["id"][:16], micro_usd(amount), node.peers().get(nym, nym[:20]), rec["note"], micro_usd(bal["balance"])))
+    elif args.cmd == "prepay":
+        if node.role != "mint":
+            raise SystemExit("the registry is the Mint's; a payer reads its balance through its proxy (/mint/balance)")
+        node.load_index()
+        peers = node.peers()
+        who = lambda n: peers.get(n, n[:20])
+        if args.prcmd == "list":
+            n = 0
+            for rec in node.load_prepay():
+                n += 1
+                when = time.strftime("%Y-%m-%d %H:%M", time.localtime(rec["posted_at"]))
+                if rec["kind"] == "deposit":
+                    print("%s  deposit %s  %s for %s: %s" % (when, rec["id"][:16], micro_usd(rec["amount"]), who(rec["payer"]), rec["note"]))
+                elif rec["kind"] == "lock":
+                    print("%s  lock    %s  %s by %s with %s for the window at %s%s" % (
+                        when, rec["id"][:16], micro_usd(rec["amount"]), who(rec["payer"]), who(rec["hop"]),
+                        time.strftime("%Y-%m-%d %H:%M", time.localtime(rec["t_first"])), ", countersigned" if "mint_sig" in rec else ""))
+                else:
+                    print("%s  claim   %s  %s counts %d bytes on lock %s of %s" % (when, rec["id"][:16], who(rec["hop"]), rec["bytes"], rec["lock"][:16], who(rec["payer"])))
+            if not n:
+                print("no deposit, lock or claim held; `bwkit deposit <payer> <usd> \"<note>\"` is the first")
+        else:
+            payers = [args.payer if args.payer.startswith("ed25519:") else node.nym_by_name(args.payer)] if args.payer else node.prepay_payers()
+            if not payers:
+                print("no payer has a balance here")
+            for nym in payers:
+                b = node.prepay_balance(nym)
+                print("%s  deposits %s  locked %s (%d open)  debited %s  balance %s" % (
+                    who(nym), micro_usd(b["deposits"]), micro_usd(b["locked"]), len(b["open_locks"]), micro_usd(b["debited"]), micro_usd(b["balance"])))
     elif args.cmd == "purchase":
         if args.pucmd == "post":
             if node.role != "payer":

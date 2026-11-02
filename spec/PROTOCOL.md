@@ -46,6 +46,8 @@ Which numbers are doubles is fixed by the field, not by the value: in a settleme
 | link announcement | `bandwidthswap/link/v1` | the canonical JSON of the record without `sig` |
 | status record (informative, Section 9) | `bandwidthswap/status/v1` | the canonical JSON of the record without `sig` |
 | map record (informative, Section 9) | `bandwidthswap/map/v1` | the canonical JSON of the record without `sig` |
+| deposit, lock, claim (Section 16) | `bandwidthswap/deposit/v1`, `bandwidthswap/lock/v1`, `bandwidthswap/claim/v1` | the canonical JSON of the record without `id` and `sig` (a lock: also without `mint` and `mint_sig`) |
+| a lock's countersignature (Section 16) | `bandwidthswap/lock/v1/mint` | the canonical JSON of the registered lock without `mint` and `mint_sig`, the payer's `sig` included |
 
 The arrays use the canonical separators and escaping above.
 
@@ -220,6 +222,9 @@ HTTP, JSON bodies, on a private network; the signatures are what protect the rec
 | `GET /commitments` | the current commitment of every hour, a JSON list, oldest first (Section 10) |
 | `GET /proof?window=<time>` | the proof document for the hour containing that time (Section 10); 404 when the hour has no commitment |
 | `GET /purchases` | the purchase registry as `application/x-ndjson`: purchases, top-ups and closes in registration order (Section 15) |
+| `POST /prepay` | Section 16; a deposit, a lock or a claim; a Mint without the extension answers 404 |
+| `GET /prepay` | the prepayment registry as `application/x-ndjson` (Section 16) |
+| `GET /balance?payer=` | a payer's balance at the Mint, integers in micro-units (Section 16); a hop or a payer proxies it at `/mint/balance`, and the registry at `/mint/prepay` |
 | `GET /steward` | the Steward's book as the status report carries it, with the latest run's `skipped` and `adjusted`; 404 without a Steward key |
 | `GET /map` | the map file; 404 on a node without one |
 | `GET /`, `GET /snapshot` | the node's own page (every role serves it); `/snapshot` is the same page with the node's data embedded in its `snapshot` element (`taken_at`, `status`, `ledger` and `purchases` as JSONL strings, `commitments`, `steward`, `map`), one self-contained file |
@@ -364,6 +369,37 @@ A place id is 1 to 32 characters of `a-z`, `0-9` and `-`, and never begins with 
 
 **The Steward.** The reference implementation's Steward runs on the Mint's host, hourly after the commitment, with its own key, over the ledger and the purchases: it posts a match at `match_size(m, escrow, income, matched, steward_escrow)` on a payer's open purchase that has none (the payer known to the Mint for `min_payer_age_s`), a bounty of `second_bridge_size(f, fees, budget)` with premium `second_bridge_premium(value, bytes)` for every link that carried fees between two different places in the program window and has no open bounty, and a first-link offer of `first_link_size(first_link_usd, budget, open_so_far)` for every mapped place no settled window has an end at, where `budget` is `bounty_budget(steward_escrow, m, income, matched)`; its income is the sum of `fee_usd`. Its parameters (*m*, the cap's margin, the program window, the first link's size and premium, the payer age, the bounty deadline) are the Mint's configuration, and the map is the membership's file. The rule's arithmetic is `steward_rules.py`, which the simulator shares; this section fixes the records and the Mint's behavior, and the plan (PLAN.md, Section 2) describes the rule.
 
+## 16. Extension: prepayment of a window
+
+The paper's Section 3.6 as a mechanism for a pilot without a payment rail (backlog B2, option b). **Implemented in part by the reference implementation from Nov 1, 2026: the records, the registry and the balance (this section's step 1).** Settlement against a lock, the lock's release and expiry, the claimed settlement, the payer's lock after each receipt and the hop's gate are steps 2 to 4 of `PREPAYMENT-DRAFT.md` and are not yet behavior; until they are, a lock is bookkeeping that nothing draws on. Everything here is off unless used: a Mint with no deposit holds no balance, and no node posts a lock by itself.
+
+**Amounts** in these records are integers in micro-units of `unit` (`amount: 11500` is $0.0115), the first in the protocol to be: a registry that holds balances adds and subtracts, and integers add exactly. The settlement's older fields stay as Section 8 has them.
+
+**The records.** Each is signed over its domain string (Section 3), a newline, and the canonical JSON of the record without `id` and `sig` (a lock: also without `mint` and `mint_sig`); `id` is the SHA-256 of those same bytes.
+
+```
+{"kind": "deposit", "proto": 1, "id", "mint": "<the Mint's NYM>", "payer": "<NYM>",
+ "amount": <integer, micro-units, positive>, "unit": "USD", "posted_at": <time>, "note": "<at most 200 characters>", "sig"}
+
+{"kind": "lock", "proto": 1, "id", "payer": "<NYM>", "hop": "<NYM>", "t_first": <the window's start>,
+ "amount": <integer, positive>, "unit": "USD", "carry": <integer, non-negative>, "link": "<the announcement's hash>" | null,
+ "posted_at": <time>, "sig": "<the payer's>",
+ "mint": "<NYM>", "mint_sig": "<the Mint's countersignature>"}        the last two once registered
+
+{"kind": "claim", "proto": 1, "id", "hop": "<NYM>", "payer": "<NYM>", "lock": "<lock id>", "bytes": <integer, non-negative>,
+ "meter": <the hop's sample pair as in an acknowledgement> | null, "posted_at": <time>, "sig"}
+```
+
+A deposit is value entering a payer's balance at the Mint, signed by the Mint because in the pilot the money moves outside the protocol, as the invoice is paid outside it; `note` carries the parties' words. A lock is the payer's reservation of one window's value with one hop: `t_first` is the start of the window about to open (the `t_last` of the receipt the payer has just made), `amount` the window's value at the link's price plus the `carry` for the time it stays locked, zero on the pilot's links, and `link` the announcement in force at (`payer`, `hop`, `t_first`) so that the lock and the settlement are priced under the same terms. A claim is a hop's own count for a window the payer never closed. Release is not a record: what a lock holds and a settlement does not draw returns to the balance by the Mint's arithmetic (step 2).
+
+**Registration.** `POST /prepay` takes one record and answers 200 `{"stored": id, "record": <the record as stored>}`; a lock comes back with the Mint's countersignature over the lock with the payer's `sig` (`mint`, `mint_sig`), which is what the payer carries to the hop. The Mint MUST check, and refuse if any fails: the shape above and `id` (400); the signature under the record's signer (400: the Mint for a deposit, the payer for a lock, the hop for a claim); that `posted_at` is not earlier than its clock less its tolerance (409 `since`); a second registration of an `id` (409 `duplicate`). For a deposit: that `mint` is its own NYM (403) and `payer` a peer (403). For a lock: that it carries no countersignature yet (409 `route`); that `payer` and `hop` are peers (403); that `t_first` is within the clock's tolerance behind its clock and at most one window plus the tolerance ahead of it (409 `since`: a lock names the window about to open); that no lock is held for (`payer`, `hop`, `t_first`) (409 `duplicate`); that `link` is the hash of the announcement in force at (`payer`, `hop`, `t_first`), or null when there is none (409 `route`); and that the payer's balance covers `amount` (409 `balance`, the figures in `detail`). For a claim: that `lock` names a lock it holds and the claim's `hop` and `payer` are that lock's (409 `route`); that no settlement is held for the lock's window (409 `since`); that `posted_at` is at least two windows (`lost_after_s`, 7200 s) after the lock's `t_first`, in case the payer's receipt is in its outbox (409 `since`); and that the lock is not already claimed (409 `duplicate`). The Mint appends what it stores to `prepay.jsonl` and serves the file at `GET /prepay`.
+
+**The balance.** `balance(payer) = Σ deposits − Σ amounts of open locks − Σ debits`, every term an integer in micro-units. `GET /balance?payer=<NYM or peer name>` answers `{"payer", "unit", "deposits", "locked", "debited", "balance", "open_locks": [{"id", "hop", "t_first", "amount"}]}`. In step 1 a lock is open from registration on and nothing debits, so `debited` is 0; step 2 settles, releases, expires and claims.
+
+**The reference implementation.** `bwkit deposit <payer> <usd> "<note>"` on the Mint signs a deposit and posts it through the Mint's own server (or appends it when the server is not running); `bwkit prepay list` and `bwkit prepay balance [payer]` read the registry and the balances; a hop or a payer reads `/mint/balance` and `/mint/prepay` through its proxy. `spec/vectors/` carries `deposit.json`, `lock.json` and `claim.json` and `tools/conform.py` checks their signatures and ids.
+
+*Note (paper):* the paper bounds a prepaid window by the payer's bond; in profile 1 the bound is the balance the Mint holds, and the Mint is a custodian of it, which the paper's Section 2 keeps open for the day a second party that does not trust the first joins.
+
 ## Appendix A. Where this profile departs from the paper
 
 Each is marked *Note (paper)* above.
@@ -372,7 +408,7 @@ Each is marked *Note (paper)* above.
 2. The hop checks the payer's `t_last` against its own clock and signs `t_first` as given; it does not compare the window's bounds with what it observed (Section 5).
 3. `prev_sig` chains the acknowledgement to its receipt; receipts are not chained across windows (Section 6).
 4. Announcements are registered with the Mint, not gossiped; carry, light time, contact plans, enforced receipt lifetimes and other units are not in profile 1 (Section 7).
-5. The lock of a window's value is the invoice; the fee reaches the Steward as a line on it (Section 8).
+5. The lock of a window's value is the invoice; the fee reaches the Steward as a line on it (Section 8). Section 16 begins to change the first half: a lock is a record from Nov 1, 2026, and nothing draws on it yet.
 6. A commitment is made after every settlement rather than once per closed hour, is keyed by the hour the window started in, and leaves the Mint's settlement time out of the leaf (Section 10).
 7. Patience declines the payer's next receipt and keeps declining until cleared; the decline has no teeth beyond the operator's hook (Section 12).
 8. The window key has five fields, not three (Section 6, against the build plan rather than the paper).

@@ -14,6 +14,7 @@ exactly these files.
 | `keys.json` | the three NYMs with their seeds and names |
 | `receipt.json`, `ack.json` | the second window's receipt and acknowledgement |
 | `link.json` | the first announcement (any payer, 10% margin, since T0+3600) |
+| `deposit.json`, `lock.json`, `claim.json` | prepayment (Section 16): a deposit the Mint signs, a lock the payer signs and the Mint countersigns (the second window, under the first announcement), a claim the hop signs on that lock; amounts in micro-USD |
 | `settlement-default.json` | the first window, no announcement in force |
 | `settlement-disputed.json` | the second window, under the first announcement |
 | `settlement-settled.json` | the sixth window, under the second announcement (price 0.2, margin 5%) |

@@ -1,0 +1,12 @@
+{
+ "amount": 50000,
+ "id": "763a7110b90f119ee2bd9ffbdb9eb531f15ddc775e8451db78d81606d01ffea2",
+ "kind": "deposit",
+ "mint": "ed25519:ZSkFPo6PQCl9IKHZpRXT7zp_1vBFqEcpwW0Zucj1Wsg",
+ "note": "test only",
+ "payer": "ed25519:IGSk-aXtuMXYJ8tMVPFTPqR2hXXtCjkDgRKur2IWVuM",
+ "posted_at": 1800000100,
+ "proto": 1,
+ "sig": "fcmVj7Gz4x_G54AQ0sJdXrOUhCBn6T_cvfOsrHM8-XV1RzNbmay_a9qYMxd-aCQ95WHKhJGzPiyAMsap96JlDA",
+ "unit": "USD"
+}
