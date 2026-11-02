@@ -67,6 +67,17 @@ function noThrow(label, fn) { let out; try { out = fn(); } catch (e) { throw new
   const html = noThrow('the Mint\'s view', () => BW.views.mint(X, now));
   ok(html.includes('<span class="k">windows settled</span><span class="v">50</span><span class="s">7 disputed · 14 commitments</span>'), 'Now shows 50 windows, 7 disputed, 14 commitments');
   eq(count(html, 'data-verify="'), 14, 'a verify button per committed hour');
+  eq(count(html, 'data-verify-day="1"'), 1, 'and one button for the last day');
+  // the day: the committed hours of the last 24 the node holds, oldest first, and the one line that sums the answers
+  const day = BW.dayHours(X, now);
+  ok(day.length > 0 && day.length <= 24 && day.every((w, i) => i === 0 || day[i - 1] < w), 'the day\'s hours are ascending and at most 24: ' + day.join(' '));
+  eq(day.length, new Set(X.C.filter((c) => c.window >= now - 86400 && c.window <= now).map((c) => c.window)).size, 'every committed hour of the last 24, once each, though an hour committed twice has two commitments');
+  eq(BW.dayHours({ C: [{ window: now - 90000 }, { window: now - 3600 }, { window: now - 3600 }] }, now).join(' '), String(now - 3600), 'an older commitment is left out and a duplicate counted once');
+  const res = (s, w, n) => ({ window: w, state: s, n: n || 0, okN: n || 0, why: s === 'failed' ? 'not in the commitment: its leaf does not reach the root' : s === 'not checked' ? 'this browser has no WebCrypto on a plain-http page' : '' });
+  ok(BW.dayWords([res('verified', now - 7200, 3), res('verified', now - 3600, 4)]).startsWith('<span class="st ok">verified</span> 2 hours, 7 settlements in their roots, every root signed by the Mint'), 'all verified: hours and settlements counted');
+  ok(BW.dayWords([res('verified', now - 7200, 3), res('failed', now - 3600, 2)]).startsWith('<span class="st declined">failed</span> 1 of 2 hours ('), 'one failure fails the day and names the hour');
+  ok(BW.dayWords([res('not checked', now - 7200), res('not checked', now - 3600)]).startsWith('<span class="st none">not checked</span> this browser has no WebCrypto'), 'nothing judged: not checked, with the reason');
+  ok(BW.dayWords([res('verified', now - 7200, 3), res('no proof', now - 3600)]).includes('1 hour with no proof held'), 'an hour without a proof is counted apart, not failed');
   ok(html.includes('<h2>Attention</h2><div class="now"><div class="ok"><span class="k">nothing</span><span class="v">all clear</span>'), 'Attention shows all clear');
   eq(Object.keys(D.proofs).length, 2, 'the snapshot holds two proofs as text'); ok(typeof D.proofs['1792335600'] === 'string', 'a proof is the Mint\'s own text, never re-serialised');
   ok(D.proofs['1792335600'].includes('"kind": "proof"'), 'kept as the Mint wrote it (spaces after the colons)');
@@ -102,6 +113,7 @@ function noThrow(label, fn) { let out; try { out = fn(); } catch (e) { throw new
   ok(html.includes('<h2>The Mint <small>who keeps my books</small></h2>'), 'the Mint card');
   ok(html.includes('<span class="k">Mint</span><span class="v">bw-mint</span>'), 'named bw-mint');
   ok(html.includes('data-verify="1792335600"'), 'the latest committed hour can be verified from the hop\'s page');
+  eq(count(html, 'data-verify-day="1"'), 1, 'and the hop\'s page has the last-day button beside it');
   // the Invoice section: nothing read in this snapshot, then the Mint's text for last month and this month, with the hop's own line picked out
   ok(html.includes('<h2>The invoice <small>'), 'the Invoice section is on the hop\'s page');
   eq(count(html, 'was not read through this node'), 2, 'a snapshot without the Mint\'s invoice says so for both months');

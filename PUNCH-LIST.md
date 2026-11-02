@@ -58,7 +58,7 @@ Not on this track, and stated so the next session does not reach for them first:
 
 These are the follow-ups in `dashboard/PLAN.md` Sections 7 and 8. Start them once bwkit serves the three views on all four nodes.
 
-- **"Verify the last day"**: one button that checks every committed hour of the last 24, not one hour at a time.
+- **"Verify the last day"**: one button that checks every committed hour of the last 24, not one hour at a time. **Done Nov 1, 2026:** "verify the last day here" beside the one-hour button on the node's Mint card and above the Mint's commitments table; it runs the committed hours of the last 24 the node holds, oldest first and one at a time through the node (`BW.dayHours`), fills each row's own answer where the view has one, and sums them in one line (`BW.dayWords`): *verified* with the hours and settlements counted, *failed* naming the hours, *not checked* when this browser could judge none, hours with no proof held counted apart and never as failures. The pure pieces are in `dashboard/test.mjs` (153 checks); the site's four `docs/dashboard/*/dash/` copies refreshed.
 - **The Steward's history in the as-of control.** The control moves every record but not the Steward's balances, which exist only as of now. `steward.jsonl` already holds every run, so the page can redraw from it.
 - **A per-node "mine" switch in the fleet list**, so watching a counterparty's node does not count toward your own position.
 

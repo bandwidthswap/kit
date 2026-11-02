@@ -76,7 +76,7 @@ Asked of each view on its own, on a snapshot of the real node, after the first l
 - The drill-down first landed below the whole table and was cut off by the table's sideways scroll. It is now a row under its own row whose content sticks to the table's left edge.
 - The as-of control moves every record but not the Steward's balances or the node's health, which exist only as of now; the page says so. A history of Steward runs (`steward.jsonl`) would let the control move those too: a later step.
 - Baselines need a week of windows and are silent until then. The lab has two days, so the first week's run is the test of whether they fire usefully.
-- "Verify here" is one hour at a time. A "verify the last day" button is the obvious next step and costs little.
+- "Verify here" is one hour at a time. A "verify the last day" button is the obvious next step and costs little. Done Nov 1, 2026: "verify the last day here" on both views runs the committed hours of the last 24 one after another through the node (`BW.dayHours`), fills each row's own answer on the Mint's view, and sums them in one line (`BW.dayWords`): verified with the hours and settlements counted, failed naming the hours, not checked when this browser could not judge any, hours with no proof held counted apart.
 
 **The node's view.**
 - A hop cannot draw the gap from its own records: its acks carry its own count and the payer's signature, not the payer's count. The page joins the Mint's settlements instead, which is right when the Mint answers and empty when it does not. bwkit should keep the receipts a hop countersigns beside its acks, so the hop's page stands on its own during an outage, which is when it matters most.

@@ -59,7 +59,7 @@ window.BW = window.BW || {};
     var Cs=sortBy(X.C, function(c){ return c.window; }, true).slice(0, 24);
     if(!Cs.length) return '<h2>Commitments</h2><div class="empty">No hour has been committed yet.</div>';
     var rows=Cs.map(function(c){ return '<tr><td>'+tstamp(c.window)+'</td><td class="n">'+c.count+'</td><td class="m">'+esc(String(c.root).slice(0,24))+'…</td><td class="m">'+(c.signature?'signed':'unsigned')+'</td><td class="m">'+tstamp(c.t)+'</td><td><button class="btn" data-verify="'+c.window+'">verify here</button> <a href="/proof?window='+c.window+'" class="m">proof</a></td><td id="vr-'+c.window+'" class="m"></td></tr>'; });
-    return '<h2>Commitments <small>one signed Merkle root per hour · '+X.C.length+' so far</small></h2>'+C.chainChart(X, now)+'<div class="tbl"><table><thead><tr><th>hour</th><th class="n">settlements</th><th>root</th><th></th><th>signed at</th><th></th><th>checked</th></tr></thead><tbody>'+rows.join('')+'</tbody></table></div>'+
+    return '<h2>Commitments <small>one signed Merkle root per hour · '+X.C.length+' so far</small></h2>'+C.chainChart(X, now)+'<p class="note"><button class="btn" data-verify-day="1">verify the last day here</button> <span id="vr-day" class="m"></span> · every committed hour of the last 24, one after another; each row below shows its own answer.</p><div class="tbl"><table><thead><tr><th>hour</th><th class="n">settlements</th><th>root</th><th></th><th>signed at</th><th></th><th>checked</th></tr></thead><tbody>'+rows.join('')+'</tbody></table></div>'+
       '<p class="note">"Verify here" fetches the hour\'s proof and checks every settlement\'s path to the root and the root\'s signature against the Mint\'s NYM, in this browser, with the same code as the public verifier.</p>';
   };
 

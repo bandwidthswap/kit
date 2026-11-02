@@ -73,4 +73,25 @@ window.BW = window.BW || {};
     Object.keys(openFirst).forEach(function(k){ if(openFirst[k]>1) add('warn',openFirst[k]+' first-link offers are open for '+F.esc(k)+'; the rule should hold one standing offer and top it up.'); });
     var seen={}; return items.filter(function(i){ if(seen[i.text]) return false; seen[i.text]=1; return true; }).sort(function(a,b){ var o={bad:0,warn:1,info:2}, r=function(l){ return l in o ? o[l] : 3; }; return r(a.level)-r(b.level); });
   };
+  // ---------------------------------------------------------------- the day's verification
+  // The committed hours of the last 24 the node holds, oldest first: what "verify the last day" checks.
+  BW.dayHours=function(X, now){
+    var since=now-24*3600, seen={}, out=[];
+    (X&&X.C||[]).forEach(function(c){ if(c.window>=since && c.window<=now && !seen[c.window]){ seen[c.window]=1; out.push(c.window); } });
+    return out.sort(function(a,b){ return a-b; });
+  };
+  // One line for the day from the hours' answers ({window, state, n, okN, why} each): three answers for the whole,
+  // never two: verified when every hour verified; failed when any did, naming the hours; not checked when none
+  // could be judged here. Hours with no proof held are counted apart, never as failures.
+  BW.dayWords=function(results){
+    var by={}; results.forEach(function(r){ (by[r.state]=by[r.state]||[]).push(r); });
+    var v=(by.verified||[]), f=(by.failed||[]), u=(by['not checked']||[]), p=(by['no proof']||[]), e=(by.error||[]);
+    var sets=v.reduce(function(a,r){ return a+r.okN; },0), hrs=function(list){ return list.map(function(r){ return F.tstamp(r.window); }).join(', '); };
+    if(f.length) return '<span class="st declined">failed</span> '+f.length+' of '+results.length+' hour'+(results.length===1?'':'s')+' ('+F.esc(hrs(f))+'): '+F.esc(f[0].why)+(v.length?'; '+v.length+' verified':'');
+    if(v.length && !u.length && !e.length) return '<span class="st ok">verified</span> '+v.length+' hour'+(v.length===1?'':'s')+', '+sets+' settlement'+(sets===1?'':'s')+' in their roots, every root signed by the Mint'+(p.length?' · '+p.length+' hour'+(p.length===1?'':'s')+' with no proof held':'');
+    if(u.length && !v.length) return '<span class="st none">not checked</span> '+F.esc(u[0].why);
+    if(v.length) return '<span class="st ok">verified</span> '+v.length+' of '+results.length+' hours, '+sets+' settlements'+(u.length?'; '+u.length+' not checked here':'')+(e.length?'; '+e.length+' could not be read: '+F.esc(e[0].why):'')+(p.length?'; '+p.length+' with no proof held':'');
+    if(e.length) return '<span class="st none">not checked</span> '+F.esc(e[0].why);
+    return '<span class="st none">no proof held</span> for any of the '+results.length+' hour'+(results.length===1?'':'s');
+  };
 })(window.BW);

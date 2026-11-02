@@ -45,29 +45,51 @@ window.BW = window.BW || {};
   }
 
   // ---------------------------------------------------------------- verification in the page
-  function verify(window_){
+  // One hour: the proof is fetched through this node (or taken from the snapshot), checked here, and the answer written
+  // beside the button that asked, when there is one. Returns {window, state, n, okN, why}: state is verified, failed,
+  // not checked (this browser could not run the check), no proof, or error.
+  function checkHour(window_){
     var out=$('vr-'+window_); if(out) out.textContent='checking…';
+    var res={window: window_, state: 'error', n: 0, okN: 0, why: ''};
     // a proof is checked as the bytes the Mint wrote: re-serialising it would rewrite its floats and change every leaf
     var p=D.proofs[window_], get = D.snapshot ? Promise.resolve(p ? (typeof p==='string' ? p : JSON.stringify(p)) : null)
             : fetch(D.base+(D.status&&D.status.role==='mint'?'/proof?window=':'/mint/proof?window=')+window_, {cache:'no-store'}).then(function(r){ return r.ok?r.text():null; });
     return get.then(function(text){
-      if(!text){ if(out) out.textContent='no proof held for this hour'; return; }
-      if(!window.bsp){ if(out) out.textContent='the verifier did not load'; return; }
+      if(!text){ res.state='no proof'; res.why='no proof held for this hour'; if(out) out.textContent=res.why; return res; }
+      if(!window.bsp){ res.why='the verifier did not load'; if(out) out.textContent=res.why; return res; }
       return window.bsp.verifyProof(text).then(function(r){
-        if(!out) return; var n=(r.settlements||[]).length, okN=(r.settlements||[]).filter(function(s){ return s.ok; }).length;
-        var why=r.reason||(r.commitment&&r.commitment.reason)||((r.settlements||[]).map(function(s){ return s.reason; }).filter(Boolean)[0])||'';
+        res.n=(r.settlements||[]).length; res.okN=(r.settlements||[]).filter(function(s){ return s.ok; }).length;
+        res.why=r.reason||(r.commitment&&r.commitment.reason)||((r.settlements||[]).map(function(s){ return s.reason; }).filter(Boolean)[0])||'';
         // three answers, never two: verified, failed (the proof is wrong), or not checked (this browser could not run the check; the proof is not judged)
-        out.innerHTML = r.ok ? '<span class="st ok">verified</span> '+okN+' of '+n+' settlement'+(n===1?'':'s')+' in the root, root signed by the Mint'
-          : r.unavailable ? '<span class="st none">not checked</span> '+F.esc(why)
-          : '<span class="st declined">failed</span> '+F.esc(why);
+        res.state = r.ok ? 'verified' : r.unavailable ? 'not checked' : 'failed';
+        if(out) out.innerHTML = r.ok ? '<span class="st ok">verified</span> '+res.okN+' of '+res.n+' settlement'+(res.n===1?'':'s')+' in the root, root signed by the Mint'
+          : r.unavailable ? '<span class="st none">not checked</span> '+F.esc(res.why)
+          : '<span class="st declined">failed</span> '+F.esc(res.why);
+        return res;
       });
-    }).catch(function(e){ if(out) out.textContent='could not check: '+e.message; });
+    }).catch(function(e){ res.why='could not check: '+e.message; if(out) out.textContent=res.why; return res; });
   }
+  function verify(window_){ return checkHour(window_); }
+
+  // The day: every committed hour of the last 24 (BW.dayHours), one after another so the Mint is asked for one proof
+  // at a time through this node, each hour's own line filled where the view has one, and one line for the whole.
+  function verifyDay(){
+    var out=$('vr-day'), hours=BW.dayHours(BW.X, BW.now()), results=[], i=0;
+    if(!hours.length){ if(out) out.textContent='no committed hour in the last day'; return Promise.resolve(results); }
+    function step(){
+      if(i>=hours.length){ if(out) out.innerHTML=BW.dayWords(results); return results; }
+      if(out) out.textContent='checking hour '+(i+1)+' of '+hours.length+', '+F.tstamp(hours[i])+'…';
+      return checkHour(hours[i]).then(function(r){ results.push(r); i++; return step(); });
+    }
+    return step();
+  }
+  BW.verifyDay=verifyDay;
 
   // ---------------------------------------------------------------- events
   document.addEventListener('click', function(e){
     var b=e.target.closest('button'); if(b){
       if(b.dataset.verify){ verify(+b.dataset.verify); return; }
+      if(b.dataset.verifyDay){ verifyDay(); return; }
       if(b.id==='asof-now'){ D.asOf=null; $('asof-range').value=$('asof-range').max; draw(); return; }
       if(b.id==='fleet-add'){ var u=$('fleet-url').value.trim().replace(/\/+$/,''); if(!u) return; var list=BW.fleetList(); if(list.indexOf(u)<0) list.push(u); BW.fleetSave(list); BW.loadFleet(list).then(draw); return; }
       if(b.dataset.close){ toggle(b.dataset.close); return; }
