@@ -196,6 +196,7 @@ sudo -u bwkit bwkit links                    # on bw-mint: the announcements, re
 sudo -u bwkit bwkit invoice 2026-10          # on bw-mint, with the Steward's line; no month: last month; --save writes invoices/<month>.txt
 sudo -u bwkit bwkit invoice 2026-10 --paid bw-neighbor "settled in person, Nov 2"   # on bw-mint: the paid mark, kept beside the saved invoice and served with it
 sudo -u bwkit bwkit deposit bw-house 1.00 "a dollar in cash, Nov 2"   # on bw-mint: value on a payer's balance (spec, Section 16); `bwkit prepay list` / `bwkit prepay balance` read the registry
+sudo -u bwkit bwkit lock --print               # on bw-house: the lock the hourly job would post for the coming window (prepay.enabled in its config turns the posting on); `bwkit balance` and `bwkit locks` beside it
 curl -s http://bw-mint.local:8710/invoice     # last month's invoice as saved, or the month so far (?month=YYYY-MM); /mint/invoice on a hop or a payer
 sudo -u bwkit bwkit owed 2026-10             # on a hop or a payer: my line of that invoice from my own copies alone, set against the Mint's (exit 0 agree, 1 differ)
 sudo -u bwkit bwkit prove 2026-10-17T21      # on bw-mint: the inclusion proofs for that hour
@@ -228,7 +229,7 @@ Config (`/etc/bwkit/config.json`):
 | `map` | mint | The map's path; `/etc/bwkit/map.json` (or `BWKIT_MAP`) by default |
 | `status_url` | mint | Where `bwkit report` posts: the feed's `/report` (`https://status.bandwidthswap.com/report` for the pilot's); `bwkit map post` posts to the `/map` beside it. `BWKIT_STATUS_URL` overrides it. Without one, `bwkit report` posts nothing and says so. |
 
-What is deliberately not here, yet: prepayment of a window (backlog B2 b; `spec/PREPAYMENT-DRAFT.md`; steps 1 and 2 of six built Nov 1, 2026: the records and the registry, `bwkit deposit` / `bwkit prepay` on the Mint, a settled window drawing on its lock, the claimed settlement, the invoice's prepaid line, `owed --prepay` and `rebuild --prepay`; the payer posts no lock by itself until step 3), a payment rail, more than one hop, onion routing, a token, a chain. The outbox means a node that cannot reach the Mint keeps its receipts and sends them next hour; a hop that was down for a window acks the next one with both windows' bytes, and the Mint settles that window at the payer's count, so the hop loses the window it missed. The HTTP is plain, on a private LAN; the signatures are what protect the receipts.
+What is deliberately not here, yet: prepayment of a window (backlog B2 b; `spec/PREPAYMENT-DRAFT.md`; steps 1 to 3 of six built Nov 1, 2026: the records and the registry, `bwkit deposit` / `bwkit prepay` on the Mint, a settled window drawing on its lock, the claimed settlement, the invoice's prepaid line, `owed --prepay` and `rebuild --prepay`, and the payer's lock after each receipt when `prepay.enabled` is set; the hop's gate is step 4), a payment rail, more than one hop, onion routing, a token, a chain. The outbox means a node that cannot reach the Mint keeps its receipts and sends them next hour; a hop that was down for a window acks the next one with both windows' bytes, and the Mint settles that window at the payer's count, so the hop loses the window it missed. The HTTP is plain, on a private LAN; the signatures are what protect the receipts.
 
 ## Keys
 

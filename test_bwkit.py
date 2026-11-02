@@ -1284,6 +1284,53 @@ class Prepay(unittest.TestCase):
         entries, rep = bwkit.rebuild(receipts, acks, [], 0.1, 0.05, prepay=bad)
         self.assertEqual(rep["bad"], ["prepay.jsonl line 2: a lock in the registry carries the Mint's countersignature"])   # a countersignature that fails
 
+    def test_the_payer_locks_the_coming_window_after_each_receipt(self):
+        """Step 3: with prepay.enabled, the hourly job posts a lock for the window that just opened, keeps the countersigned copy,
+        shows it to the hop, and says so when the balance is short; `bwkit lock --print`, `balance` and `locks` on the payer."""
+        lab = self.lab
+        lab.mint.config["steward_mint"] = lab.mint_url
+        lab.payer.config["prepay"] = {"enabled": True, "headroom": 1.25}
+        # the purchase minimum raises the estimate: 20 MB minimum, the first window is empty
+        with mock.patch("time.time", return_value=lab.t):
+            lab.payer.purchase_post("bw-forest", 20_000_000, 0.02, 100, 0.01, lab.t + 30 * 86400, now=lab.t)
+        with mock.patch("time.time", return_value=lab.t):
+            out = lab.hour(0, 0)                                               # nothing moved: the estimate is the minimum times the headroom
+        self.assertIsNone(out["lock"]); self.assertIn("balance", out["lock_error"])     # no deposit yet: the Mint refuses, the job goes on
+        cli(["deposit", "bw-house", "0.02", "cash"], mint_env(lab))
+        with mock.patch("time.time", return_value=lab.t):
+            out = lab.hour(100_000_000, 100_000_000)
+        held = out["lock"]
+        self.assertIsNotNone(held, out["lock_error"])
+        self.assertEqual((held["payer"], held["hop"], held["t_first"], held["amount"], held["link"], held["mint"]),
+                         (lab.payer.nym, lab.hop.nym, lab.t, 12500, None, lab.mint.nym))           # 100 MB x 1.25 at 10c/GB; no announcement
+        self.assertTrue(bwkit.verify_lock_mint(held))
+        self.assertEqual(out["lock_hop"], "the hop takes no locks yet (404)")                    # step 4 gives the hop its door
+        self.assertEqual([r["id"] for r in lab.payer.read_lines("locks.jsonl")], [held["id"]])
+        # the window the lock covers settles covered, and the next lock follows it
+        with mock.patch("time.time", return_value=lab.t):
+            out = lab.hour(190_000_000, 190_000_000)
+        s = [e for e in lab.mint.ledger_lines() if e["kind"] == "settlement"][-1]
+        self.assertEqual((s.get("lock"), s.get("debit"), s.get("covered")), (held["id"], 10800, True))     # 90 MB at 10c/GB plus the purchase's 2c/GB premium
+        self.assertIsNone(out["lock"]); self.assertIn("balance", out["lock_error"])                  # $0.011 left, $0.02375 asked for 190 MB x 1.25: short
+        # the commands on the payer: the record it would post, the balance through the proxy, the copies it keeps
+        rc, text = cli(["lock", "--print"], payer_env(lab))
+        self.assertEqual(rc, 0, text)
+        self.assertIn('"kind": "lock"', text); self.assertIn("bytes estimated (the last window 90000000, minimum 20000000, headroom 1.25)", text)
+        with mock.patch("time.time", return_value=lab.t + 10):
+            rc, text = cli(["balance"], payer_env(lab))
+        self.assertEqual(rc, 0, text)
+        self.assertIn("balance at the Mint: $0.009200 (deposits $0.020000, locked $0.000000 on 0 open locks, drawn $0.010800, released $0.000000)", text)
+        self.assertIn("with bw-forest  settled   drew $0.010800", text)
+        rc, text = cli(["locks"], payer_env(lab))
+        self.assertIn("%s  $0.012500 with bw-forest  countersigned" % held["id"][:16], text)
+        with self.assertRaises(SystemExit):
+            cli(["balance"], hop_env(lab))
+        # off by default: a payer whose config does not enable it posts nothing
+        del lab.payer.config["prepay"]
+        with mock.patch("time.time", return_value=lab.t):
+            out = lab.hour(200_000_000, 200_000_000)
+        self.assertNotIn("lock", out)
+
     def test_shapes_are_refused_with_the_reason(self):
         lab = self.lab
         now = int(time.time())

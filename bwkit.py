@@ -2015,7 +2015,126 @@ class Node:
                 log("hop declined: %s %s" % (status, body))
         sent, left = self.flush()
         log("sent %d to the Mint, %d left in outbox" % (sent, left))
-        return {"receipt": env, "ack": ack, "sent": sent, "left": left}
+        out = {"receipt": env, "ack": ack, "sent": sent, "left": left}
+        if (self.config.get("prepay") or {}).get("enabled"):
+            out.update(self.lock_next(env, now))              # the lock for the window that just opened (spec, Section 16; step 3)
+        return out
+
+    # prepayment on the payer (spec, Section 16; step 3): the lock for the coming window, after each receipt
+
+    def lock_estimate(self, last_bytes, t_first):
+        """What to lock for the window starting at t_first, in micro-units, and the announcement it is priced under.
+
+        The larger of the last window's bytes and the purchase minimum in
+        force, times the headroom (prepay.headroom, 1.25: a quarter over the
+        last window covered 163 of 167 windows of the neighbor link's week),
+        at the announcement's price; the pilot's links carry no carry.
+        Returns (amount, link or None, estimate_bytes, min_bytes).
+        """
+        pp = self.config.get("prepay") or {}
+        headroom = float(pp.get("headroom", 1.25))
+        hop_nym = self.nym_by_name(self.config["hop_name"])
+        links = []
+        try:
+            status, data, _ = self.proxy_get("/links")
+            if status == 200:
+                links = [l for l in json.loads(data.decode("utf-8")) if isinstance(l, dict) and l.get("kind") == "link" and verify_link(l)]
+        except (urlerror.URLError, socket.timeout, OSError, ValueError):
+            pass
+        link = link_in_force(links, self.nym, hop_nym, t_first)
+        price = link_params(link)["price"] if link else self.config.get("price_usd_per_gb", DEFAULT_PRICE_USD_PER_GB)
+        min_bytes = 0
+        for rec in self.load_purchases():
+            if isinstance(rec, dict) and rec.get("kind") == "purchase" and rec.get("poster") == self.nym and rec.get("deadline", 0) >= t_first:
+                min_bytes = max(min_bytes, int(rec.get("min_bytes") or 0))
+        estimate = int(max(last_bytes, min_bytes) * headroom)
+        amount = int(fractions.Fraction(estimate) * fractions.Fraction(str(price)) * MICRO / 10 ** 9)
+        return max(amount, 1), link, estimate, min_bytes
+
+    def lock_record(self, t_first, last_bytes, now=None):
+        """The signed lock for the window at t_first, not yet registered. Returns (record, link, estimate_bytes, min_bytes)."""
+        now = int(now if now is not None else time.time())
+        amount, link, estimate, min_bytes = self.lock_estimate(last_bytes, t_first)
+        body = {"kind": "lock", "proto": PROTO, "payer": self.nym, "hop": self.nym_by_name(self.config["hop_name"]), "t_first": t_first,
+                "amount": amount, "unit": "USD", "carry": 0, "link": link_hash(link) if link else None, "posted_at": now}
+        rec = dict(body, id=prepay_id(body))
+        rec["sig"] = sign_prepay(self.priv, rec)
+        return rec, link, estimate, min_bytes
+
+    def lock_next(self, env, now=None):
+        """After a receipt: lock the window that just opened with the Mint, keep the countersigned copy, show it to the hop.
+
+        Never raises: the hourly job must not fail over a lock. Returns a
+        dict for the summary: lock (the countersigned record or None),
+        lock_error (why not, or None), lock_hop (what the hop said).
+        """
+        now = int(now if now is not None else time.time())
+        r = env["receipt"]
+        out = {"lock": None, "lock_error": None, "lock_hop": None}
+        try:
+            rec, link, estimate, min_bytes = self.lock_record(r["t_last"], r["bytes"], now)
+            mint = self.mint_url()
+            if not mint:
+                raise OSError("no Mint configured")
+            status, ans = http_post(mint + "/prepay", rec)
+        except (urlerror.URLError, socket.timeout, OSError, SystemExit, ValueError) as e:
+            out["lock_error"] = "no lock for the window at %d: %s" % (r["t_last"], e)
+            log(out["lock_error"])
+            return out
+        if status != 200:
+            detail = (ans.get("detail") or ans.get("error")) if isinstance(ans, dict) else str(ans)
+            out["lock_error"] = "the Mint refused the lock for the window at %d: %s" % (r["t_last"], detail)
+            log(out["lock_error"])
+            if isinstance(ans, dict) and ans.get("error") == "balance":
+                self.run_hook("on_short", detail)
+            return out
+        held = ans["record"] if isinstance(ans, dict) and isinstance(ans.get("record"), dict) else None
+        if held is None or not verify_lock_mint(held):
+            out["lock_error"] = "the Mint answered the lock without a countersignature that verifies; not kept"
+            log(out["lock_error"])
+            return out
+        self.append("locks.jsonl", held)
+        out["lock"] = held
+        log("lock %s for the window at %d: %s (%d bytes estimated%s, %s), countersigned by the Mint" % (
+            held["id"][:16], held["t_first"], micro_usd(held["amount"]), estimate,
+            " with a %d-byte minimum" % min_bytes if min_bytes else "", "under %s" % held["link"][:16] if held["link"] else "the default price"))
+        hop_url = self.config.get("hop_url")
+        if hop_url:
+            try:
+                status, ans = http_post(hop_url.rstrip("/") + "/lock", held)
+                out["lock_hop"] = "held" if status == 200 else ("the hop takes no locks yet (404)" if status == 404 else "the hop answered %s %s" % (status, ans))
+            except (urlerror.URLError, socket.timeout, OSError) as e:
+                out["lock_hop"] = "hop unreachable: %s" % e
+            log("the hop: %s" % out["lock_hop"])
+        return out
+
+    def run_hook(self, name, arg):
+        """Run a configured command (on_short, on_decline) with one argument; never raises."""
+        cmd = self.config.get(name)
+        if not cmd:
+            return
+        try:
+            subprocess.Popen([cmd, str(arg)])
+        except OSError as e:
+            log("%s hook %s did not run: %s" % (name, cmd, e))
+
+    def balance_text(self):
+        """A payer's balance at its Mint through the proxy, as `bwkit balance` prints it. Returns (text, rc)."""
+        try:
+            status, data, _ = self.proxy_get("/balance?payer=" + self.nym)
+        except (urlerror.URLError, socket.timeout, OSError) as e:
+            return "the Mint did not answer: %s\n" % e, 2
+        if status != 200:
+            return "the Mint answered %s: %s\n" % (status, data.decode("utf-8", "replace").strip()), 2
+        b = json.loads(data.decode("utf-8"))
+        names = self.peers()
+        lines = ["balance at the Mint: %s (deposits %s, locked %s on %d open lock%s, drawn %s, released %s)" % (
+            micro_usd(b["balance"]), micro_usd(b["deposits"]), micro_usd(b["locked"]), len(b["open_locks"]), "" if len(b["open_locks"]) == 1 else "s",
+            micro_usd(b["debited"]), micro_usd(b["released"]))]
+        for l in b.get("locks", [])[-12:]:
+            lines.append("  %s  %s with %s  %-8s%s" % (time.strftime("%Y-%m-%d %H:%M", time.localtime(l["t_first"])), micro_usd(l["amount"]),
+                                                   names.get(l["hop"], l["hop"][:20]), l["state"], "  drew %s" % micro_usd(l["debit"]) if l.get("debit") is not None else ""))
+        return "\n".join(lines) + "\n", 0
 
     def purchase_post(self, to, min_bytes, premium_per_gb, windows, escrow, deadline, now=None, post=True, poster_priv=None,
                       program="payer", route_from="self", not_via=(), matches=None, mint_url=None, keep=True):
@@ -4161,6 +4280,10 @@ def main(argv=None):
     pt2.add_argument("--escrow", type=float, required=True)
     pc = pus.add_parser("close", help="payer: withdraw a purchase of yours; what it did not spend comes back")
     pc.add_argument("id")
+    lk = sub.add_parser("lock", help="payer: the lock for the coming window (spec, Section 16), as the hourly job posts it after the receipt when prepay.enabled is set")
+    lk.add_argument("--print", dest="print_only", action="store_true", help="print the signed record and the estimate instead of posting it")
+    sub.add_parser("balance", help="payer: my balance at the Mint through this node's proxy, and the state of my locks")
+    sub.add_parser("locks", help="payer: the countersigned locks this node keeps (locks.jsonl)")
     dp = sub.add_parser("deposit", help="mint: note that a payer put value on its balance here (spec, Section 16); signed by this Mint, kept in prepay.jsonl")
     dp.add_argument("payer", help="the payer, by peer name or NYM")
     dp.add_argument("usd", type=float, help="the amount in USD, kept as micro-units")
@@ -4399,6 +4522,48 @@ def main(argv=None):
                 declined = [n for n, ps in node.patience_state().items() if ps.get("declined")]
                 if declined:
                     print("declined payers: %s" % ", ".join(declined))
+    elif args.cmd == "lock":
+        if node.role != "payer":
+            raise SystemExit("only a payer locks a window")
+        st = node.state().get("sample")
+        if not st:
+            raise SystemExit("no baseline sample yet: the first receipt opens the first window")
+        last = [e for e in node.read_lines("receipts.jsonl") if isinstance(e, dict) and e.get("kind") == "receipt"]
+        last_bytes = last[-1]["receipt"]["bytes"] if last else 0
+        rec, link, estimate, min_bytes = node.lock_record(st["t"], last_bytes)
+        if args.print_only:
+            print(json.dumps(rec, indent=1, sort_keys=True))
+            print("the window at %s: %d bytes estimated (the last window %d%s, headroom %s), %s%s" % (
+                time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(rec["t_first"])), estimate, last_bytes,
+                ", minimum %d" % min_bytes if min_bytes else "", (node.config.get("prepay") or {}).get("headroom", 1.25), micro_usd(rec["amount"]),
+                " under announcement %s" % rec["link"][:16] if rec["link"] else " at the default price"))
+            return 0
+        out = node.lock_next({"receipt": {"t_last": st["t"], "bytes": last_bytes}})
+        if out["lock_error"]:
+            print(out["lock_error"])
+            return 1
+        print("locked %s for the window at %s, countersigned by the Mint; the hop: %s" % (
+            micro_usd(out["lock"]["amount"]), time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(out["lock"]["t_first"])), out["lock_hop"] or "not asked"))
+    elif args.cmd == "balance":
+        if node.role != "payer":
+            raise SystemExit("`balance` is a payer's; the Mint has `bwkit prepay balance`")
+        text, rc = node.balance_text()
+        print(text, end="")
+        return rc
+    elif args.cmd == "locks":
+        if node.role != "payer":
+            raise SystemExit("`locks` lists a payer's own copies")
+        names = node.peers()
+        n = 0
+        for rec in node.read_lines("locks.jsonl"):
+            if not isinstance(rec, dict) or rec.get("kind") != "lock":
+                continue
+            n += 1
+            print("%s  %s  %s with %s  %s%s" % (time.strftime("%Y-%m-%d %H:%M", time.localtime(rec["t_first"])), rec["id"][:16], micro_usd(rec["amount"]),
+                                            names.get(rec["hop"], rec["hop"][:20]), "countersigned" if verify_lock_mint(rec) else "COUNTERSIGNATURE FAILS",
+                                            " under %s" % rec["link"][:16] if rec.get("link") else ""))
+        if not n:
+            print("no lock kept yet; the hourly job posts one after each receipt when prepay.enabled is set, or `bwkit lock` posts one now")
     elif args.cmd == "deposit":
         if node.role != "mint":
             raise SystemExit("only the Mint signs a deposit")
