@@ -1,6 +1,6 @@
 # Bandwidth Swap kit
 
-The code for the Phase 0 lab: three Raspberry Pi 3 B nodes on a home LAN that keep time, tunnel traffic and sign receipts. The site, the paper and the backlog are in [bandwidthswap.github.io](https://github.com/bandwidthswap/bandwidthswap.github.io); this repo is what runs on the nodes.
+The code for the pilot's lab: six Raspberry Pi 3 B nodes at two houses (Phase 0's three on a home LAN, the neighbor's hop and two more next door) that keep time, tunnel traffic, sign receipts and, since Phase 1 began, carry them over LoRa. The site, the paper and the backlog are in [bandwidthswap.github.io](https://github.com/bandwidthswap/bandwidthswap.github.io); this repo is what runs on the nodes.
 
 | Path | What it is |
 |---|---|
@@ -13,8 +13,8 @@ The code for the Phase 0 lab: three Raspberry Pi 3 B nodes on a home LAN that ke
 | `test_bwkit.py` | Runs a payer, a hop and a Mint in one process. `python3 test_bwkit.py` (on the Mac: `python3 -m venv venv && venv/bin/pip install cryptography`, then `venv/bin/python`; `venv/` is ignored). It also runs `node dashboard/test.mjs` when `node` is installed. |
 | `install.sh` | Installs `bwkit` on one node: `sudo ./install.sh payer\|hop\|mint` |
 | `systemd/` | The hop's and Mint's service, the payer's hourly timer, the Mint's status timer (every ten minutes, five past), the Steward's hourly timer (five past, after the commitment), the Mint's invoice timer (the first of the month, ten past midnight), and the Wi-Fi watchdog (`bwkit-wifi.timer` and the `bwkit-wifi-watchdog` script, every minute on a node that reaches everything over `wlan0`: a gateway silent ten minutes brings the wireless profile back up, a second grace period turns the radio off and on first, never a reboot; `phase0/neighbor.sh watchdog` installs it). |
-| `phase0/provision.sh` | The whole lab from the Mac over SSH: upgrade, chrony, WireGuard, logs to RAM, bwkit; `status` installs the status reporter on `bw-mint`, `map` posts the signed map to the feed, `steward` the Steward (the map, its key, its timer). |
-| `phase0/neighbor.sh`, `phase0/NEIGHBOR.md` | A fourth node at a neighbor's house, the first operated by someone else: provisioned on the house LAN, meeting the house on a Tailscale tailnet because neither house can open a port, then carried next door. `NEIGHBOR.md` is the whole procedure, and ends with the section written to the operator: their key, what runs, what it sends, the page, the invoice, the terms, how to stop it. |
+| `phase0/provision.sh` | The whole lab from the Mac over SSH: upgrade, chrony, WireGuard, logs to RAM, bwkit; `status` installs the status reporter on `bw-mint`, `map` posts the signed map to the feed, `steward` the Steward (the map, its key, its timer), `invoice` the Mint's monthly invoice timer, `update` rolls a newer `bwkit.py` and the units onto the nodes, `radio` the LoRa carrier (`radio/PLAN.md`; `RADIO_RELAY` names a hop served by another node's board). |
+| `phase0/neighbor.sh`, `phase0/NEIGHBOR.md` | A fourth node at a neighbor's house, the first operated by someone else: provisioned on the house LAN, meeting the house on a Tailscale tailnet because neither house can open a port, then carried next door; `N=<node>` provisions any later node the same way (`bw-cabin`, `bw-mint2`), `announce` sets the link's terms (`LINK_MARGIN`, `LINK_CLOCK_TOL`, ...), `update` rolls the kit out, `watchdog` installs the Wi-Fi watchdog. `NEIGHBOR.md` is the whole procedure, and ends with the section written to the operator: their key, what runs, what it sends, the page, the invoice, the terms, how to stop it. |
 | `radio/` | Phase 1, the control plane on LoRa: `PLAN.md` (the nodes and radios, the wire format, the carrier, the bench in order, the test), `wire.py` (the `bwl/1` codec: a receipt is 131 bytes on the air, an acknowledgement 195, the peers named by key fingerprint and rebuilt from the peer list; no dependencies), `test_wire.py` (the spec's vectors round-tripped and verified with `bwkit.check_envelope`), `bwradio.py` (the carrier: a sidecar with the Meshtastic API in `/opt/bwradio`, run by `systemd/bwkit-radio.service`; `phase0/provision.sh radio` installs it) and `test_radio.py` (the carrier against a fake mesh, with real nodes). Since 0.5.0 a hop asked twice for the same receipt returns the one acknowledgement it signed. |
 | `phase0/link-log.sh`, `phase0/link-report.sh` | The neighbor's link measured: a ten-minute log on both ends (each clock against NTP, the metered and uplink byte counters), the purchase line carrying its rate and overhead, and the report from the Mac that reads them with the Mint's ledger: the clock between the sites per day, overhead and rate per purchase, the payer/hop gap per window. `NEIGHBOR.md`, "Measuring the link". |
 | `phase0/dispute-test.sh [hop\|payer]` | The dispute tests from the Mac: an agreeing window, then one where one side's counters restart mid-window. `hop` (the default) is the hop under-claiming, `payer` the hop over-claiming; the Mint settles both at the smaller count, then the script resolves the dispute again offline on the Mint and once more on the hop from its own copies. The link is named by `HOP`, `IFACE`, `TARGET` and `SSH_SUFFIX` (the bench by default; `HOP=bw-neighbor IFACE=tailscale0 TARGET=<its tailnet address> SSH_SUFFIX=-ts` for the neighbor, where the restart is `tailscaled`'s and runs detached). |
@@ -34,9 +34,9 @@ A NYM is an ed25519 public key (`ed25519:` and the key, base64url). The signed b
 Phase 0 has two nodes on a tunnel and nothing chunked, so:
 
 - `merkle_root` is the payer's SHA-256 commitment to its own meter readings for the window (counters at `t_first` and `t_last`). It stands in for the Merkle root over payload chunks until there is a chunked data plane.
-- The window is an hour. The payer's receipt counts the bytes that crossed its `wg0` in that hour, both directions.
+- The window is an hour. The payer's receipt counts the bytes that crossed its metered interface in that hour, both directions: `wg0` on the bench, `tailscale0` on the neighbor link.
 
-Every hour, `bw-house` (the payer) signs its receipt and asks `bw-forest` (the hop) to acknowledge it. The hop checks the signature and the payer's clock (5 seconds, decline: backlog B9), reads its own `wg0` counters for the same window, and signs the same tuple with **its own** byte count and `prev_sig` set to the payer's signature. When the counts agree that is the countersignature that closes the chain. When they don't, it is the dispute, in the same format.
+Every hour, `bw-house` (the payer) signs its receipt and asks its hop (`bw-forest` on the bench; `bw-neighbor` since Oct 18, 2026) to acknowledge it. The hop checks the signature and the payer's clock (5 seconds, decline: backlog B9), reads its own `wg0` counters for the same window, and signs the same tuple with **its own** byte count and `prev_sig` set to the payer's signature. When the counts agree that is the countersignature that closes the chain. When they don't, it is the dispute, in the same format.
 
 Both go to `bw-mint`. The Mint checks every signature, refuses NYMs it was not told about, appends each receipt and ack to `ledger.jsonl` (append only, nothing is ever rewritten), and once it holds both halves of a window writes a settlement:
 
@@ -216,7 +216,7 @@ Config (`/etc/bwkit/config.json`):
 |---|---|---|
 | `role` | all | `payer`, `hop` or `mint` |
 | `name` | all | The node's name on the ledger; the hostname by default |
-| `iface` | payer, hop | The metered interface, `wg0`. `file:/path.json` with `{"rx","tx"}` is the test meter. |
+| `iface` | payer, hop | The metered interface: `wg0` on the bench, `tailscale0` on the neighbor link. `file:/path.json` with `{"rx","tx"}` is the test meter. |
 | `hop_name`, `hop_url` | payer | The hop to ask for acks, by its peers.json name and its URL on the tunnel |
 | `mint` | payer, hop | The Mint's URL |
 | `port` | hop, mint | Listen port, 8710 |

@@ -34,11 +34,17 @@ ledger again from the payer's receipts.jsonl, the hop's acks.jsonl and the
 announcements alone and, with --compare, says whether the Mint's ledger and
 its commitments agree with it.
 
-The Mint also reports: `bwkit report` (the bwkit-status timer, every two
-minutes) summarises the ledger per node, names and roles, with the latest
+The Mint also reports: `bwkit report` (the bwkit-status timer, every ten
+minutes, and again after each commitment) summarises the ledger per node, names and roles, with the latest
 commitment, the Mint's NYM and the proofs of that hour, and posts it to the
 status page's Worker, so bandwidthswap.com can say which nodes are up and a
 browser can check the commitment while nothing reaches the LAN.
+
+The Mint also keeps the purchases and the Network Steward's book (spec,
+Section 15; the bwkit-steward timer), writes the month's invoice itself
+(bwkit-invoice.timer; GET /invoice, `bwkit invoice`), and a payer's balance
+and per-window locks for prepayment (Section 16), which are off until a
+deposit exists. README.md has each in turn.
 
 The receipt is the paper's Figure 2:
 
@@ -56,7 +62,7 @@ the window (a SHA-256 over them) until a chunked data plane exists.
 
 Files: config in /etc/bwkit/config.json (BWKIT_CONFIG), everything else in
 /var/lib/bwkit (BWKIT_DIR): key.priv, peers.json, state.json, ledger.jsonl,
-links.jsonl, outbox/, sent/. Every node keeps its own signed copies: the
+links.jsonl, purchases.jsonl, prepay.jsonl, invoices/, outbox/, sent/. Every node keeps its own signed copies: the
 payer appends receipts.jsonl and acks.jsonl, the hop receipts.jsonl (the
 payer's receipts it countersigned), acks.jsonl and links.jsonl, and both
 append sent.jsonl with the Mint's answer to each
