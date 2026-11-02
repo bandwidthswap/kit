@@ -7,7 +7,7 @@ window.BW = window.BW || {};
   var D = BW.D = {
     mode: 'live',          // 'live' (this node), 'snapshot' (data embedded in the page), 'fleet' (many nodes)
     base: '',              // the origin the JSON comes from; '' is this node
-    status: null, ledger: [], commitments: [], purchases: [], steward: null, map: null,
+    status: null, ledger: [], commitments: [], purchases: [], steward: null, stewardRuns: [], map: null,
     links: [], acks: [], receipts: [], outbox: [], proofs: {},     // a node's own records (hop, payer)
     mint: null,            // for a hop or payer: the Mint's ledger and commitments, as proxied by the node
     nodes: [],             // fleet: [{url, name, status, steward, map, ledger, error}]
@@ -36,7 +36,7 @@ window.BW = window.BW || {};
     D.mode='snapshot'; D.snapshot=true; D.status=s.status||null;
     D.ledger=typeof s.ledger==='string'?parseJsonl(s.ledger):(s.ledger||[]);
     D.commitments=s.commitments||[]; D.purchases=typeof s.purchases==='string'?parseJsonl(s.purchases):(s.purchases||[]);
-    D.steward=s.steward||null; D.map=s.map||null; D.proofs=s.proofs||{};   // proofs are kept as the Mint's own text, never re-serialised
+    D.steward=s.steward||null; D.stewardRuns=s.steward_runs||[]; D.map=s.map||null; D.proofs=s.proofs||{};   // proofs are kept as the Mint's own text, never re-serialised
     D.links=typeof s.links==='string'?parseJsonl(s.links):(s.links||[]);
     D.acks=typeof s.acks==='string'?parseJsonl(s.acks):(s.acks||[]);
     D.receipts=typeof s.receipts==='string'?parseJsonl(s.receipts):(s.receipts||[]);
@@ -58,6 +58,7 @@ window.BW = window.BW || {};
         jobs.push(opt(b, '/commitments', false, []).then(function(v){ D.commitments=v||[]; }));
         jobs.push(opt(b, '/purchases', true, '').then(function(v){ D.purchases=typeof v==='string'?parseJsonl(v):(v||[]); }));
         jobs.push(opt(b, '/steward', false, null).then(function(v){ D.steward=v; }));
+        jobs.push(opt(b, '/steward/history', false, []).then(function(v){ D.stewardRuns=v||[]; }));   // every run, so the as-of control can move the Steward too
         jobs.push(opt(b, '/map', false, null).then(function(v){ D.map=v; }));
       } else {
         jobs.push(opt(b, '/acks', true, '').then(function(v){ D.acks=parseJsonl(v); }));
@@ -76,7 +77,7 @@ window.BW = window.BW || {};
   BW.loadFleet = function(urls){
     D.mode='fleet'; var dayAgo=Math.floor(Date.now()/1000)-86400;
     return Promise.all(urls.map(function(u){
-      var n={url:u, name:null, status:null, steward:null, map:null, ledger:[], error:null, mine:true};
+      var n={url:u, name:null, status:null, steward:null, map:null, ledger:[], error:null, mine: !(BW.fleetTheirs && BW.fleetTheirs().indexOf(u)>=0)};   // a counterparty's node is watched, not counted as mine
       return get(u, '/status').then(function(st){ n.status=st; n.name=st.name;
         if(st.role!=='mint') return;
         return Promise.all([opt(u, '/steward', false, null).then(function(v){ n.steward=v; }), opt(u, '/map', false, null).then(function(v){ n.map=v; }), opt(u, '/ledger?since='+dayAgo, true, '').then(function(t){ n.ledger=parseJsonl(t); })]);

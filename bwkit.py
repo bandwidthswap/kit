@@ -3019,6 +3019,7 @@ class Node:
             snap["commitments"] = self.commitments()
             snap["purchases"] = self.file_bytes("purchases.jsonl").decode("utf-8")
             snap["steward"] = self.steward_view()
+            snap["steward_runs"] = self.steward_runs()
             snap["map"] = self.load_map() if self.map_path_exists() else None
             proofs = {}
             for c in snap["commitments"][-SNAPSHOT_PROOFS["mint"]:]:
@@ -3069,6 +3070,23 @@ class Node:
 
     def map_path_exists(self):
         return os.path.exists(os.environ.get("BWKIT_MAP") or self.config.get("map") or DEFAULT_MAP_PATH)
+
+    def steward_runs(self, since=0):
+        """GET /steward/history: the Steward's runs from steward.jsonl at or after `since`, oldest first, balances only.
+
+        Each run is the book as that run left it, so the page's as-of control
+        can draw the Steward's balances at any moment and not only now.
+        """
+        if self.role != "mint":
+            return []
+        out = []
+        for r in self.read_lines("steward.jsonl", skip_partial=True):
+            if not isinstance(r, dict) or r.get("kind") != "steward-run" or r.get("t", 0) < since:
+                continue
+            out.append({"t": r["t"], "income_usd": r.get("income_usd", 0), "escrow_usd": r.get("escrow_usd", 0), "posted_usd": r.get("posted_usd", 0),
+                        "paid_usd": r.get("paid_usd", 0), "refunded_usd": r.get("refunded_usd", 0), "held_by_cap_usd": r.get("held_by_cap_usd", 0),
+                        "posted": len(r.get("posted") or []), "skipped": list(r.get("skipped") or [])})
+        return out
 
     def steward_view(self):
         """GET /steward: the feed's steward object with the latest run's `skipped`, or None without a Steward key."""
@@ -3222,6 +3240,12 @@ class Node:
                     return self.reply(200, node.commitments())
                 if url.path == "/links" and node.role == "mint":
                     return self.reply(200, node.index["links"])
+                if url.path == "/steward/history" and node.role == "mint":
+                    q = urlparse.parse_qs(url.query).get("since", ["0"])[0]
+                    if not q.isdigit():
+                        return self.reply(400, {"error": "since must be Unix seconds"})
+                    with node.lock:
+                        return self.reply(200, node.steward_runs(int(q)))
                 if url.path == "/steward" and node.role == "mint":
                     with node.lock:
                         view = node.steward_view()

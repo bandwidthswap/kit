@@ -68,6 +68,27 @@ function noThrow(label, fn) { let out; try { out = fn(); } catch (e) { throw new
   ok(html.includes('<span class="k">windows settled</span><span class="v">50</span><span class="s">7 disputed · 14 commitments</span>'), 'Now shows 50 windows, 7 disputed, 14 commitments');
   eq(count(html, 'data-verify="'), 14, 'a verify button per committed hour');
   eq(count(html, 'data-verify-day="1"'), 1, 'and one button for the last day');
+  // the Steward as of a moment: the run nearest before it, from the history the Mint serves; between runs the book does not change
+  ok(html.includes('<h2>The Steward <small>runs on this host after each hour\'s commitment</small></h2>'), 'now: the Steward\'s book as the feed carries it');
+  const S0 = D.steward;
+  D.stewardRuns = [{ t: now - 7200, income_usd: 0.01, escrow_usd: 0.5, posted_usd: 0.2, paid_usd: 0.001, refunded_usd: 0, held_by_cap_usd: 0, posted: 1, skipped: ['the cabin: no link yet'] },
+                   { t: now - 3600, income_usd: 0.02, escrow_usd: 0.6, posted_usd: 0.3, paid_usd: 0.002, refunded_usd: 0.0005, held_by_cap_usd: 0.0001, posted: 1, skipped: [] }];
+  eq(BW.sec.stewardRunAt(D.stewardRuns, now - 5000).t, now - 7200, 'the run in force at a moment is the last at or before it');
+  eq(BW.sec.stewardRunAt(D.stewardRuns, now - 7200).t, now - 7200, 'a run at the moment itself counts');
+  eq(BW.sec.stewardRunAt(D.stewardRuns, now - 9000), null, 'none before the first');
+  D.asOf = now - 5000;
+  const asOfHtml = BW.views.mint(X, D.asOf);
+  ok(asOfHtml.includes('<h2>The Steward <small>as its run of '), 'as of a moment, the section is headed by the run it shows');
+  ok(asOfHtml.includes('<span class="k">income</span><span class="v">1.00¢</span>') || asOfHtml.includes('<span class="k">income</span><span class="v">$0.0100</span>'), 'the income of that run, not the feed\'s: ' + (asOfHtml.match(/<span class="k">income<\/span><span class="v">[^<]*/) || [''])[0]);
+  ok(asOfHtml.includes('<span class="k">match reserve</span><span class="v">'), 'the reserve is m of that run\'s income');
+  ok(asOfHtml.includes('That run skipped: the cabin: no link yet.'), 'that run\'s skipped list, not the feed\'s');
+  ok(asOfHtml.includes('nearest before ') && asOfHtml.includes('from the 2 runs the Mint keeps; between runs the book does not change'), 'the note says which run and why');
+  ok(!asOfHtml.includes('the as-of control does not move them'), 'the old disclaimer is gone');
+  D.asOf = now - 9000;
+  ok(BW.views.mint(X, D.asOf).includes('No Steward run before '), 'before the first run: says so instead of drawing now\'s book');
+  D.stewardRuns = [];
+  ok(BW.views.mint(X, D.asOf).includes('The Mint served no run history, so the Steward\'s balances are known only as of now.'), 'no history served: says so');
+  D.asOf = null; D.stewardRuns = []; D.steward = S0;
   // the day: the committed hours of the last 24 the node holds, oldest first, and the one line that sums the answers
   const day = BW.dayHours(X, now);
   ok(day.length > 0 && day.length <= 24 && day.every((w, i) => i === 0 || day[i - 1] < w), 'the day\'s hours are ascending and at most 24: ' + day.join(' '));
@@ -178,6 +199,25 @@ function noThrow(label, fn) { let out; try { out = fn(); } catch (e) { throw new
   eq(count(html, '<span class="st ok">on time</span>'), 1, 'the Mint\'s last hour committed on time');
   ok(html.includes('<h2>Position <small>the last 24 hours'), 'position across the Mints');
   ok(html.includes('bw-forest'), 'the node that did not answer is still on the grid');
+  // mine or theirs: a counterparty's node is watched, drawn, and left out of Position
+  const posOf = (h) => (h.match(/<span class="k">net<\/span><span class="v">([^<]*)/) || [])[1];
+  const net0 = posOf(html);
+  ok(net0, 'Position has a net figure: ' + net0);
+  const hop = D.nodes.find((n) => n.status && n.status.role === 'hop');
+  hop.mine = false;
+  const theirsHtml = BW.views.fleet(now);
+  ok(theirsHtml.includes('watched, not mine: ' + hop.status.name), 'Position names the node watched as a counterparty\'s');
+  ok(posOf(theirsHtml) !== net0, 'and its earnings leave the net: ' + net0 + ' → ' + posOf(theirsHtml));
+  ok(!theirsHtml.includes(hop.status.name + ' <span class="m">mine</span>'), 'its pair is no longer marked mine');
+  ok(theirsHtml.includes('bw-forest'), 'it stays on the grid');
+  eq(count(theirsHtml, 'data-mine="'), 0, 'a snapshot has no list editor, so no switch to press');
+  hop.mine = true;
+  eq(posOf(BW.views.fleet(now)), net0, 'back to mine, the net is as it was');
+  D.snapshot = false;
+  const live = BW.views.fleet(now);
+  eq(count(live, 'data-mine="'), D.nodes.length, 'live, one mine/theirs switch per node');
+  eq(count(live, '>mine</button>'), D.nodes.length, 'every node mine by default');
+  D.snapshot = true;
 }
 
 // ---------------------------------------------------------------- the verifier, bsp.js

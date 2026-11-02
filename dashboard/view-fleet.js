@@ -8,6 +8,10 @@ window.BW = window.BW || {};
 
   BW.fleetList=function(){ try{ var q=new URLSearchParams(location.search).get('nodes'); if(q) return q.split(',').map(function(s){ return s.trim(); }).filter(Boolean); var v=localStorage.getItem('bw.fleet.nodes'); return v?JSON.parse(v):[]; }catch(e){ return []; } };
   BW.fleetSave=function(list){ try{ localStorage.setItem('bw.fleet.nodes', JSON.stringify(list)); }catch(e){} };
+  // The nodes on the list that are not mine: watched, drawn on the grid and the map, but not counted in Position. The
+  // list lives in this browser like the fleet list itself.
+  BW.fleetTheirs=function(){ try{ var v=localStorage.getItem('bw.fleet.theirs'); return v?JSON.parse(v):[]; }catch(e){ return []; } };
+  BW.fleetTheirsSave=function(list){ try{ localStorage.setItem('bw.fleet.theirs', JSON.stringify(list)); }catch(e){} };
 
   // What a node's status alone says needs attention; its own `health` first when it carries one.
   function nodeAttention(n, now){
@@ -55,7 +59,8 @@ window.BW = window.BW || {};
       Object.keys(by).forEach(function(k){ var o=by[k], p=mine[o.payer]?o.amount+o.premium-o.refund:0, e=mine[o.hop]?o.amount-o.fee+o.premium:0; paid+=p; earned+=e; fees+=o.fee;
         rows+='<tr><td>'+esc(m.name)+'</td><td>'+esc(o.payer)+(mine[o.payer]?' <span class="m">mine</span>':'')+' pays '+esc(o.hop)+(mine[o.hop]?' <span class="m">mine</span>':'')+'</td><td class="n">'+o.windows+'</td><td class="n">'+bytes(o.bytes)+'</td><td class="n">'+money(o.amount+o.premium)+'</td><td class="n">'+money(o.fee)+'</td><td class="n">'+(p?'−'+money(p):'')+'</td><td class="n">'+(e?'+'+money(e):'')+'</td></tr>'; }); });
     if(!rows) return '<h2>Position</h2><div class="empty">No Mint in the fleet has settled a window in the last day.</div>';
-    var cells=[['paid by my payers', '−'+money(paid), 'carriage and premiums, less refunds'],['earned by my hops', '+'+money(earned), 'carriage less the fee, plus premiums'],['net', (earned-paid>=0?'+':'−')+money(Math.abs(earned-paid)), 'the last 24 hours'],['fees to the Stewards', money(fees), 'across my Mints']];
+    var theirs=nodes.filter(function(n){ return n.status && n.mine===false; }).map(function(n){ return n.status.name; });
+    var cells=[['paid by my payers', '−'+money(paid), 'carriage and premiums, less refunds'],['earned by my hops', '+'+money(earned), 'carriage less the fee, plus premiums'],['net', (earned-paid>=0?'+':'−')+money(Math.abs(earned-paid)), 'the last 24 hours'],['fees to the Stewards', money(fees), 'across my Mints'+(theirs.length?' · watched, not mine: '+theirs.join(', '):'')]];
     return '<h2>Position <small>the last 24 hours, across every Mint in the fleet</small></h2><div class="now">'+cells.map(function(c){ return '<div><span class="k">'+c[0]+'</span><span class="v">'+esc(c[1])+'</span><span class="s">'+esc(c[2])+'</span></div>'; }).join('')+'</div><div class="tbl" style="margin-top:10px"><table><thead><tr><th>Mint</th><th>pair</th><th class="n">windows</th><th class="n">settled</th><th class="n">paid</th><th class="n">fee</th><th class="n">I paid</th><th class="n">I earned</th></tr></thead><tbody>'+rows+'</tbody></table></div>';
   }
 
@@ -67,7 +72,7 @@ window.BW = window.BW || {};
 
   function listEditor(nodes){
     if(BW.D.snapshot) return '';
-    return '<div class="fleet-add"><input id="fleet-url" type="url" placeholder="http://a-node:8710" aria-label="a node\'s address"><button class="btn" id="fleet-add">add</button>'+nodes.map(function(n){ return '<button class="btn" data-remove="'+esc(n.url)+'" title="remove from this browser\'s list">× '+esc(n.name||n.url)+'</button>'; }).join('')+'<span class="note" style="margin:0">the list lives in this browser only</span></div>';
+    return '<div class="fleet-add"><input id="fleet-url" type="url" placeholder="http://a-node:8710" aria-label="a node\'s address"><button class="btn" id="fleet-add">add</button>'+nodes.map(function(n){ return '<span class="fleet-node"><button class="btn" data-mine="'+esc(n.url)+'" title="'+(n.mine!==false?'counted as mine in Position; press to watch it as a counterparty\'s':'a counterparty\'s: watched, not counted in Position; press to count it as mine')+'">'+(n.mine!==false?'mine':'theirs')+'</button><button class="btn" data-remove="'+esc(n.url)+'" title="remove from this browser\'s list">× '+esc(n.name||n.url)+'</button></span>'; }).join('')+'<span class="note" style="margin:0">the list lives in this browser only · mine/theirs says whose position a node counts toward</span></div>';
   }
 
   V.fleet=function(now){
@@ -75,7 +80,7 @@ window.BW = window.BW || {};
     if(!nodes.length) return '<h2>The fleet</h2><div class="empty">No nodes yet. Add each node\'s address below; the page reads their status and, for a Mint, its books, from this browser.</div>'+listEditor(nodes);
     var mints=nodes.filter(function(n){ return n.status&&n.status.role==='mint'; }).map(function(n){ return {node:n, name:n.status.name, X:mintBooks(n, now)}; });
     var placeOf=function(name){ for(var i=0;i<mints.length;i++){ var m=mints[i].node.map; if(m&&m.nodes&&m.nodes[name]) return (m.places[m.nodes[name]]||{}).name||m.nodes[name]; } return null; };
-    var mine=nodes.filter(function(n){ return n.status; }).map(function(n){ return n.status.name; });
+    var mine=nodes.filter(function(n){ return n.status && n.mine!==false; }).map(function(n){ return n.status.name; });
     var maps=mints.map(function(m){ return m.node.map ? C.mapChart(m.X, now, m.node.map, mine) : ''; }).join('');
     return [grid(nodes, now, placeOf), listEditor(nodes), attentionAll(nodes, now), hourAcross(mints, now), position(nodes, mints, now), maps].join('');
   };

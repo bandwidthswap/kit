@@ -91,14 +91,18 @@ window.BW = window.BW || {};
     return '<table style="width:auto"><thead><tr><th>window</th><th class="n">settled</th><th class="n">rate</th><th class="n">premium</th><th class="n">from the Steward</th><th class="n">returned</th></tr></thead><tbody>'+sortBy(paid.rows, function(s){ return s.t_first; }, true).map(function(s){ return '<tr><td>'+tstamp(s.t_first)+'</td><td class="n">'+bytes(s.settled_bytes)+'</td><td class="n">'+F.rateOf(s).toFixed(2)+' Mbit/s</td><td class="n">'+money(s.premium_usd||0)+'</td><td class="n">'+money(s.from_steward_usd||0)+'</td><td class="n">'+money(s.refund_usd||0)+'</td></tr>'; }).join('')+'</tbody></table>';
   };
 
+  // The Steward's run in force at a moment: the last run at or before it, from the history the Mint serves (/steward/history).
+  S.stewardRunAt=function(runs, at){ var best=null; (runs||[]).forEach(function(r){ if(r.t<=at && (!best || r.t>best.t)) best=r; }); return best; };
   S.steward=function(X, now){
     var s=BW.D.steward; if(!s) return '';
-    var last=s.last_run;
-    return '<h2>The Steward <small>runs on this host after each hour\'s commitment</small></h2><div class="now">'+
-      [['income', money(s.income_usd), 'f = '+pct(s.f,0)+' of every fee'],['in open offers', money(s.in_offers_usd!=null?s.in_offers_usd:s.posted_usd), ''],['escrow', money(s.escrow_usd), 'unposted'],['match reserve', money(s.reserve_usd), 'm = '+pct(s.m,0)+' of income'],['paid out', money(s.paid_usd), 'against receipts'],['returned', money(s.refunded_usd), 'to the escrow'],['held by the cap', money(s.held_by_cap_usd), 'f − '+pct(s.margin||0,0)+' per payer'],['last run', last?ago(last, now):'never', last?tstamp(last):'']]
+    var asOf=BW.D.asOf, runs=BW.D.stewardRuns||[], run=asOf?S.stewardRunAt(runs, asOf):null, b=run||s;
+    if(asOf && !run) return '<h2>The Steward <small>runs on this host after each hour\'s commitment</small></h2><div class="empty">'+(runs.length?'No Steward run before '+tstamp(asOf)+': the first is '+tstamp(runs[0].t)+'.':'The Mint served no run history, so the Steward\'s balances are known only as of now.')+'</div>';
+    var last=run?run.t:s.last_run, reserve=run?(run.income_usd||0)*(s.m||0):s.reserve_usd, offers=run?run.posted_usd:(s.in_offers_usd!=null?s.in_offers_usd:s.posted_usd);
+    return '<h2>The Steward <small>'+(run?'as its run of '+tstamp(run.t)+' left the book':'runs on this host after each hour\'s commitment')+'</small></h2><div class="now">'+
+      [['income', money(b.income_usd), 'f = '+pct(s.f,0)+' of every fee'],['in open offers', money(offers), run?'posted, as of that run':''],['escrow', money(b.escrow_usd), 'unposted'],['match reserve', money(reserve), 'm = '+pct(s.m,0)+' of income'],['paid out', money(b.paid_usd), 'against receipts'],['returned', money(b.refunded_usd), 'to the escrow'],['held by the cap', money(b.held_by_cap_usd), 'f − '+pct(s.margin||0,0)+' per payer'],[run?'that run':'last run', last?ago(last, now):'never', last?tstamp(last):'']]
       .map(function(c){ return '<div><span class="k">'+c[0]+'</span><span class="v">'+esc(c[1])+'</span><span class="s">'+esc(c[2])+'</span></div>'; }).join('')+'</div>'+
-      (s.skipped&&s.skipped.length?'<p class="note">Last run skipped: '+s.skipped.map(esc).join('; ')+'.</p>':'')+
-      (BW.D.asOf?'<p class="note">The Steward\'s balances are as of now; the as-of control does not move them.</p>':'')+
+      (b.skipped&&b.skipped.length?'<p class="note">'+(run?'That run':'Last run')+' skipped: '+b.skipped.map(esc).join('; ')+'.</p>':'')+
+      (asOf?'<p class="note">The balances above are the Steward\'s run nearest before '+tstamp(asOf)+', from the '+runs.length+' run'+(runs.length===1?'':'s')+' the Mint keeps; between runs the book does not change.</p>':'')+
       '<p class="note">NYM <code>'+esc(s.nym||'')+'</code> · the book in full: <code>bwkit steward book</code> on this host, and the public page at bandwidthswap.com/docs/steward.html.</p>';
   };
 

@@ -2416,7 +2416,7 @@ class Served(unittest.TestCase):
         self.lab.close()
 
     PAGE = ("/", "/fleet", "/snapshot", "/dash/data.js", "/dash/bsp.js", "/dash/style.css", "/dash/nothing.js", "/nothing")
-    PATHS = {"mint": ("/status", "/ledger", "/ledger?since=1", "/commitments", "/purchases", "/links", "/map", "/steward", "/proof?window=1800000000",
+    PATHS = {"mint": ("/status", "/ledger", "/ledger?since=1", "/commitments", "/purchases", "/links", "/map", "/steward", "/steward/history", "/proof?window=1800000000",
                       "/proof?window=x") + PAGE,
              "hop": ("/status", "/purchases", "/map", "/ledger", "/acks", "/receipts", "/links", "/outbox", "/mint/ledger", "/mint/commitments",
                      "/mint/links", "/mint/proof?window=1800000000", "/mint/map") + PAGE,
@@ -2619,7 +2619,7 @@ class Dashboard(unittest.TestCase):
         st.run(lab.t + 300)
         lab.hop.flush()                                                                             # its own copy of the ack, otherwise sent 5 s later
         here = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard")
-        shapes = {"mint": ["taken_at", "status", "ledger", "commitments", "purchases", "steward", "map", "proofs"],
+        shapes = {"mint": ["taken_at", "status", "ledger", "commitments", "purchases", "steward", "steward_runs", "map", "proofs"],
                   "hop": ["taken_at", "status", "acks", "receipts", "links", "outbox", "mint", "map", "proofs"],
                   "payer": ["taken_at", "status", "receipts", "acks", "purchases", "outbox", "mint", "map", "proofs"]}
         w = bwkit.commit_hour(list(lab.mint.index["settled"].values())[0])
@@ -2688,6 +2688,12 @@ class Dashboard(unittest.TestCase):
         self.assertEqual([r["id"] for r in own], [pid])                                                # the payer's own copies
         view = json.loads(bwkit.http_get(lab.mint_url + "/steward")[1])
         self.assertEqual((view["nym"], view["last_run"], view["skipped"] is not None, "adjusted" in view), (st.nym, lab.t + 300, True, True))
+        runs = json.loads(bwkit.http_get(lab.mint_url + "/steward/history")[1])       # the runs, for the page's as-of control
+        self.assertEqual([r["t"] for r in runs], [lab.t + 300])
+        self.assertEqual(sorted(runs[-1]), ["escrow_usd", "held_by_cap_usd", "income_usd", "paid_usd", "posted", "posted_usd", "refunded_usd", "skipped", "t"])
+        self.assertEqual((runs[-1]["income_usd"], runs[-1]["posted"] > 0), (view["income_usd"], True))   # the run's income is the feed's; it posted something
+        self.assertEqual(json.loads(bwkit.http_get(lab.mint_url + "/steward/history?since=%d" % (lab.t + 301))[1]), [])
+        self.assertEqual(lab.mint.snapshot_data()["steward_runs"], runs)
         self.assertIn("the-cabin", json.loads(bwkit.http_get(lab.mint_url + "/map")[1])["places"])
         for path in ("/steward", "/ledger", "/commitments"):
             with self.assertRaises(bwkit.urlerror.HTTPError) as cm:

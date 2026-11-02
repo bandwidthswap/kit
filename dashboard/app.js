@@ -94,6 +94,7 @@ window.BW = window.BW || {};
       if(b.id==='fleet-add'){ var u=$('fleet-url').value.trim().replace(/\/+$/,''); if(!u) return; var list=BW.fleetList(); if(list.indexOf(u)<0) list.push(u); BW.fleetSave(list); BW.loadFleet(list).then(draw); return; }
       if(b.dataset.close){ toggle(b.dataset.close); return; }
       if(b.dataset.remove){ var l2=BW.fleetList().filter(function(x){ return x!==b.dataset.remove; }); BW.fleetSave(l2); BW.loadFleet(l2).then(draw); return; }
+      if(b.dataset.mine){ var u2=b.dataset.mine, th=BW.fleetTheirs(), was=th.indexOf(u2)>=0; BW.fleetTheirsSave(was?th.filter(function(x){ return x!==u2; }):th.concat([u2])); (D.nodes||[]).forEach(function(n){ if(n.url===u2) n.mine=was; }); draw(); return; }
     }
     var tr=e.target.closest('tr.open'); if(tr && !e.target.closest('a,button')){ toggle(tr.dataset.win||tr.dataset.pur); }
   });
