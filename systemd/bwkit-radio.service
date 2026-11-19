@@ -2,8 +2,10 @@
 Description=bwkit: the radio carrier (receipts, acknowledgements and liveness over LoRa)
 After=network-online.target bwkit.service
 Wants=network-online.target
-# The T-Beam on USB, named by the udev rule provision.sh radio installs; without it there is nothing to carry.
-ConditionPathExists=/dev/bwradio
+# The T-Beam on USB is /dev/bwradio, named by the udev rule provision.sh radio installs. There is no
+# ConditionPathExists on it since bwradio 0.2.1: the carrier waits for a board that is not there and opens it when
+# it comes. A condition would leave the unit skipped at boot or at a restart with nothing to start it once the
+# board is plugged in, and it never stopped systemd's own restarts of a carrier that died without one.
 
 [Service]
 Type=simple

@@ -23,6 +23,9 @@ By role (every rule is in the plan):
   everyone   records to the Mint still in the outbox after GRACE_S go to the gateway by radio and are moved to sent/
              on its `delivered`; a beacon every BEACON_S
 
+A board that is not there, or that stops answering, is waited for and opened again every RECONNECT_S; the carrier keeps
+what it had asked and says so in one log line when the wait starts and every WAIT_LOG_S after. It never exits for it.
+
 config.json:  "radio": {"port": "/dev/bwradio", "gateway": false, "gateway_id": "!a1b2c3d4",
                         "peers": {"<NYM>": "!a1b2c3d4", ...}, "self_url": "http://127.0.0.1:8710",
                         "relay": {"<hop NYM>": "http://192.168.1.149:8710"}, "names": {"<NYM>": "bw-neighbor", ...}}
@@ -66,7 +69,7 @@ def load_bwkit():
 bwkit = load_bwkit()
 log = bwkit.log
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 RADIO_AFTER_S = 2        # a payer's receipt goes to the hop by radio this long after it is signed, unless an ack is held
 ASK_RETRY_S = 5          # and again this often while no ack and no decline has come back
 ASK_GIVE_UP_S = 90       # until this long after t_last: beyond the widest clock tolerance a link would announce, the window is lost
@@ -74,8 +77,15 @@ GRACE_S = 60             # a record for the Mint still in the outbox after this 
 RETRY_S = 300            # and again this often until the gateway says delivered
 BEACON_S = 600
 SWEEP_S = 15             # how often the outbox is looked at
+RECONNECT_S = 15         # how often a board that is missing or went quiet is looked for
+WAIT_LOG_S = 600         # and how often the log says the carrier is still waiting for it
+TURN_S = 0.5             # the loop's pause between looks at the board and the node's files
 RECENT_LINES = 400       # how far back receipts.jsonl and acks.jsonl are read
 REASONS = {"duplicate": 0, "replay": 1, "clock": 2, "unknown": 3, "patience": 4, "since": 5, "domain": 6, "profile": 7, "route": 8}
+
+
+class RadioGone(Exception):
+    """The board is not there or stopped answering. The carrier waits for it and opens it again (run, below)."""
 
 
 def tail(path, n=RECENT_LINES):
@@ -97,9 +107,9 @@ def tail(path, n=RECENT_LINES):
 
 
 class Carrier:
-    def __init__(self, node, radio, now=None):
+    def __init__(self, node, radio=None, now=None):
         cfg = node.config.get("radio") or {}
-        self.node, self.radio = node, radio
+        self.node, self.radio = node, None
         self.gateway = bool(cfg.get("gateway"))
         self.gateway_id = cfg.get("gateway_id")
         self.radio_of = dict(cfg.get("peers") or {})           # NYM -> radio id
@@ -114,7 +124,9 @@ class Carrier:
         self.last_beacon = None
         self.last_sweep = None
         self.sent_log = []                                      # what went on the air, for status and tests
-        radio.on_receive(self.on_packet)
+        self.board = {"state": "waiting", "since": None, "drops": 0, "why": None}   # for `bwradio status`: is the board there
+        if radio is not None:
+            self.attach(radio)
 
     # ---------------------------------------------------------------- helpers
 
@@ -124,9 +136,23 @@ class Carrier:
     def dest_for(self, nym):
         return self.radio_of.get(nym)
 
+    def attach(self, radio):
+        """Carry on this radio from now on; None while the board is away. What was asked and declined stays."""
+        self.radio = radio
+        if radio is not None:
+            radio.on_receive(self.on_packet)
+
+    def write_status(self, now):
+        try:
+            self.node.write_json("radio.json", {"heard": self.heard, "board": self.board, "written": int(now)})
+        except OSError:
+            pass
+
     def send(self, dest, packet, key=None, file=None, now=None):
         now = now if now is not None else time.time()
-        self.radio.send(dest, packet)
+        if self.radio is None:
+            raise RadioGone("no board")
+        self.radio.send(dest, packet)                           # RadioGone from here leaves nothing marked as sent
         self.sent_log.append((now, dest, packet[1], len(packet)))
         if key is not None:
             p = self.pending.get(key) or {"file": file, "sent": now, "tries": 0}
@@ -368,39 +394,62 @@ class Carrier:
             return
         b["radio"], b["heard_at"] = from_id, int(now)
         self.heard[b["name"] or from_id] = b
-        try:
-            self.node.write_json("radio.json", {"heard": self.heard, "written": int(now)})
-        except OSError:
-            pass
+        self.write_status(now)
 
 
 class MeshtasticRadio:
     """A T-Beam on its serial port through the Meshtastic Python API: data packets on the private port number, to a
-    node id or broadcast. Not yet run against a board: radio/PLAN.md, step 6, is where it is."""
+    node id or broadcast. Whatever the library or the port raises is RadioGone here: the board unplugged (no device
+    file), the port busy, or the library's own MeshInterfaceError when the board stops answering ("Timed out waiting
+    for connection completion", bw-house, Nov 2, 2026). The library's failures are not one family of exception, so
+    this boundary catches them all and the carrier's loop decides."""
     PORTNUM = 256   # PRIVATE_APP
 
     def __init__(self, port):
-        import meshtastic.serial_interface   # the venv at /opt/bwradio
-        from pubsub import pub
-        self.iface = meshtastic.serial_interface.SerialInterface(port)
-        self.my_id = self.iface.getMyUser()["id"]
+        self.port, self.iface, self.lost = port, None, None
         self.q = queue.Queue()
         self.cb = None
+        if not os.path.exists(port):                            # the udev link goes with the board
+            raise RadioGone("no board at %s" % port)
+        import meshtastic.serial_interface   # the venv at /opt/bwradio
+        from pubsub import pub
+        self.pub = pub
+        try:
+            self.iface = meshtastic.serial_interface.SerialInterface(port)
+            self.my_id = self.iface.getMyUser()["id"]
+        except (Exception, SystemExit) as e:                    # the library exits the process on some of its own errors
+            self.close()
+            raise RadioGone("cannot open the board at %s: %s" % (port, _words(e)))
         pub.subscribe(self._rx, "meshtastic.receive")
+        pub.subscribe(self._lost, "meshtastic.connection.lost")
 
     def _rx(self, packet, interface):
+        if interface is not self.iface:
+            return
         d = packet.get("decoded") or {}
         if d.get("portnum") not in ("PRIVATE_APP", self.PORTNUM):
             return
         self.q.put((bytes(d.get("payload") or b""), packet.get("fromId")))
 
+    def _lost(self, interface):
+        """The library's reader thread ended: the port closed under it."""
+        if interface is self.iface:
+            self.lost = "the board stopped answering on %s" % self.port
+
     def on_receive(self, cb):
         self.cb = cb
 
     def send(self, dest, data):
-        self.iface.sendData(data, destinationId=dest or "^all", portNum=self.PORTNUM, wantAck=dest is not None)
+        try:
+            self.iface.sendData(data, destinationId=dest or "^all", portNum=self.PORTNUM, wantAck=dest is not None)
+        except Exception as e:
+            raise RadioGone("the board at %s did not take a packet: %s" % (self.port, _words(e)))
 
     def poll(self):
+        if self.lost:
+            raise RadioGone(self.lost)
+        if not os.path.exists(self.port):
+            raise RadioGone("the board at %s is gone" % self.port)
         while True:
             try:
                 data, from_id = self.q.get_nowait()
@@ -408,6 +457,78 @@ class MeshtasticRadio:
                 return
             if self.cb:
                 self.cb(data, from_id)
+
+    def close(self):
+        """Let go of the port and the library's threads, quietly: the board may already be gone."""
+        for fn, topic in ((self._rx, "meshtastic.receive"), (self._lost, "meshtastic.connection.lost")):
+            try:
+                self.pub.unsubscribe(fn, topic)
+            except Exception:
+                pass
+        try:
+            if self.iface is not None:
+                self.iface.close()
+        except Exception:
+            pass
+        self.iface = None
+
+
+def _words(e):
+    """An exception as a few words for one log line."""
+    return ("%s: %s" % (type(e).__name__, e)).strip().splitlines()[0][:160]
+
+
+def run(carrier, open_radio, turns=None, sleep=time.sleep, clock=time.time):
+    """Carry until stopped (or for `turns` passes of the loop, for the tests). open_radio() returns a radio or raises
+    RadioGone. A board missing at the start, or one that drops off later, is waited for and opened again RECONNECT_S
+    apart, on the same carrier, so what it had asked and what was declined are kept. The wait is one log line when
+    it starts and one every WAIT_LOG_S, and the board's state is in radio.json for `bwradio status`.
+
+    Why: from Nov 2 to Nov 18, 2026, bw-house's board was off its USB, the process died on FileNotFoundError each
+    time and systemd restarted it every ten seconds, 112,000 times, a traceback each, which pushed everything else
+    out of the node's journal in RAM. (The unit had a ConditionPathExists on the device then. systemd reads it at a
+    start, not on its own restarts, so it did not stop the loop; it is gone from the unit, since a skipped unit has
+    nothing to start it when the board comes back.) Returns how many times a board that was open went away."""
+    radio, gone_since, said, n = None, None, None, 0
+    carrier.board.update(state="waiting", since=int(clock()), why=None)
+    while turns is None or n < turns:
+        n += 1
+        try:
+            if radio is None:
+                radio = open_radio()
+                carrier.attach(radio)
+                now = clock()
+                log("bwradio %s: %s %s on %s as %s%s%s%s" % (
+                    VERSION, carrier.node.role, carrier.node.name, getattr(radio, "port", "the board"), getattr(radio, "my_id", "?"),
+                    ", the Mint's gateway" if carrier.gateway else "",
+                    ", relays for %s" % ", ".join(carrier.peers().get(x, x[:20]) for x in carrier.relay) if carrier.relay else "",
+                    "" if gone_since is None else ", back after %d s without it" % (now - gone_since)))
+                gone_since = said = None
+                carrier.board.update(state="up", since=int(now), why=None)
+                carrier.write_status(now)
+            radio.poll()
+            carrier.tick(clock())
+        except RadioGone as e:
+            now = clock()
+            if radio is not None:                               # it was open: it dropped off
+                carrier.board["drops"] += 1
+                if hasattr(radio, "close"):
+                    radio.close()
+                radio = None
+                carrier.attach(None)
+            if gone_since is None:
+                gone_since = now
+                carrier.board.update(state="waiting", since=int(now))
+            carrier.board["why"] = str(e)
+            if said is None or now - said >= WAIT_LOG_S:
+                log("radio: %s; waiting for it, looking every %d s%s" % (
+                    e, RECONNECT_S, "" if said is None else " (%d min without it)" % ((now - gone_since) // 60)))
+                said = now
+                carrier.write_status(now)
+            sleep(RECONNECT_S)
+            continue
+        sleep(TURN_S)
+    return carrier.board["drops"]
 
 
 def main(argv):
@@ -421,19 +542,15 @@ def main(argv):
         except OSError:
             print("nothing heard yet")
         print("outbox: %d" % len(os.listdir(node.path("outbox"))))
+        port = cfg.get("port") or "/dev/bwradio"
+        print("board: %s %s" % (port, "is there" if os.path.exists(port) else "is NOT there"))
         return 0
     if cmd != "run":
         print(__doc__)
         return 2
     port = cfg.get("port") or "/dev/bwradio"
-    radio = MeshtasticRadio(port)
-    carrier = Carrier(node, radio)
-    log("bwradio %s: %s %s on %s as %s%s%s" % (VERSION, node.role, node.name, port, radio.my_id, ", the Mint's gateway" if carrier.gateway else "",
-        ", relays for %s" % ", ".join(carrier.peers().get(n, n[:20]) for n in carrier.relay) if carrier.relay else ""))
-    while True:
-        radio.poll()
-        carrier.tick()
-        time.sleep(0.5)
+    run(Carrier(node), lambda: MeshtasticRadio(port))
+    return 0
 
 
 if __name__ == "__main__":

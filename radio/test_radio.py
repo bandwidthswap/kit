@@ -50,15 +50,40 @@ class FakeMesh:
 
 
 class FakeRadio:
+    """gone: a reason once the board is unplugged; from then on it raises as the real one does."""
     def __init__(self, mesh, rid):
-        self.mesh, self.id, self.cb = mesh, rid, None
+        self.mesh, self.id, self.my_id, self.cb = mesh, rid, rid, None
+        self.gone, self.closed = None, False
 
     def on_receive(self, cb):
         self.cb = cb
 
     def send(self, dest, data):
+        if self.gone:
+            raise bwradio.RadioGone(self.gone)
         assert len(data) <= wire.MAX_PAYLOAD
         self.mesh.queue.append((dest, data, self.id))
+
+    def poll(self):
+        if self.gone:
+            raise bwradio.RadioGone(self.gone)
+
+    def close(self):
+        self.closed = True
+
+
+class Clock:
+    """The loop's clock and its sleep: sleeping is the only thing that moves the time."""
+    def __init__(self, t):
+        self.t, self.at = t, {}
+
+    def __call__(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += s
+        for when in sorted(k for k in self.at if k <= self.t):
+            self.at.pop(when)()
 
 
 class Outage(unittest.TestCase):
@@ -304,6 +329,134 @@ class Relayed(Outage):
 
     def test_beacons_are_heard_and_written_by_the_gateway(self):
         pass
+
+
+class Board(unittest.TestCase):
+    """The board is not there, or goes away: the carrier waits for it, says so once, and carries on where it was.
+    (bw-house, Nov 2 to 18, 2026: the board off its USB, the process dead on FileNotFoundError every ten seconds.)"""
+
+    def setUp(self):
+        self.lab = Lab()
+        lab = self.lab
+        lab.payer.config["hop_url"] = "http://127.0.0.1:1"
+        lab.payer.config["radio"] = {"gateway": True, "peers": {lab.hop.nym: "!hop", lab.mint.nym: "!house"}}
+        self.mesh = FakeMesh()
+        self.carrier = bwradio.Carrier(lab.payer)               # no radio yet: main() makes it this way
+        self.logged = []
+        self.quiet, bwradio.log = bwradio.log, self.logged.append
+
+    def tearDown(self):
+        bwradio.log = self.quiet
+        self.lab.close()
+
+    def status(self):
+        with open(self.lab.payer.path("radio.json")) as f:
+            return json.load(f)
+
+    def waiting_lines(self):
+        return [x for x in self.logged if "waiting for it" in x]
+
+    def test_no_board_at_the_start_is_waited_for_and_opened_when_it_appears(self):
+        clock, tries = Clock(self.lab.t), []
+
+        def open_radio():
+            tries.append(clock())
+            if len(tries) <= 3:
+                raise bwradio.RadioGone("no board at /dev/bwradio")
+            return self.mesh.radio("!house")
+
+        drops = bwradio.run(self.carrier, open_radio, turns=5, sleep=clock.sleep, clock=clock)
+        self.assertEqual(drops, 0)                              # it was never open, so it never dropped
+        self.assertEqual([t - tries[0] for t in tries], [0, 15, 30, 45])   # RECONNECT_S apart, no faster
+        self.assertEqual(len(self.waiting_lines()), 1)          # said once, not once a try
+        self.assertIn("no board at /dev/bwradio", self.waiting_lines()[0])
+        up = [x for x in self.logged if x.startswith("bwradio ")]
+        self.assertEqual(len(up), 1)
+        self.assertIn("as !house, the Mint's gateway, back after 45 s without it", up[0])
+        self.assertEqual([q[1][1] for q in self.mesh.queue], [wire.BEACON])   # and it carries: its first beacon
+        self.assertEqual((self.carrier.board["state"], self.carrier.board["drops"]), ("up", 0))
+        self.assertEqual(self.status()["board"]["state"], "up")
+
+    def test_a_board_that_never_comes_is_said_every_ten_minutes_and_nothing_raises(self):
+        clock, tries = Clock(self.lab.t), []
+
+        def open_radio():
+            tries.append(clock())
+            raise bwradio.RadioGone("no board at /dev/bwradio")
+
+        bwradio.run(self.carrier, open_radio, turns=100, sleep=clock.sleep, clock=clock)   # 25 minutes of it
+        self.assertEqual(len(tries), 100)
+        lines = self.waiting_lines()
+        self.assertEqual(len(lines), 3)                         # at the start, at ten minutes, at twenty
+        self.assertIn("(10 min without it)", lines[1])
+        self.assertIn("(20 min without it)", lines[2])
+        self.assertEqual(self.logged, lines)                    # and nothing else: no traceback, no line a try
+        board = self.status()["board"]
+        self.assertEqual((board["state"], board["drops"], board["why"]), ("waiting", 0, "no board at /dev/bwradio"))
+        self.assertEqual(board["since"], self.lab.t)            # since the start, not since the last try
+
+    def test_a_board_that_drops_off_is_opened_again_and_the_ask_goes_on(self):
+        lab = self.lab
+        out = lab.hour(1_000, 1_000)                            # a receipt the hop never acked: the tunnel is down
+        self.assertIsNone(out["ack"])
+        sig, key = out["receipt"]["sig"], (out["receipt"]["sig"], "!hop")
+        clock = Clock(lab.t)
+        first = self.mesh.radio("!house")
+        clock.at[lab.t + 3] = lambda: setattr(first, "gone", "the board at /dev/bwradio is gone")   # unplugged at 3 s
+        radios = [first, None, None, self.mesh.radio("!house")]  # then two looks find nothing, the third finds it back
+
+        def open_radio():
+            r = radios.pop(0)
+            if r is None:
+                raise bwradio.RadioGone("no board at /dev/bwradio")
+            return r
+
+        self.carrier.last_beacon = lab.t + 10 ** 9              # the beacons have their own test
+        carrier = self.carrier
+        drops = bwradio.run(carrier, open_radio, turns=12, sleep=clock.sleep, clock=clock)
+        self.assertEqual(drops, 1)
+        self.assertTrue(first.closed)                           # the port is let go before it is opened again
+        self.assertIs(carrier.radio, self.mesh.radios["!house"])
+        self.assertEqual(carrier.pending[key]["tries"], 2)      # asked at 2 s on the first board, again on the second
+        self.assertEqual(carrier.first_seen[sig], lab.t)        # the same carrier: what it knew, it still knows
+        self.assertEqual([q[1][1] for q in self.mesh.queue], [wire.RECEIPT, wire.RECEIPT])
+        self.assertEqual(len(self.waiting_lines()), 1)
+        self.assertIn("the board at /dev/bwradio is gone", self.waiting_lines()[0])
+        self.assertTrue(any("back after" in x for x in self.logged))
+        self.assertEqual((self.status()["board"]["state"], self.status()["board"]["drops"]), ("up", 1))
+
+    def test_a_packet_the_board_did_not_take_is_not_marked_sent(self):
+        radio = self.mesh.radio("!house")
+        self.carrier.attach(radio)
+        radio.gone = "the board at /dev/bwradio did not take a packet"
+        with self.assertRaises(bwradio.RadioGone):
+            self.carrier.tick(self.lab.t)                       # the first beacon
+        self.assertEqual((self.carrier.sent_log, self.carrier.pending, self.carrier.last_beacon), ([], {}, None))
+        radio.gone = None
+        self.carrier.tick(self.lab.t + 1)                       # so the next pass sends it
+        self.assertEqual([q[1][1] for q in self.mesh.queue], [wire.BEACON])
+
+    def test_the_real_radio_turns_what_the_library_raises_into_a_wait(self):
+        with self.assertRaises(bwradio.RadioGone) as c:        # no device file: said before the library is even loaded
+            bwradio.MeshtasticRadio("/nonexistent/bwradio")
+        self.assertEqual(str(c.exception), "no board at /nonexistent/bwradio")
+
+        class Iface:                                            # the library, as it failed on bw-house on Nov 2
+            def sendData(self, *a, **k):
+                raise Exception("Timed out waiting for connection completion")
+        r = bwradio.MeshtasticRadio.__new__(bwradio.MeshtasticRadio)
+        r.port, r.iface, r.lost = __file__, Iface(), None       # any path that exists stands in for the device
+        with self.assertRaises(bwradio.RadioGone) as c:
+            r.send(None, b"x")
+        self.assertIn("Timed out waiting for connection completion", str(c.exception))
+        r._lost(object())                                       # another interface's loss is not this board's
+        self.assertIsNone(r.lost)
+        r._lost(r.iface)                                        # the library's reader ended: the next poll says so
+        with self.assertRaises(bwradio.RadioGone):
+            r.poll()
+        r.lost, r.port = None, "/nonexistent/bwradio"           # and so does a device file that went away
+        with self.assertRaises(bwradio.RadioGone):
+            r.poll()
 
 
 if __name__ == "__main__":
