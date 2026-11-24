@@ -1338,6 +1338,65 @@ class Prepay(unittest.TestCase):
             out = lab.hour(200_000_000, 200_000_000)
         self.assertNotIn("lock", out)
 
+    def test_a_hop_that_does_not_answer_does_not_make_the_lock_late(self):
+        """Nov 23, 2026: with the hop off the air the hourly job waited out its post to the hop, so the lock reached the Mint ten
+        seconds behind its window and was refused (`since`), at each of 51 hours. The payer now locks without waiting for a hop
+        that is silent, and still takes the hop's answer when it comes."""
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+        lab = self.lab
+        lab.mint.config["steward_mint"] = lab.mint_url
+        lab.payer.config["prepay"] = {"enabled": True}
+        cli(["deposit", "bw-house", "0.05", "cash"], mint_env(lab))
+        clock = {"t": lab.t}
+        seen = {}
+
+        def held_at_the_mint():
+            return lab.mint.index["prepay"].lock_for(lab.payer.nym, lab.hop.nym, lab.t) is not None
+
+        class SilentHop(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                self.rfile.read(int(self.headers["Content-Length"]))
+                if self.path == "/ack":
+                    # hold the receipt as a hop that is away holds it, until the Mint has the lock or three seconds pass;
+                    # after that the Mint's clock is ten seconds on, where it stands when a post to the hop has timed out
+                    deadline = time.monotonic() + 3
+                    while time.monotonic() < deadline and not held_at_the_mint():
+                        time.sleep(0.02)
+                    seen["locked while the hop was silent"] = held_at_the_mint()
+                    clock["t"] += 10
+                data = b'{"error": "away"}'
+                self.send_response(503)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), SilentHop)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        lab.payer.config["hop_url"] = "http://127.0.0.1:%d" % srv.server_address[1]
+        try:
+            clock["t"] = lab.t + 3600
+            with mock.patch("time.time", side_effect=lambda: clock["t"]), mock.patch.object(bwkit, "LOCK_HOP_GRACE_S", 0.2):
+                out = lab.hour(100_000_000, 100_000_000)
+                held = out["lock"]
+                self.assertIsNotNone(held, out["lock_error"])                       # countersigned, though the hop never acknowledged
+                self.assertEqual((held["t_first"], held["mint"]), (lab.t, lab.mint.nym))
+                self.assertTrue(seen["locked while the hop was silent"])            # the Mint had it before the hop's post came back
+                self.assertIsNone(out["ack"])
+                self.assertEqual((out["sent"], out["left"]), (1, 0))                # the receipt went to the Mint too, once
+                self.assertEqual(clock["t"], lab.t + 10)
+                # the same lock asked for only now, as the job asked for it before, is behind its window: the Mint's rule holds
+                late = lab.payer.lock_record(lab.t, 100_000_000, now=clock["t"])[0]
+                status, ans = self.post(late)
+                self.assertEqual((status, ans["error"]), (409, "since"))
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
     def test_the_hop_takes_locks_gates_on_them_and_claims_a_window_never_closed(self):
         """Step 4: the hop keeps the locks payers show it, declines a receipt with no lock when it requires one (the on_decline hook),
         offers the service again when a lock arrives (on_cover), says who is covered in its status, and claims a window the payer

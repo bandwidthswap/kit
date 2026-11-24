@@ -160,6 +160,8 @@ BSP_MODULE = """<script type="module">import * as bsp from './dash/bsp.js'; wind
 DECLINE_WORDS = ("clock", "patience", "since", "domain", "profile", "replay", "route", "duplicate", "balance", "lock")   # 409 reasons, the word before the colon
 TOKEN_RE = re.compile(r"^[a-z0-9-]{1,32}$")   # a medium or range class
 HTTP_TIMEOUT_S = 10
+LOCK_HOP_GRACE_S = 2                    # a payer that locks waits this long for its hop's ack before it locks the open window without it:
+                                        # the Mint's slack on a lock's `since` is CLOCK_TOLERANCE_S, and a dead hop holds the job HTTP_TIMEOUT_S
 MINT_INFO_S = (600, 60)                 # a hop or payer re-reads its Mint's name and NYM this often: after an answer, after none
 MINT_INFO_TIMEOUT_S = 2                 # and waits this long for it, so its own /status is not held up by a Mint that is away
 HOP_FLUSH_DELAY_S = 5                   # the hop sends its own copy of an ack this long after answering the payer
@@ -2002,13 +2004,34 @@ class Node:
         self.append("receipts.jsonl", env)
         self.outbox_put(env)
         ack = None
+        locks = bool((self.config.get("prepay") or {}).get("enabled"))
+        early, sent = None, 0
         hop_url = self.config.get("hop_url")
         if hop_url:
-            try:
-                status, body = http_post(hop_url.rstrip("/") + "/ack", env)
-            except (urlerror.URLError, socket.timeout, OSError) as e:
-                log("hop unreachable: %s" % e)
-                status, body = None, None
+            def ask_hop():
+                try:
+                    return http_post(hop_url.rstrip("/") + "/ack", env) + (None,)
+                except (urlerror.URLError, socket.timeout, OSError) as e:
+                    return None, None, e
+            if locks:
+                # A hop that does not answer holds this job for HTTP_TIMEOUT_S, and a lock that reaches the Mint that late is
+                # refused (`since`). So the hop is asked on the side: when it has not answered within LOCK_HOP_GRACE_S the
+                # receipt goes to the Mint and the open window is locked now, and the hop's answer is taken when it comes.
+                # A hop that answers in time leaves the order as it was: ack, the Mint, the lock.
+                box = []
+                asking = threading.Thread(target=lambda: box.append(ask_hop()), daemon=True)
+                asking.start()
+                asking.join(LOCK_HOP_GRACE_S)
+                if asking.is_alive():
+                    log("the hop has not answered in %s s; the receipt goes to the Mint and the open window is locked without waiting" % LOCK_HOP_GRACE_S)
+                    sent, _ = self.flush()
+                    early = self.lock_next(env, now)
+                    asking.join()
+                status, body, err = box[0] if box else (None, None, OSError("no answer"))
+            else:
+                status, body, err = ask_hop()
+            if err is not None:
+                log("hop unreachable: %s" % err)
             if status == 200:
                 try:
                     signer = check_envelope(body)
@@ -2023,11 +2046,12 @@ class Node:
                     log("hop returned a bad ack: %s" % e)
             elif status is not None:
                 log("hop declined: %s %s" % (status, body))
-        sent, left = self.flush()
+        more, left = self.flush()
+        sent += more
         log("sent %d to the Mint, %d left in outbox" % (sent, left))
         out = {"receipt": env, "ack": ack, "sent": sent, "left": left}
-        if (self.config.get("prepay") or {}).get("enabled"):
-            out.update(self.lock_next(env, now))              # the lock for the window that just opened (spec, Section 16; step 3)
+        if locks:
+            out.update(early if early is not None else self.lock_next(env, now))   # the lock for the window that just opened (spec, Section 16; step 3)
         return out
 
     # prepayment on the payer (spec, Section 16; step 3): the lock for the coming window, after each receipt
