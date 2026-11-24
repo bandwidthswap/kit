@@ -398,6 +398,10 @@ class StatusReport(unittest.TestCase):
                           (self.lab.t - 3600, self.lab.t, 2_000_000, 1_000_000, True)])
         self.assertEqual([w["bytes"] for w in by["bw-forest"]["history"]], [1_000_000, 1_000_000])
         self.assertEqual([(w["bytes"], w["disputed"]) for w in by["bw-mint"]["history"]], [(1_000_000, False), (1_000_000, True)])
+        # no lock was held for either window: each settled on credit, and every node's history says so (Section 16)
+        for name in ("bw-house", "bw-forest", "bw-mint"):
+            self.assertEqual([w["covered"] for w in by[name]["history"]], [False, False], name)
+            self.assertEqual(set(by[name]["history"][0]), {"t_first", "t_last", "bytes", "settled_bytes", "disputed", "covered"}, name)
         text = json.dumps(rep)
         self.assertNotIn("127.0.0.1", text)                  # names, roles and signed records; never an address
         bwkit.assert_public(text)
@@ -435,6 +439,8 @@ class StatusReport(unittest.TestCase):
         by = {n["name"]: n for n in rep["nodes"]}
         last = by["bw-house"]["history"][-1]
         self.assertEqual((last["bytes"], last["settled_bytes"], last["disputed"]), (1000, None, None))
+        self.assertIsNone(last["covered"])                       # no settlement is held, so neither covered nor on credit
+        self.assertIs(by["bw-house"]["history"][-2]["covered"], False)
         self.assertEqual(rep["ledger"]["receipts_without_ack"], 1)
         self.lab.hop_srv = self.lab.hop.serve("127.0.0.1", 0, block=False)   # so close() has something to shut down
 
@@ -1203,6 +1209,43 @@ class Prepay(unittest.TestCase):
         self.assertEqual(lab.mint.prepay_balance(lab.payer.nym)["balance"], 49900)
         self.assertEqual(sorted(lab.mint.index["prepay"].claims), [rec["id"]])
 
+    def test_the_report_marks_each_window_covered_on_credit_or_not_settled(self):
+        """The public report's history (Nov 23, 2026): `covered` is true for a window settled against a lock, false for one
+        settled on credit, null where no settlement is held; the record is still public and signed over what it carries."""
+        lab = self.lab
+        lab.mint.config["steward_mint"] = lab.mint_url
+        cli(["deposit", "bw-house", "0.05", "cash"], mint_env(lab))
+        with mock.patch("time.time", return_value=lab.t - 1):
+            status, ans = self.post(self.signed(lab.payer.priv, self.lock_body(lab.t, 12500, now=lab.t - 1)))
+        self.assertEqual(status, 200, ans)
+        lab.hour(100_000_000, 100_000_000)                                 # a lock was held: covered
+        lab.hour(300_000_000, 150_000_000)                                 # none for this one: on credit, and disputed besides
+        lab.hop_srv.shutdown()
+        lab.hop_srv.server_close()
+        try:
+            lab.hour(301_000_000, 151_000_000)                             # the hop never acknowledges: no settlement is held
+            rec = lab.mint.status_record(now=lab.t + 5)
+        finally:
+            lab.hop_srv = lab.hop.serve("127.0.0.1", 0, block=False)       # so close() has something to shut down
+        by = {n["name"]: n["history"] for n in rec["nodes"]}
+        self.assertEqual([(w["settled_bytes"], w["disputed"], w["covered"]) for w in by["bw-house"]],
+                         [(100_000_000, False, True), (50_000_000, True, False), (None, None, None)])
+        self.assertEqual([(w["settled_bytes"], w["covered"]) for w in by["bw-forest"]], [(100_000_000, True), (50_000_000, False)])
+        self.assertEqual([(w["settled_bytes"], w["disputed"], w["covered"]) for w in by["bw-mint"]],
+                         [(100_000_000, False, True), (50_000_000, True, False)])
+        for h in by.values():
+            for w in h:
+                self.assertIn(w["covered"], (True, False, None))
+                self.assertIs(type(w["covered"]), bool if w["settled_bytes"] is not None else type(None))   # a flag or null, never 0 or 1
+        # the signed bytes carry the three values as JSON writes them, and the signature holds on the parsed text
+        signed = bwkit.status_canon(rec).decode()
+        for lit in ('"covered":true', '"covered":false', '"covered":null'):
+            self.assertIn(lit, signed)
+        self.assertTrue(bwkit.verify_status(rec))
+        self.assertTrue(bwkit.verify_status(json.loads(json.dumps(rec))))
+        bwkit.assert_public(json.dumps(rec))
+        self.assertEqual(rec["prepaid"]["bw-house"]["covered"], 1)          # the book's count agrees with the marks
+
     def test_a_covered_window_draws_on_its_lock_a_claim_settles_and_a_lock_releases(self):
         """Step 2: the settlement debits the lock, a claim settles the window the payer never closed, an unclaimed lock releases,
         the invoice carries the prepayment line, the payer's `owed` agrees, and the rebuild from the files agrees with the Mint."""
@@ -1263,6 +1306,13 @@ class Prepay(unittest.TestCase):
             rep = lab.mint.status_report(now=lab.t + 3600 + 14400)
         self.assertEqual(list(rep["prepaid"]), ["bw-house"])
         self.assertEqual((rep["prepaid"]["bw-house"]["balance"], rep["prepaid"]["bw-house"]["debited"], rep["prepaid"]["bw-house"]["covered"], rep["prepaid"]["bw-house"]["released"]), (20000, 30000, 2, 15000))
+        # and each window of the history says whether it settled against a lock: the page's covered mark. The claimed window is
+        # on the Mint's row only (the payer signed no receipt for it and the hop no acknowledgement), and it is a covered one.
+        hist = {n["name"]: n["history"] for n in rep["nodes"]}
+        self.assertEqual([(w["t_first"], w["settled_bytes"], w["disputed"], w["covered"]) for w in hist["bw-mint"]],
+                         [(lab.t - 3600, 100_000_000, False, True), (lab.t, 200_000_000, False, True)])
+        self.assertEqual([(w["t_first"], w["covered"]) for w in hist["bw-house"]], [(lab.t - 3600, True)])
+        self.assertEqual([(w["t_first"], w["covered"]) for w in hist["bw-forest"]], [(lab.t - 3600, True)])
         bwkit.assert_public(json.dumps(rep))
         # `owed` on the payer, with the registry through its proxy, agrees figure for figure, the prepayment line too
         with mock.patch("time.time", return_value=lab.t + 3600 + 14400):

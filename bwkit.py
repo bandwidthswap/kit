@@ -3306,7 +3306,9 @@ class Node:
         settled for the Mint), and `history`: its windows of the last twelve
         hours (HISTORY_HOURS, at most HISTORY_MAX), each with the window's
         bounds, the bytes, the settled bytes and the disputed flag (None while
-        unsettled). The Mint's own line counts what it recorded. `since` is
+        unsettled), and `covered` (Section 16): True for a window settled
+        against a lock, False for one settled on credit, None while no
+        settlement is held. The Mint's own line counts what it recorded. `since` is
         when the first entry reached the ledger. `service` is whether the
         Mint's server answered (service_up), None when not checked.
         `commitment` is the Mint's latest: the hour, the Merkle root over
@@ -3343,7 +3345,8 @@ class Node:
         def window_of(r, nbytes, st):
             return {"t_first": r["t_first"], "t_last": r["t_last"], "bytes": nbytes,
                     "settled_bytes": st["settled_bytes"] if st else None,
-                    "disputed": (st["status"] == "disputed") if st else None}
+                    "disputed": (st["status"] == "disputed") if st else None,
+                    "covered": bool(st.get("covered")) if st else None}     # settled against a lock, on credit, or not settled (Section 16)
 
         for name in peers.values():
             node(name, "peer")                      # a peer with nothing on the ledger yet is still listed
