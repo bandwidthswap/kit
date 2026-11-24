@@ -110,6 +110,12 @@ function noThrow(label, fn) { let out; try { out = fn(); } catch (e) { throw new
     eq(bc.locks[1].state, 'settled', 'and its state is settled');
     ok(BW.views.mint(Xc, now).includes('<span class="st covered" title="drew 1.33¢ on lock ffffffff">covered</span>'), 'the row says covered and what it drew');
     D.ledger.pop();
+    // a covered window that drew more than the balance held: it settles in full and the balance is below zero, owed (spec, Section 16)
+    D.ledger.push(Object.assign({}, cov, { debit: 1013300 }));
+    const Xn = BW.derive(now), bn = Xn.prepay.payers[house];
+    eq([bn.locked, bn.debited, bn.balance].join(' '), '0 1013300 -13300', 'the draw is whole and the balance is 1.33¢ below zero');
+    ok(BW.views.mint(Xn, now).includes('<b>−1.33¢</b> <span class="m">owed</span>'), 'the Mint\'s table says it is owed');
+    D.ledger.pop();
   }
   // the Steward as of a moment: the run nearest before it, from the history the Mint serves; between runs the book does not change
   ok(html.includes('<h2>The Steward <small>runs on this host after each hour\'s commitment</small></h2>'), 'now: the Steward\'s book as the feed carries it');
@@ -235,6 +241,13 @@ function noThrow(label, fn) { let out; try { out = fn(); } catch (e) { throw new
   ok(html.includes('<span class="k">locked ahead</span><span class="v">1.50¢</span><span class="s">for the ' + BW.fmt.hm(D.prepay[2].t_first) + ' window with bw-neighbor</span>'), 'locked ahead: 1.50¢ for the window open now, with the hop named');
   ok(html.includes('<span class="k">covered</span><span class="v">0 windows</span><span class="s">drew 0 · on credit '), 'covered: none yet; what is on credit');
   eq(count(html, '<span class="st credit">on credit</span>'), 48, 'the payer\'s rows say on credit');
+  // a window that drew more than the balance held: the payer's cell says what is owed, not a balance
+  { const s0 = D.mint.ledger.filter((e) => e.kind === 'settlement').slice(-1)[0];
+    D.mint.ledger.push(Object.assign({}, s0, { t: now - 100, t_first: D.prepay[2].t_first, t_last: D.prepay[2].t_first + 3600, lock: D.prepay[2].id, debit: 1100000, covered: true }));
+    const Xo = BW.derive(now), ho = BW.views.node(Xo, now);
+    eq(Xo.prepay.payers[house].balance, -100000, 'the payer\'s balance is 10¢ below zero');
+    ok(ho.includes('<span class="k">owed to the Mint</span><span class="v">10.00¢</span>') && !ho.includes('<span class="k">balance at the Mint</span>'), 'owed to the Mint: 10.00¢, in place of the balance');
+    D.mint.ledger.pop(); }
   // the Mint's invoice through this node: the payer's prepaid line becomes a cell
   { const months = BW.invoiceMonths(now), m = months[1];
     D.mintInvoice = {}; D.mintInvoice[m] = m + '  bw-house pays bw-neighbor: 50 windows (7 disputed), 5.00 GB, $0.1613: the relay\'s $0.1532, the Steward\'s $0.0081\n' + m + '  bw-house prepaid: deposits $1.000000, drawn $0.000000 on 0 covered windows, balance $0.985000; on credit $0.1613 on 50 windows\n' + m + '  the Network Steward\'s share: $0.0081 (f = 0.05 of every settlement since 0.3.0; none before)\nthe month so far, computed now; the Mint writes ' + m + '.txt on the first of the next month\n';

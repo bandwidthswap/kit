@@ -145,6 +145,8 @@ LOCK_MINT_FIELDS = ("mint", "mint_sig")             # added by the Mint when it 
 CLAIM_FIELDS = ("kind", "proto", "id", "hop", "payer", "lock", "bytes", "meter", "posted_at", "sig")
 PREPAY_KINDS = ("deposit", "lock", "claim")
 LOCK_AHEAD_S = 3600                     # a lock names the window about to open: t_first within one window of the Mint's clock
+LOCK_FLOOR_BYTES = 50_000_000           # a payer's lock is sized for at least this many bytes (prepay.floor_bytes; 0 for none): the decision
+                                        # of Nov 1, 2026, so the window after a quiet one is not covered for a thousandth of what it carries
 DEFAULT_STEWARD = {                     # the Steward's parameters (paper, Section 7; the mockup's values), under "steward" in the Mint's config
     "m": 0.04, "margin": 0.01, "program_window_s": 7 * 86400, "first_link_usd": 1.0, "first_link_premium": 0.05,
     "min_payer_age_s": 86400, "bounty_deadline_s": 7 * 86400,
@@ -2056,17 +2058,25 @@ class Node:
 
     # prepayment on the payer (spec, Section 16; step 3): the lock for the coming window, after each receipt
 
+    def lock_floor(self):
+        """The fewest bytes a lock of this payer's is sized for (prepay.floor_bytes; LOCK_FLOOR_BYTES unless set, 0 for none)."""
+        return max(0, int((self.config.get("prepay") or {}).get("floor_bytes", LOCK_FLOOR_BYTES)))
+
     def lock_estimate(self, last_bytes, t_first):
         """What to lock for the window starting at t_first, in micro-units, and the announcement it is priced under.
 
-        The larger of the last window's bytes and the purchase minimum in
-        force, times the headroom (prepay.headroom, 1.25: a quarter over the
-        last window covered 163 of 167 windows of the neighbor link's week),
-        at the announcement's price; the pilot's links carry no carry.
-        Returns (amount, link or None, estimate_bytes, min_bytes).
+        The largest of the last window's bytes, the floor (prepay.floor_bytes,
+        50 MB unless set, 0 for none) and the purchase minimum in force, times
+        the headroom (prepay.headroom, 1.25: a quarter over the last window
+        covered 163 of 167 windows of the neighbor link's week), at the
+        announcement's price; the pilot's links carry no carry. The floor is
+        there for the window after a quiet one: on Nov 23, 2026 the first
+        window after two days off the air was locked for 122 kB and carried
+        111 MB. Returns (amount, link or None, estimate_bytes, min_bytes).
         """
         pp = self.config.get("prepay") or {}
         headroom = float(pp.get("headroom", 1.25))
+        floor = self.lock_floor()
         hop_nym = self.nym_by_name(self.config["hop_name"])
         links = []
         try:
@@ -2081,7 +2091,7 @@ class Node:
         for rec in self.load_purchases():
             if isinstance(rec, dict) and rec.get("kind") == "purchase" and rec.get("poster") == self.nym and rec.get("deadline", 0) >= t_first:
                 min_bytes = max(min_bytes, int(rec.get("min_bytes") or 0))
-        estimate = int(max(last_bytes, min_bytes) * headroom)
+        estimate = int(max(last_bytes, min_bytes, floor) * headroom)
         amount = int(fractions.Fraction(estimate) * fractions.Fraction(str(price)) * MICRO / 10 ** 9)
         return max(amount, 1), link, estimate, min_bytes
 
@@ -2166,6 +2176,9 @@ class Node:
         lines = ["balance at the Mint: %s (deposits %s, locked %s on %d open lock%s, drawn %s, released %s)" % (
             micro_usd(b["balance"]), micro_usd(b["deposits"]), micro_usd(b["locked"]), len(b["open_locks"]), "" if len(b["open_locks"]) == 1 else "s",
             micro_usd(b["debited"]), micro_usd(b["released"]))]
+        if b["balance"] < 0:
+            lines.append("  owed to the Mint: %s. A covered window drew more than the balance held (spec, Section 16: a window settles in full); "
+                         "the next deposit goes to this first, and the Mint takes no lock until the balance covers one." % micro_usd(-b["balance"]))
         for l in b.get("locks", [])[-12:]:
             lines.append("  %s  %s with %s  %-8s%s" % (time.strftime("%Y-%m-%d %H:%M", time.localtime(l["t_first"])), micro_usd(l["amount"]),
                                                    names.get(l["hop"], l["hop"][:20]), l["state"], "  drew %s" % micro_usd(l["debit"]) if l.get("debit") is not None else ""))
@@ -4747,7 +4760,8 @@ def main(argv=None):
             print(json.dumps(rec, indent=1, sort_keys=True))
             print("the window at %s: %d bytes estimated (the last window %d%s, headroom %s), %s%s" % (
                 time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(rec["t_first"])), estimate, last_bytes,
-                ", minimum %d" % min_bytes if min_bytes else "", (node.config.get("prepay") or {}).get("headroom", 1.25), micro_usd(rec["amount"]),
+                (", minimum %d" % min_bytes if min_bytes else "") + (", floor %d" % node.lock_floor() if node.lock_floor() > max(last_bytes, min_bytes) else ""),
+                (node.config.get("prepay") or {}).get("headroom", 1.25), micro_usd(rec["amount"]),
                 " under announcement %s" % rec["link"][:16] if rec["link"] else " at the default price"))
             return 0
         out = node.lock_next({"receipt": {"t_last": st["t"], "bytes": last_bytes}})
@@ -4838,8 +4852,9 @@ def main(argv=None):
                 print("no payer has a balance here")
             for nym in payers:
                 b = node.prepay_balance(nym)
-                print("%s  deposits %s  locked %s (%d open)  debited %s  balance %s" % (
-                    who(nym), micro_usd(b["deposits"]), micro_usd(b["locked"]), len(b["open_locks"]), micro_usd(b["debited"]), micro_usd(b["balance"])))
+                print("%s  deposits %s  locked %s (%d open)  debited %s  balance %s%s" % (
+                    who(nym), micro_usd(b["deposits"]), micro_usd(b["locked"]), len(b["open_locks"]), micro_usd(b["debited"]), micro_usd(b["balance"]),
+                    "  (owes %s: a covered window drew more than the balance held)" % micro_usd(-b["balance"]) if b["balance"] < 0 else ""))
     elif args.cmd == "purchase":
         if args.pucmd == "post":
             if node.role != "payer":

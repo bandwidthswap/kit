@@ -25,7 +25,8 @@ window.BW = window.BW || {};
       if(!P.on) return cells;
       var b=P.payers[X.me], next=P.nextLock(X.me);
       if(!b) return [['balance at the Mint', '–', 'no deposit and no lock of mine in the registry']];
-      cells.push(['balance at the Mint', F.micro(b.balance), F.micro(b.deposits)+' deposited, less what locks hold and covered windows drew']);
+      if(b.balance<0) cells.push(['owed to the Mint', F.micro(-b.balance), 'a covered window drew more than the balance held; the next deposit goes to this first, and no lock is taken until the balance covers one']);
+      else cells.push(['balance at the Mint', F.micro(b.balance), F.micro(b.deposits)+' deposited, less what locks hold and covered windows drew']);
       cells.push(['locked ahead', next ? F.micro(next.amount) : 'none', next ? 'for the '+F.hm(next.t_first)+' window with '+X.name(next.hop) : 'no lock open; the next window settles on credit']);
       cells.push(['covered', b.covered+' window'+(b.covered===1?'':'s'), 'drew '+F.micro(b.debited)+(P.onCredit?' · on credit '+money(P.creditUsd)+' on '+P.onCredit+' window'+(P.onCredit===1?'':'s'):'')+(b.released?' · '+F.micro(b.released)+' released unused':'')]);
       return cells;
@@ -48,7 +49,7 @@ window.BW = window.BW || {};
       var lines=t.split('\n').filter(Boolean), mine=lines.filter(function(l){ var mm=/^\S+  (\S+) pays (\S+):/.exec(l); return mm && (hop ? mm[2]===me : mm[1]===me); });
       var written=lines.filter(function(l){ return /^written /.test(l); })[0], sofar=lines.some(function(l){ return /computed now/.test(l); });
       var paid=lines.map(function(l){ return /^\S+  (\S+) paid (\S+): (.*) \(noted (.*)\)$/.exec(l); }).filter(function(mm){ return mm && (hop ? mm[2]===me : mm[1]===me); });
-      var pre=hop ? null : lines.map(function(l){ return /^\S+  (\S+) prepaid: deposits \$([0-9.]+), drawn \$([0-9.]+) on (\d+) covered windows?, balance \$([0-9.]+); on credit \$([0-9.]+) on (\d+) windows?$/.exec(l); }).filter(function(mm){ return mm && mm[1]===me; })[0];
+      var pre=hop ? null : lines.map(function(l){ return /^\S+  (\S+) prepaid: deposits \$([0-9.]+), drawn \$([0-9.]+) on (\d+) covered windows?, balance \$(-?[0-9.]+); on credit \$([0-9.]+) on (\d+) windows?$/.exec(l); }).filter(function(mm){ return mm && mm[1]===me; })[0];
       var preCell = pre ? '<div><span class="k">prepaid</span><span class="v">$'+esc(pre[3])+'</span><span class="s">drawn on '+esc(pre[4])+' covered window'+(pre[4]==='1'?'':'s')+'; balance $'+esc(pre[5])+'; on credit $'+esc(pre[6])+' on '+esc(pre[7])+' window'+(pre[7]==='1'?'':'s')+'</span></div>' : '';
       var paidCell = !mine.length ? '' : paid.length ? paid.map(function(mm){ return '<div><span class="k">paid</span><span class="v">'+esc(mm[3])+'</span><span class="s">noted '+esc(mm[4])+'</span></div>'; }).join('') : (written ? '<div><span class="k">paid</span><span class="v">not yet</span><span class="s">'+(hop?'the Mint notes it when the house settles up':'the Mint notes it when I settle up')+'</span></div>' : '');
       return '<h3>'+esc(m)+' <small>'+(written?'as the Mint wrote it, '+esc(written.replace(/^written /,'')):(sofar?'this month so far, computed by the Mint now':'as the Mint serves it'))+'</small></h3>'

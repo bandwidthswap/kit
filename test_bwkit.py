@@ -1338,6 +1338,69 @@ class Prepay(unittest.TestCase):
             out = lab.hour(200_000_000, 200_000_000)
         self.assertNotIn("lock", out)
 
+    def test_a_lock_is_sized_for_at_least_the_floor(self):
+        """Nov 23, 2026: the first window after two days off the air was locked for 122 kB, 1.25 times the quiet window before
+        it, and carried 111 MB. A lock is sized for at least prepay.floor_bytes, 50 MB unless set (the decision of Nov 1, 2026)."""
+        lab = self.lab
+        lab.mint.config["steward_mint"] = lab.mint_url
+        lab.payer.config["prepay"] = {"enabled": True}
+        cli(["deposit", "bw-house", "0.05", "cash"], mint_env(lab))
+        with mock.patch("time.time", return_value=lab.t):
+            out = lab.hour(100_000, 100_000)                                   # a quiet window, 100 kB
+        self.assertIsNotNone(out["lock"], out["lock_error"])
+        self.assertEqual(out["lock"]["amount"], 6250)                          # 50 MB x 1.25 at 10c/GB, where 100 kB x 1.25 is 12 micro-dollars
+        rc, text = cli(["lock", "--print"], payer_env(lab))
+        self.assertEqual(rc, 0, text)
+        self.assertIn("62500000 bytes estimated (the last window 100000, floor 50000000, headroom 1.25)", text)
+        with mock.patch("time.time", return_value=lab.t):
+            out = lab.hour(100_100_000, 100_100_000)                           # a busy window sets the lock as before
+        self.assertEqual(out["lock"]["amount"], 12500)
+        rc, text = cli(["lock", "--print"], payer_env(lab))
+        self.assertIn("bytes estimated (the last window 100000000, headroom 1.25)", text)      # the floor is named only when it is what set the size
+        lab.payer.config["prepay"] = {"enabled": True, "floor_bytes": 0}       # none: the size before the floor
+        self.assertEqual(lab.payer.lock_estimate(100_000, lab.t + 3600)[0], 12)
+        lab.payer.config["prepay"] = {"enabled": True, "floor_bytes": 200_000_000}     # the operator's own
+        self.assertEqual(lab.payer.lock_estimate(100_000, lab.t + 3600)[0], 25000)
+
+    def test_a_window_that_draws_more_than_the_balance_settles_in_full_and_the_rest_is_owed(self):
+        """The decision of Nov 23, 2026: a covered window settles in full whatever the balance holds. The balance goes below
+        zero, that is what the payer owes, the Mint takes no lock until a deposit covers one, and every reader says so."""
+        lab = self.lab
+        lab.mint.config["steward_mint"] = lab.mint_url
+        lab.payer.config["prepay"] = {"enabled": True}
+        cli(["deposit", "bw-house", "0.008", "cash"], mint_env(lab))           # enough for the floor's lock, not for a busy window
+        with mock.patch("time.time", side_effect=lambda: lab.t):               # the Mint's clock is the lab's, hour by hour
+            out = lab.hour(1_000_000, 1_000_000)
+            self.assertEqual(out["lock"]["amount"], 6250)                      # the window that opens is locked at the floor
+            out = lab.hour(101_000_000, 101_000_000)                           # and carries 100 MB: $0.010000 against $0.008 on deposit
+            s = [e for e in lab.mint.ledger_lines() if e["kind"] == "settlement"][-1]
+            self.assertEqual((s["status"], s["settled_bytes"], s["debit"], s["covered"]), ("settled", 100_000_000, 10000, True))   # in full
+            bal = lab.mint.prepay_balance(lab.payer.nym)
+            self.assertEqual((bal["deposits"], bal["locked"], bal["debited"], bal["balance"]), (8000, 0, 10000, -2000))
+            self.assertIsNone(out["lock"])                                     # no lock while the balance is below one
+            self.assertIn("balance: $-0.002000 on hand, $0.012500 asked", out["lock_error"])
+            rc, text = cli(["balance"], payer_env(lab))
+            self.assertEqual(rc, 0, text)
+            self.assertIn("balance at the Mint: $-0.002000 (deposits $0.008000", text)
+            self.assertIn("owed to the Mint: $0.002000. A covered window drew more than the balance held", text)
+            rc, text = cli(["prepay", "balance"], mint_env(lab))
+            self.assertIn("balance $-0.002000  (owes $0.002000: a covered window drew more than the balance held)", text)
+            # the invoice's line carries the figure and reads back; the signed public report carries it as an integer below zero
+            month = time.strftime("%Y-%m", time.localtime(lab.t))
+            line = [l for l in lab.mint.invoice_text(month).split("\n") if " prepaid: " in l][0]
+            self.assertIn("drawn $0.010000 on 1 covered window, balance $-0.002000; on credit $0.0001 on 1 window", line)
+            self.assertEqual(bwkit.parse_prepaid_line(line)["balance"], "-0.002000")
+            rep = lab.mint.status_report(now=lab.t)
+            self.assertEqual(rep["prepaid"]["bw-house"]["balance"], -2000)
+            bwkit.assert_public(json.dumps(rep))
+        # a deposit pays what is owed first: the balance is the deposits less every draw, and the next window is locked again
+        cli(["deposit", "bw-house", "0.02", "what was owed, and more"], mint_env(lab))
+        with mock.patch("time.time", side_effect=lambda: lab.t):
+            self.assertEqual(lab.mint.prepay_balance(lab.payer.nym)["balance"], 18000)
+            out = lab.hour(201_000_000, 201_000_000)
+        self.assertIsNotNone(out["lock"], out["lock_error"])
+        self.assertEqual(out["lock"]["amount"], 12500)
+
     def test_a_hop_that_does_not_answer_does_not_make_the_lock_late(self):
         """Nov 23, 2026: with the hop off the air the hourly job waited out its post to the hop, so the lock reached the Mint ten
         seconds behind its window and was refused (`since`), at each of 51 hours. The payer now locks without waiting for a hop
