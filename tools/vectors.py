@@ -53,6 +53,7 @@ def inputs():
         {"t_first": T0 + 10800, "t_last": T0 + 11400, "payer_bytes": 1712, "hop_bytes": 1712},              # link B: settled, 0.0
         {"t_first": T0 + 11400, "t_last": T0 + 12600, "payer_bytes": 20_000_000, "hop_bytes": 20_100_000},  # link B: settled
         {"t_first": T0 + 12600, "t_last": T0 + 14400, "payer_bytes": 30_000_000, "hop_bytes": 31_000_000},  # link B: settled
+        {"t_first": T0 + 14400, "t_last": T0 + 21687, "payer_bytes": 90_000_000, "hop_bytes": 30_000_000},  # link B: locked, claimed by the hop, then closed late: disputed, on credit
     ]
     for w, m in zip(windows, meters(windows)):
         w["meter"] = m
@@ -76,8 +77,11 @@ def inputs():
                        "settlement-purchased": 6, "commitment_hour": T0 + 10800},
         "prepay": {"deposit": 50_000, "deposit_at": T0 + 100, "note": "test only",          # micro-USD (spec, Section 16)
                    "lock_window": 1, "lock_amount": 12_500, "lock_at": T0 + 3590,
-                   "claim_bytes": 1_000_000, "claim_at": T0 + 3600 + 7200},
-        "rebuild_at": T0 + 20000,
+                   "claim_bytes": 1_000_000, "claim_at": T0 + 3600 + 7200,
+                   # the eighth window: locked, claimed two windows on, and closed by the payer three seconds before the claim's
+                   # posted_at by its own clock, inside the link's five: acknowledged after the claim, so the claim stands
+                   "late": {"lock_window": 7, "lock_amount": 8_000, "lock_at": T0 + 14390, "claim_bytes": 55_000_000, "claim_at": T0 + 14400 + 7200 + 90}},
+        "rebuild_at": T0 + 30000,
     }
 
 
@@ -119,6 +123,17 @@ def generate(inp):
             "meter": None, "posted_at": pp["claim_at"]}
     claim = dict(body, id=bwkit.prepay_id(body)); claim["sig"] = bwkit.sign_prepay(priv["hop"], claim)
     lock_t_first = lock["t_first"]
+    late = pp["late"]
+    lw = inp["windows"][late["lock_window"]]
+    lk = bwkit.link_in_force(links, nym["payer"], nym["hop"], lw["t_first"])
+    body = {"kind": "lock", "proto": 1, "payer": nym["payer"], "hop": nym["hop"], "t_first": lw["t_first"], "amount": late["lock_amount"],
+            "unit": "USD", "carry": 0, "link": bwkit.link_hash(lk) if lk else None, "posted_at": late["lock_at"]}
+    lock2 = dict(body, id=bwkit.prepay_id(body)); lock2["sig"] = bwkit.sign_prepay(priv["payer"], lock2)
+    lock2["mint"] = nym["mint"]; lock2["mint_sig"] = bwkit.sign_lock_mint(priv["mint"], lock2)
+    body = {"kind": "claim", "proto": 1, "hop": nym["hop"], "payer": nym["payer"], "lock": lock2["id"], "bytes": late["claim_bytes"],
+            "meter": None, "posted_at": late["claim_at"]}
+    claim2 = dict(body, id=bwkit.prepay_id(body)); claim2["sig"] = bwkit.sign_prepay(priv["hop"], claim2)
+    claimed = bwkit.claimed_settlement(lock2, claim2, lk, inp["price_usd_per_gb"], inp["steward_fee"], claim2["posted_at"])
     receipts, acks, settlements = [], [], []
     for w in inp["windows"]:
         r = {"payer": nym["payer"], "hop": nym["hop"], "hop_index": 1, "merkle_root": bwkit.meter_root(nym["payer"], w["meter"]),
@@ -149,7 +164,8 @@ def generate(inp):
                               [(i + 1, a) for i, a in enumerate(x for x in acks if x)],
                               [(i + 1, l) for i, l in enumerate(links)],
                               inp["price_usd_per_gb"], inp["steward_fee"], inp["rebuild_at"],
-                              purchases=[(1, purchase)], steward_margin=pu["steward_margin"], prepay=[(1, deposit), (2, lock)])
+                              purchases=[(1, purchase)], steward_margin=pu["steward_margin"],
+                              prepay=[(i + 1, r) for i, r in enumerate((deposit, lock, claim, lock2, claim2))])
     return {
         "keys.json": {r: {"seed": inp["seeds"][r], "nym": nym[r], "name": names[r]} for r in ROLES},
         "deposit.json": deposit,
@@ -163,13 +179,14 @@ def generate(inp):
         "settlement-settled.json": settlements[sa["settlement-settled"]],
         "purchase.json": purchase,
         "settlement-purchased.json": settlements[sa["settlement-purchased"]],
+        "settlement-claimed.json": claimed,
         "commitment.json": commitment,
         "proof.json": proof,
         "rebuild/receipts.jsonl": receipts,
         "rebuild/acks.jsonl": [a for a in acks if a],
         "rebuild/links.jsonl": links,
         "rebuild/purchases.jsonl": [purchase],
-        "rebuild/prepay.jsonl": [deposit, lock],
+        "rebuild/prepay.jsonl": [deposit, lock, claim, lock2, claim2],
         "rebuild/ledger.jsonl": ledger,
     }
 
@@ -185,7 +202,7 @@ README = """# `bsp/1` test vectors
 **Test-only keys.** `inputs.json` and `keys.json` carry the private seeds of the three keys. They are published so that
 anyone can reproduce every signature here. Never use them on a node; a Mint should refuse their NYMs.
 
-Written by `tools/vectors.py` from `inputs.json`: fixed seeds, fixed timestamps (T0 = 1800000000, an hour boundary), seven
+Written by `tools/vectors.py` from `inputs.json`: fixed seeds, fixed timestamps (T0 = 1800000000, an hour boundary), eight
 windows' meter readings and counts, two announcements, a purchase, the price and the fee. `spec/CONFORMANCE.md` says what each file
 is and how `tools/conform.py` checks a directory in this layout. `test_bwkit.py` fails when the kit no longer writes
 exactly these files.
@@ -196,14 +213,15 @@ exactly these files.
 | `keys.json` | the three NYMs with their seeds and names |
 | `receipt.json`, `ack.json` | the second window's receipt and acknowledgement |
 | `link.json` | the first announcement (any payer, 10% margin, since T0+3600) |
-| `deposit.json`, `lock.json`, `claim.json` | prepayment (Section 16): a deposit the Mint signs, a lock the payer signs and the Mint countersigns (the second window, under the first announcement), a claim the hop signs on that lock; amounts in micro-USD; `rebuild/prepay.jsonl` holds the deposit and the lock, so the second window's settlement in `rebuild/ledger.jsonl` (and `settlement-disputed.json`) carries `lock`, `debit` and `covered` |
+| `deposit.json`, `lock.json`, `claim.json` | prepayment (Section 16): a deposit the Mint signs, a lock the payer signs and the Mint countersigns (the second window, under the first announcement), a claim the hop signs on that lock; amounts in micro-USD; `rebuild/prepay.jsonl` holds all three, so the second window's settlement in `rebuild/ledger.jsonl` (and `settlement-disputed.json`) carries `lock`, `debit` and `covered`, and the claim, posted an hour after the hop acknowledged that window, is left out of the ledger |
 | `settlement-default.json` | the first window, no announcement in force |
 | `settlement-disputed.json` | the second window, under the first announcement |
 | `settlement-settled.json` | the sixth window, under the second announcement (price 0.2, margin 5%) |
 | `purchase.json` | the payer's purchase on the link, posted at T0+12700: 20 MB a window, 2 cents a GB, one window, a cent escrowed |
 | `settlement-purchased.json` | the seventh window, settled against it: the premium on 30 MB from the poster, the fee on both |
+| `settlement-claimed.json` | the eighth window's lock, claimed by the hop two windows on (Section 16): 55 MB counted, settled at the 40 MB the lock covers; `rebuild/prepay.jsonl` holds that lock and claim, and the payer's receipt for the window, closed three seconds before the claim's `posted_at` and so inside the clock tolerance, settles after it on credit |
 | `commitment.json`, `proof.json` | the hour T0+10800, three settlements |
-| `rebuild/` | the four inputs of a rebuild and the ledger it must make |
+| `rebuild/` | the five inputs of a rebuild and the ledger it must make |
 """
 
 

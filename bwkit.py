@@ -1491,6 +1491,22 @@ def rebuild(receipts, acks, links=(), price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB,
         return {"kind": env["kind"], "received_at": now, "from": env.get("from") or env["kind"],
                 "receipt": env["receipt"], "sig": env["sig"], "meter": env.get("meter")}
 
+    # The claims that can stand, by lock: inside the lock's claim window. Which came first at the Mint, such a claim or the
+    # receipt for its window, is read from the two signed times (spec, Section 16): a hop acknowledges within the link's clock
+    # tolerance of the receipt's t_last, so a receipt closed no earlier than the claim's posted_at less that tolerance was
+    # acknowledged after the claim, when the lock was already drawn. The claim stands and that window settles without the lock.
+    standing, pname = {}, names[4] if len(names) > 4 else "prepay.jsonl"
+    for lock_id, claim in pbook.claims.items():
+        lock = pbook.locks.get(lock_id)
+        if lock is None:
+            continue
+        opens, closes = pbook.claim_window(lock)
+        if opens <= claim["posted_at"] < closes:
+            standing[lock_id] = claim
+        else:
+            bad.append("%s: claim %s is outside its lock's claim window (%d..%d)" % (pname, claim["id"][:12], opens, closes))
+    acked_first = {}                                                 # lock id -> the t_last of the receipt that drew on it before its claim
+
     entries, by_hour = [], {}
     for env in sorted(good["receipt"], key=lambda e: (e["receipt"]["t_last"], e["receipt"]["t_first"], e["sig"])):
         entries.append(entry(env))
@@ -1508,22 +1524,28 @@ def rebuild(receipts, acks, links=(), price_usd_per_gb=DEFAULT_PRICE_USD_PER_GB,
             continue
         lock = pbook.lock_for(r["payer"], r["hop"], r["t_first"])
         if lock is not None and lock["id"] not in pbook.debits:
-            apply_lock(s, lock)
+            claim = standing.get(lock["id"])
+            if claim is None:
+                apply_lock(s, lock)
+            elif r["t_last"] < claim["posted_at"] - link_params(link_in_force(good["link"], r["payer"], r["hop"], r["t_first"]))["clock_tolerance_s"]:
+                apply_lock(s, lock)                                  # acknowledged before the claim: the window's own settlement draws on the lock
+                acked_first[lock["id"]] = r["t_last"]
+            # else the claim came first and has the lock; this window settles on credit, as it did at the Mint
         book.note(s)
         pbook.note(s)
         entries.append(s)
         rep["settlements"] += 1
         rep["disputed"] += 1 if s["status"] == "disputed" else 0
         by_hour.setdefault(commit_hour(s), []).append(s)
-    # a claim on a lock whose window never settled: the claimed settlement, in the window's place among the others
+    # a claim on a lock no earlier window drew on: the claimed settlement, in the window's place among the others
     claimed = []
-    for lock_id, claim in sorted(pbook.claims.items(), key=lambda kv: (pbook.locks.get(kv[0], {}).get("t_first", 0), kv[0])):
-        lock = pbook.locks.get(lock_id)
-        if lock is None or lock_id in pbook.debits:
+    for lock_id, claim in sorted(standing.items(), key=lambda kv: (pbook.locks[kv[0]]["t_first"], kv[0])):
+        lock = pbook.locks[lock_id]
+        if lock_id in acked_first:
+            bad.append("%s: claim %s is on a lock whose window the hop had acknowledged (closed at %d, %d s before the claim); the receipt draws on the lock and the claim is left out" % (
+                pname, claim["id"][:12], acked_first[lock_id], claim["posted_at"] - acked_first[lock_id]))
             continue
-        opens, closes = pbook.claim_window(lock)
-        if not opens <= claim["posted_at"] < closes:
-            bad.append("%s: claim %s is outside its lock's claim window (%d..%d)" % (names[4] if len(names) > 4 else "prepay.jsonl", claim["id"][:12], opens, closes))
+        if lock_id in pbook.debits:
             continue
         s = claimed_settlement(lock, claim, link_in_force(good["link"], lock["payer"], lock["hop"], lock["t_first"]), price_usd_per_gb, fee, claim["posted_at"])
         pbook.note(s)

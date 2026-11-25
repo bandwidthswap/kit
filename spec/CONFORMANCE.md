@@ -17,10 +17,12 @@ From the inputs in `spec/vectors/inputs.json` (test-only key seeds, the windows'
 | `settlement-settled.json` | a window under the second announcement, settled at its price and margin |
 | `purchase.json` | the payer's purchase on the link (Section 15): its id, which is the hash of the record, and its signature |
 | `settlement-purchased.json` | the seventh window, settled against that purchase: the premium on the bytes moved, from the poster's pool, and the fee on both |
+| `deposit.json`, `lock.json`, `claim.json` | the prepayment records (Section 16): their ids, signatures and the Mint's countersignature on the lock |
+| `settlement-claimed.json` | the eighth window's lock, claimed by the hop: the claimed settlement, the hop's count cut to what the lock covers by the exact integer rule |
 | `commitment.json` | the Mint's commitment over the hour with three settlements: the root over the leaves in leaf order with the odd split, and the signature |
 | `proof.json` | the proof document for that hour: every index, leaf and path |
-| `rebuild/receipts.jsonl`, `acks.jsonl`, `links.jsonl`, `purchases.jsonl` | the four inputs of a rebuild, as the parties would hold them (every envelope, announcement and purchase signed by the test keys) |
-| `rebuild/ledger.jsonl` | the ledger a rebuild makes from them (Section 11): every receipt, acknowledgement, settlement and unsigned commitment, in order, with the rebuild's fixed clock |
+| `rebuild/receipts.jsonl`, `acks.jsonl`, `links.jsonl`, `purchases.jsonl`, `prepay.jsonl` | the five inputs of a rebuild, as the parties would hold them (every envelope, announcement, purchase and prepayment record signed by the test keys) |
+| `rebuild/ledger.jsonl` | the ledger a rebuild makes from them (Section 11): every receipt, acknowledgement, settlement and unsigned commitment, in order, with the rebuild's fixed clock. It holds both cases of a claim and a receipt for one window (Section 16, the rebuild): the second window's claim was posted an hour after the hop acknowledged that window, so the receipt draws on the lock and the claim is left out; the eighth window's receipt was closed three seconds before its claim's `posted_at`, inside the clock tolerance of five, so the claim stands and the receipt settles after it without the lock |
 
 Settlement records are compared whole, including `t`, which the inputs fix. Numbers must be encoded as Section 3 of the spec says (`0.0`, `5e-05` and `3e-06`, the fee on `5e-05` rounded from 2.5e-06, all occur in the vectors, on purpose). The rebuilt ledger is compared line by line.
 

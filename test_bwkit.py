@@ -1341,6 +1341,90 @@ class Prepay(unittest.TestCase):
         entries, rep = bwkit.rebuild(receipts, acks, [], 0.1, 0.05, prepay=bad)
         self.assertEqual(rep["bad"], ["prepay.jsonl line 2: a lock in the registry carries the Mint's countersignature"])   # a countersignature that fails
 
+    def claimed_then_closed_late(self, late_by):
+        """A locked window the hop claims two windows on, and the payer's receipt for it `late_by` seconds after the window's start.
+        Returns the lock, the claim as stored, and the rebuild's inputs."""
+        lab = self.lab
+        lab.mint.config["steward_mint"] = lab.mint_url
+        cli(["deposit", "bw-house", "0.05", "cash"], mint_env(lab))
+        t0 = lab.t
+        with mock.patch("time.time", return_value=t0 - 1):
+            status, ans = self.post(self.signed(lab.payer.priv, self.lock_body(t0, 20000, now=t0 - 1)))
+        self.assertEqual(status, 200, ans)
+        lock = ans["record"]
+        claim = {"kind": "claim", "proto": 1, "hop": lab.hop.nym, "payer": lab.payer.nym, "lock": lock["id"], "bytes": 250_000_000, "meter": None, "posted_at": t0 + 7200 + 1}
+        with mock.patch("time.time", return_value=t0 + 7200 + 1):
+            status, ans = self.post(self.signed(lab.hop.priv, claim))
+        self.assertEqual(status, 200, ans)
+        lab.step(late_by, 300_000_000, 60_000_000)                         # the payer's job runs again: one receipt from the window's start to now
+        return t0, lock, ans["record"]
+
+    def test_a_claim_stands_when_the_payer_closes_the_window_late_and_the_rebuild_agrees(self):
+        """The forfeiture test of Nov 23, 2026: the hop claims the locked window, then the payer's first receipt back starts at the
+        same t_first. The Mint has the claimed settlement and the receipt's on credit; a rebuild from the parties' files has the same,
+        and `owed` on the payer matches the invoice."""
+        lab = self.lab
+        t0, lock, claim = self.claimed_then_closed_late(9000)
+        ss = [e for e in lab.mint.ledger_lines() if e["kind"] == "settlement"]
+        self.assertEqual([(s["status"], s.get("lock"), s.get("debit"), s["settled_bytes"]) for s in ss],
+                         [("claimed", lock["id"], 20000, 200_000_000), ("disputed", None, None, 60_000_000)])
+        self.assertEqual((ss[1]["t_first"], ss[1]["t_last"]), (t0, t0 + 9000))          # the same window start, closed after the claim
+        receipts = bwkit.read_jsonl(lab.payer.path("receipts.jsonl"))[0]
+        acks = bwkit.read_jsonl(lab.hop.path("acks.jsonl"))[0]
+        prepay = bwkit.read_jsonl(lab.mint.path("prepay.jsonl"))[0]
+        entries, rep = bwkit.rebuild(receipts, acks, [], 0.1, 0.05, prepay=prepay)
+        self.assertEqual((rep["settlements"], rep["bad"]), (2, []))
+        agree, verdict, lines = bwkit.compare(entries, lab.mint.ledger_lines())
+        self.assertTrue(agree, (verdict, lines))
+        month = time.strftime("%Y-%m", time.localtime(lab.t))
+        with mock.patch("time.time", return_value=lab.t + 60):
+            lab.mint.invoice_save(month)
+            rc, out = cli(["owed", month], payer_env(lab))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("drawn $0.020000 on 1 covered window, balance $0.030000; on credit $0.0060 on 1 window", out)
+        self.assertIn("matches the Mint's invoice, figure for figure: I owe $0.0260", out)
+
+    def test_a_claim_stands_when_the_late_receipt_is_within_the_clock_tolerance_of_it(self):
+        """The hop acknowledges within the link's clock tolerance of t_last, so a receipt closed a few seconds before the claim's
+        posted_at can still have been acknowledged after the claim, as it was here: the claim stands and the rebuild agrees."""
+        lab = self.lab
+        t0, lock, claim = self.claimed_then_closed_late(7200 - 3)          # t_last four seconds before the claim's posted_at; the tolerance is five
+        receipts = bwkit.read_jsonl(lab.payer.path("receipts.jsonl"))[0]
+        acks = bwkit.read_jsonl(lab.hop.path("acks.jsonl"))[0]
+        prepay = bwkit.read_jsonl(lab.mint.path("prepay.jsonl"))[0]
+        entries, rep = bwkit.rebuild(receipts, acks, [], 0.1, 0.05, prepay=prepay)
+        self.assertEqual((rep["settlements"], rep["bad"]), (2, []))
+        agree, verdict, lines = bwkit.compare(entries, lab.mint.ledger_lines())
+        self.assertTrue(agree, (verdict, lines))
+
+    def test_a_claim_on_a_window_the_hop_had_acknowledged_is_left_out_of_the_rebuild_and_named(self):
+        """A registry that holds a claim posted well after the hop acknowledged the window: an honest Mint refuses it (the window
+        settled), so a rebuild that meets one gives the lock to the receipt, leaves the claim out and names it."""
+        lab = self.lab
+        lab.mint.config["steward_mint"] = lab.mint_url
+        cli(["deposit", "bw-house", "0.05", "cash"], mint_env(lab))
+        t0 = lab.t
+        with mock.patch("time.time", return_value=t0 - 1):
+            status, ans = self.post(self.signed(lab.payer.priv, self.lock_body(t0, 20000, now=t0 - 1)))
+        self.assertEqual(status, 200, ans)
+        lock = ans["record"]
+        lab.hour(100_000_000, 100_000_000)                                 # closed on time and acknowledged: covered
+        claim = self.signed(lab.hop.priv, {"kind": "claim", "proto": 1, "hop": lab.hop.nym, "payer": lab.payer.nym, "lock": lock["id"],
+                                           "bytes": 250_000_000, "meter": None, "posted_at": t0 + 7200 + 1})
+        with mock.patch("time.time", return_value=t0 + 7200 + 1):
+            status, ans = self.post(claim)
+        self.assertEqual((status, ans["error"]), (409, "since"))           # the Mint: the window settled, nothing to claim
+        receipts = bwkit.read_jsonl(lab.payer.path("receipts.jsonl"))[0]
+        acks = bwkit.read_jsonl(lab.hop.path("acks.jsonl"))[0]
+        prepay = bwkit.read_jsonl(lab.mint.path("prepay.jsonl"))[0]
+        forged = prepay + [(len(prepay) + 1, claim)]                       # a registry that took it anyway
+        entries, rep = bwkit.rebuild(receipts, acks, [], 0.1, 0.05, prepay=forged)
+        self.assertEqual(rep["settlements"], 1)
+        self.assertEqual(rep["bad"], ["prepay.jsonl: claim %s is on a lock whose window the hop had acknowledged (closed at %d, %d s before the claim); the receipt draws on the lock and the claim is left out"
+                                      % (claim["id"][:12], t0 + 3600, 3601)])
+        agree, verdict, lines = bwkit.compare(entries, lab.mint.ledger_lines())
+        self.assertTrue(agree, (verdict, lines))                           # and it is the honest Mint's ledger
+
     def test_the_payer_locks_the_coming_window_after_each_receipt(self):
         """Step 3: with prepay.enabled, the hourly job posts a lock for the window that just opened, keeps the countersigned copy,
         shows it to the hop, and says so when the balance is short; `bwkit lock --print`, `balance` and `locks` on the payer."""
@@ -2255,7 +2339,7 @@ class Vectors(unittest.TestCase):
         self.assertEqual(self.vectors.check(), [])
         files = self.vectors.generate(self.vectors.inputs())
         self.assertEqual(set(files), {"keys.json", "receipt.json", "ack.json", "link.json", "deposit.json", "lock.json", "claim.json", "settlement-default.json",
-                                      "settlement-disputed.json", "settlement-settled.json", "purchase.json", "settlement-purchased.json",
+                                      "settlement-disputed.json", "settlement-settled.json", "purchase.json", "settlement-purchased.json", "settlement-claimed.json",
                                       "commitment.json", "proof.json", "rebuild/receipts.jsonl", "rebuild/acks.jsonl",
                                       "rebuild/links.jsonl", "rebuild/purchases.jsonl", "rebuild/prepay.jsonl", "rebuild/ledger.jsonl"})
         sp = files["settlement-purchased.json"]
@@ -2268,6 +2352,14 @@ class Vectors(unittest.TestCase):
         self.assertEqual((files["settlement-settled.json"]["price_usd_per_gb"], files["settlement-settled.json"]["margin"]), (0.2, 0.05))
         self.assertEqual((files["commitment.json"]["count"], len(files["proof.json"]["settlements"])), (3, 3))
         self.assertTrue(bwkit.check_proof(files["proof.json"], files["keys.json"]["mint"]["nym"])[0])
+        # a claim and a receipt for one window, both ways (spec, Section 16, the rebuild): the second window's claim came an hour
+        # after its acknowledgement and is left out; the eighth's receipt was closed inside the clock tolerance of its claim, which stands
+        sc = files["settlement-claimed.json"]
+        self.assertEqual((sc["status"], sc["hop_bytes"], sc["settled_bytes"], sc["amount_usd"], sc["debit"]), ("claimed", 55_000_000, 40_000_000, 0.008, 8000))
+        ss = [e for e in files["rebuild/ledger.jsonl"] if e["kind"] == "settlement"]
+        self.assertEqual([(s["status"], s.get("debit")) for s in ss if s["t_first"] == sc["t_first"]], [("claimed", 8000), ("disputed", None)])
+        self.assertEqual([(s["status"], s.get("lock")) for s in ss if s["t_first"] == files["lock.json"]["t_first"]], [("disputed", files["lock.json"]["id"])])
+        self.assertEqual([r["kind"] for r in files["rebuild/prepay.jsonl"]], ["deposit", "lock", "claim", "lock", "claim"])
 
     def test_conform_passes_on_the_vectors_and_fails_on_a_changed_byte(self):
         out = io.StringIO()

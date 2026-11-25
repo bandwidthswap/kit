@@ -3,7 +3,7 @@
 **Test-only keys.** `inputs.json` and `keys.json` carry the private seeds of the three keys. They are published so that
 anyone can reproduce every signature here. Never use them on a node; a Mint should refuse their NYMs.
 
-Written by `tools/vectors.py` from `inputs.json`: fixed seeds, fixed timestamps (T0 = 1800000000, an hour boundary), seven
+Written by `tools/vectors.py` from `inputs.json`: fixed seeds, fixed timestamps (T0 = 1800000000, an hour boundary), eight
 windows' meter readings and counts, two announcements, a purchase, the price and the fee. `spec/CONFORMANCE.md` says what each file
 is and how `tools/conform.py` checks a directory in this layout. `test_bwkit.py` fails when the kit no longer writes
 exactly these files.
@@ -14,11 +14,12 @@ exactly these files.
 | `keys.json` | the three NYMs with their seeds and names |
 | `receipt.json`, `ack.json` | the second window's receipt and acknowledgement |
 | `link.json` | the first announcement (any payer, 10% margin, since T0+3600) |
-| `deposit.json`, `lock.json`, `claim.json` | prepayment (Section 16): a deposit the Mint signs, a lock the payer signs and the Mint countersigns (the second window, under the first announcement), a claim the hop signs on that lock; amounts in micro-USD; `rebuild/prepay.jsonl` holds the deposit and the lock, so the second window's settlement in `rebuild/ledger.jsonl` (and `settlement-disputed.json`) carries `lock`, `debit` and `covered` |
+| `deposit.json`, `lock.json`, `claim.json` | prepayment (Section 16): a deposit the Mint signs, a lock the payer signs and the Mint countersigns (the second window, under the first announcement), a claim the hop signs on that lock; amounts in micro-USD; `rebuild/prepay.jsonl` holds all three, so the second window's settlement in `rebuild/ledger.jsonl` (and `settlement-disputed.json`) carries `lock`, `debit` and `covered`, and the claim, posted an hour after the hop acknowledged that window, is left out of the ledger |
 | `settlement-default.json` | the first window, no announcement in force |
 | `settlement-disputed.json` | the second window, under the first announcement |
 | `settlement-settled.json` | the sixth window, under the second announcement (price 0.2, margin 5%) |
 | `purchase.json` | the payer's purchase on the link, posted at T0+12700: 20 MB a window, 2 cents a GB, one window, a cent escrowed |
 | `settlement-purchased.json` | the seventh window, settled against it: the premium on 30 MB from the poster, the fee on both |
+| `settlement-claimed.json` | the eighth window's lock, claimed by the hop two windows on (Section 16): 55 MB counted, settled at the 40 MB the lock covers; `rebuild/prepay.jsonl` holds that lock and claim, and the payer's receipt for the window, closed three seconds before the claim's `posted_at` and so inside the clock tolerance, settles after it on credit |
 | `commitment.json`, `proof.json` | the hour T0+10800, three settlements |
-| `rebuild/` | the four inputs of a rebuild and the ledger it must make |
+| `rebuild/` | the five inputs of a rebuild and the ledger it must make |

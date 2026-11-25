@@ -34,6 +34,13 @@
   "claim_bytes": 1000000,
   "deposit": 50000,
   "deposit_at": 1800000100,
+  "late": {
+   "claim_at": 1800021690,
+   "claim_bytes": 55000000,
+   "lock_amount": 8000,
+   "lock_at": 1800014390,
+   "lock_window": 7
+  },
   "lock_amount": 12500,
   "lock_at": 1800003590,
   "lock_window": 1,
@@ -50,7 +57,7 @@
   "steward_margin": 0.01,
   "windows": 1
  },
- "rebuild_at": 1800020000,
+ "rebuild_at": 1800030000,
  "seeds": {
   "hop": "37de99ca6d1d1f7de3ae97914e8a05d09e222ac72156bcb33b78694f4075b86c",
   "mint": "0ef04a03dfb962cf962708dc2f2ee8d408452af54bf251f53a7e8dd3a3347093",
@@ -178,6 +185,22 @@
    "settled_at": 1800014402,
    "t_first": 1800012600,
    "t_last": 1800014400
+  },
+  {
+   "hop_bytes": 30000000,
+   "meter": {
+    "reset": false,
+    "rx0": 101750856,
+    "rx1": 146750856,
+    "t0": 1800014400,
+    "t1": 1800021687,
+    "tx0": 102750856,
+    "tx1": 147750856
+   },
+   "payer_bytes": 90000000,
+   "settled_at": 1800021689,
+   "t_first": 1800014400,
+   "t_last": 1800021687
   }
  ]
 }
